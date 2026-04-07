@@ -12,6 +12,30 @@ from .api_client import AnswerPayload, Question, ScoringAPIClient
 from .graph import GaiaGraphAgent
 
 
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or key in os.environ:
+            continue
+
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+def load_runtime_env() -> None:
+    _load_dotenv(Path.cwd() / ".env")
+
+
 def _default_cache_file() -> Path:
     return Path(".cache/gaia/last_run_answers.json")
 
@@ -135,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    load_runtime_env()
     parser = build_parser()
     args = parser.parse_args()
     if not args.func:
