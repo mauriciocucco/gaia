@@ -22,9 +22,13 @@ from ast import (
     parse,
     walk,
 )
+import contextlib
 import csv
+import io
 import json
 import logging
+import mimetypes
+import os
 from pathlib import Path
 import re
 import shutil
@@ -32,6 +36,7 @@ import subprocess
 import tempfile
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
+import xml.etree.ElementTree as ET
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,15 @@ from pypdf import PdfReader
 _HTTP_HEADERS = {
     "User-Agent": "GaiaAgent/1.0 (https://github.com/gaia-agent; educational research)",
 }
+_SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
 
 
 def _truncate(value: str, *, max_chars: int = 12000) -> str:
@@ -87,6 +101,57 @@ def _read_pdf(path: Path) -> str:
     return "\n".join(chunks)
 
 
+def _audio_api_config() -> tuple[str, str, str]:
+    provider = os.getenv("MODEL_PROVIDER", "openai").strip().lower()
+    if provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
+        model = os.getenv("AUDIO_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
+    elif provider == "huggingface":
+        api_key = os.getenv("HF_TOKEN", "").strip()
+        base_url = os.getenv("OPENAI_BASE_URL", "https://router.huggingface.co/v1").strip()
+        model = os.getenv("AUDIO_TRANSCRIPTION_MODEL", "whisper-1").strip()
+    else:
+        raise RuntimeError(
+            f"Audio transcription is not configured for MODEL_PROVIDER '{provider}'."
+        )
+
+    if not api_key:
+        raise RuntimeError("Missing API key for audio transcription.")
+    if not base_url:
+        raise RuntimeError("Missing base URL for audio transcription.")
+    if not model:
+        raise RuntimeError("Missing audio transcription model.")
+    return api_key, base_url.rstrip("/"), model
+
+
+def _transcribe_audio(path: Path) -> str:
+    api_key, base_url, model = _audio_api_config()
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    data: dict[str, Any] = {
+        "model": model,
+        "response_format": "json",
+    }
+    language = os.getenv("AUDIO_TRANSCRIPTION_LANGUAGE", "").strip()
+    prompt = os.getenv("AUDIO_TRANSCRIPTION_PROMPT", "").strip()
+    if language:
+        data["language"] = language
+    if prompt:
+        data["prompt"] = prompt
+
+    with path.open("rb") as handle:
+        files = {"file": (path.name, handle, content_type)}
+        with httpx.Client(timeout=120.0, headers={"Authorization": f"Bearer {api_key}"}) as client:
+            response = client.post(f"{base_url}/audio/transcriptions", data=data, files=files)
+            response.raise_for_status()
+
+    payload = response.json()
+    transcript = str(payload.get("text") or "").strip()
+    if not transcript:
+        raise RuntimeError(f"Audio transcription returned no text for {path.name}.")
+    return _truncate(transcript, max_chars=20000)
+
+
 def read_file_content(path: str) -> str:
     """Read a local task attachment and return plain text content."""
     candidate = Path(path)
@@ -104,6 +169,8 @@ def read_file_content(path: str) -> str:
         content = _html_to_text(candidate.read_text(encoding="utf-8", errors="replace"))
     elif suffix == ".pdf":
         content = _read_pdf(candidate)
+    elif suffix in _AUDIO_SUFFIXES:
+        content = _transcribe_audio(candidate)
     else:
         content = candidate.read_text(encoding="utf-8", errors="replace")
     return _truncate(content)
@@ -251,12 +318,148 @@ def extract_youtube_video_id(url: str) -> str:
     raise ValueError(f"Unsupported YouTube URL: {url}")
 
 
+def _normalize_search_result(
+    *, title: str | None, url: str | None, snippet: str | None
+) -> dict[str, str] | None:
+    normalized_title = re.sub(r"\s+", " ", str(title or "").strip())
+    normalized_url = str(url or "").strip()
+    normalized_snippet = re.sub(r"\s+", " ", str(snippet or "").strip())
+    if not normalized_title or not normalized_url.startswith(("http://", "https://")):
+        return None
+    return {
+        "title": normalized_title,
+        "href": normalized_url,
+        "body": normalized_snippet,
+    }
+
+
+def _merge_search_results(
+    existing: list[dict[str, str]],
+    incoming: list[dict[str, str]],
+    *,
+    max_results: int,
+) -> list[dict[str, str]]:
+    merged = list(existing)
+    seen = {item.get("href", "") for item in existing}
+    for item in incoming:
+        href = item.get("href", "")
+        if not href or href in seen:
+            continue
+        merged.append(item)
+        seen.add(href)
+        if len(merged) >= max_results:
+            break
+    return merged
+
+
+def _search_brave_html(query: str, *, max_results: int) -> list[dict[str, str]]:
+    with httpx.Client(
+        timeout=20.0,
+        follow_redirects=True,
+        headers=_SEARCH_HEADERS,
+    ) as client:
+        response = client.get(
+            "https://search.brave.com/search",
+            params={"q": query, "source": "web"},
+        )
+        response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    page_title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    title = re.sub(r"\s+", " ", page_title).strip()
+    if "pow captcha" in title.lower():
+        raise RuntimeError("Brave search returned a captcha challenge.")
+
+    results: list[dict[str, str]] = []
+    for container in soup.select("div.result-content"):
+        anchor = container.select_one("a[href]")
+        title_el = container.select_one(".search-snippet-title")
+        snippet_el = container.select_one(".generic-snippet .content")
+        item = _normalize_search_result(
+            title=title_el.get_text(" ", strip=True) if title_el else None,
+            url=anchor.get("href") if anchor else None,
+            snippet=snippet_el.get_text(" ", strip=True) if snippet_el else "",
+        )
+        if item is None:
+            continue
+        results.append(item)
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _search_duckduckgo(query: str, *, max_results: int) -> list[dict[str, str]]:
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with DDGS() as ddgs:
+            raw_results = list(ddgs.text(query, max_results=max_results))
+
+    results: list[dict[str, str]] = []
+    for item in raw_results:
+        normalized = _normalize_search_result(
+            title=item.get("title"),
+            url=item.get("href") or item.get("url"),
+            snippet=item.get("body"),
+        )
+        if normalized is not None:
+            results.append(normalized)
+    return results
+
+
+def _search_bing_rss(query: str, *, max_results: int) -> list[dict[str, str]]:
+    with httpx.Client(
+        timeout=20.0,
+        follow_redirects=True,
+        headers=_SEARCH_HEADERS,
+    ) as client:
+        response = client.get(
+            "https://www.bing.com/search",
+            params={"q": query, "format": "rss", "count": str(max_results)},
+        )
+        response.raise_for_status()
+
+    root = ET.fromstring(response.text)
+    results: list[dict[str, str]] = []
+    for item in root.findall("./channel/item"):
+        normalized = _normalize_search_result(
+            title=item.findtext("title"),
+            url=item.findtext("link"),
+            snippet=item.findtext("description"),
+        )
+        if normalized is not None:
+            results.append(normalized)
+        if len(results) >= max_results:
+            break
+    return results
+
+
 @tool
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web and return short snippets from the top results."""
-    with DDGS() as ddgs:
-        results = list(ddgs.text(query, max_results=max_results))
+    providers = (
+        ("brave", _search_brave_html),
+        ("duckduckgo", _search_duckduckgo),
+        ("bing", _search_bing_rss),
+    )
+    results: list[dict[str, str]] = []
+    errors: list[str] = []
+
+    for provider_name, provider in providers:
+        if len(results) >= max_results:
+            break
+        try:
+            provider_results = provider(query, max_results=max_results)
+        except Exception as exc:
+            errors.append(f"{provider_name}: {exc}")
+            continue
+        results = _merge_search_results(
+            results,
+            provider_results,
+            max_results=max_results,
+        )
+
     if not results:
+        if errors:
+            raise RuntimeError("All search providers failed: " + " | ".join(errors))
         return "No results found."
 
     lines = []
@@ -313,6 +516,16 @@ def get_youtube_transcript(url: str, languages_csv: str = "en,en-US") -> str:
 
 _FRAME_INTERVAL_SECONDS = 5
 _MAX_FRAMES = 20
+_COUNTING_VISUAL_CUES = (
+    "how many",
+    "highest number",
+    "maximum number",
+    "minimum number",
+    "lowest number",
+    "simultaneously",
+    "at the same time",
+    "on camera simultaneously",
+)
 
 
 def _check_binary(name: str) -> str:
@@ -364,6 +577,91 @@ def _encode_frame_base64(frame_path: Path) -> str:
     return base64.b64encode(frame_path.read_bytes()).decode("ascii")
 
 
+def _is_counting_visual_question(question: str) -> bool:
+    lowered = question.strip().lower()
+    return any(cue in lowered for cue in _COUNTING_VISUAL_CUES)
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    candidates = [str(text or "").strip()]
+    fenced = re.findall(r"```(?:json)?\s*(.*?)\s*```", str(text or ""), flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(item.strip() for item in fenced if item.strip())
+
+    match = re.search(r"\{.*\}", str(text or ""), flags=re.DOTALL)
+    if match:
+        candidates.append(match.group(0).strip())
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _extract_max_count_from_payload(payload: dict[str, Any]) -> int | None:
+    for key in ("max_count", "max_species_count", "highest_count", "highest_species_count"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+
+    frames = payload.get("frames")
+    if not isinstance(frames, list):
+        return None
+
+    counts: list[int] = []
+    for item in frames:
+        if not isinstance(item, dict):
+            continue
+        for key in ("count", "species_count", "visible_count"):
+            value = item.get(key)
+            if isinstance(value, int):
+                counts.append(value)
+                break
+            if isinstance(value, str) and value.strip().isdigit():
+                counts.append(int(value.strip()))
+                break
+    if counts:
+        return max(counts)
+    return None
+
+
+def _build_video_analysis_prompt(
+    *,
+    question: str,
+    video_id: str,
+    frame_count: int,
+    frame_interval_seconds: int,
+    counting_mode: bool,
+) -> str:
+    if counting_mode:
+        return (
+            f"These are {frame_count} frames sampled every {frame_interval_seconds} seconds "
+            f"from a YouTube video (ID: {video_id}).\n\n"
+            f"Question: {question}\n\n"
+            "Analyze each frame independently and count only what the question asks for.\n"
+            "For species questions, count biological species, not individuals, ages, or sexes.\n"
+            "Do not count chicks and adults of the same species separately.\n"
+            "Look carefully for small or distant subjects in the background before deciding.\n"
+            "Return JSON only using this schema:\n"
+            '{\"frames\":[{\"timestamp_s\":0,\"count\":0,\"notes\":\"short note\"}],\"max_count\":0}\n'
+            "Use integer counts."
+        )
+    return (
+        f"These are {frame_count} frames sampled every {frame_interval_seconds} seconds "
+        f"from a YouTube video (ID: {video_id}).\n\n"
+        f"Question: {question}\n\n"
+        "Analyze the frames carefully and answer the question. "
+        "Be specific and precise."
+    )
+
+
 @tool
 def analyze_youtube_video(url: str, question: str) -> str:
     """Download a YouTube video, extract frames, and analyze them with a vision model to answer the question."""
@@ -391,15 +689,16 @@ def analyze_youtube_video(url: str, question: str) -> str:
         if not frames:
             return f"No frames extracted from video {video_id}."
 
+        counting_mode = _is_counting_visual_question(question)
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
-                "text": (
-                    f"These are {len(frames)} frames sampled every {_FRAME_INTERVAL_SECONDS} seconds "
-                    f"from a YouTube video (ID: {video_id}).\n\n"
-                    f"Question: {question}\n\n"
-                    "Analyze the frames carefully and answer the question. "
-                    "Be specific and precise."
+                "text": _build_video_analysis_prompt(
+                    question=question,
+                    video_id=video_id,
+                    frame_count=len(frames),
+                    frame_interval_seconds=_FRAME_INTERVAL_SECONDS,
+                    counting_mode=counting_mode,
                 ),
             }
         ]
@@ -413,7 +712,7 @@ def analyze_youtube_video(url: str, question: str) -> str:
                 "type": "image_url",
                 "image_url": {
                     "url": f"data:image/jpeg;base64,{_encode_frame_base64(frame)}",
-                    "detail": "low",
+                    "detail": "high" if counting_mode else "low",
                 },
             })
 
@@ -440,7 +739,14 @@ def analyze_youtube_video(url: str, question: str) -> str:
 
         vision_model = ChatOpenAI(**kwargs)
         response = vision_model.invoke([HM(content=content)])
-        return _truncate(str(response.content), max_chars=8000)
+        response_text = str(response.content)
+        if counting_mode:
+            payload = _extract_json_object(response_text)
+            if payload is not None:
+                max_count = _extract_max_count_from_payload(payload)
+                if max_count is not None:
+                    return str(max_count)
+        return _truncate(response_text, max_chars=8000)
 
 
 @tool
@@ -461,7 +767,7 @@ def count_wikipedia_studio_albums(
 
 @tool
 def read_local_file(path: str) -> str:
-    """Read a local text, CSV, JSON, HTML, or PDF file."""
+    """Read a local text, CSV, JSON, HTML, PDF, or supported audio file."""
     return read_file_content(path)
 
 

@@ -71,6 +71,7 @@ def solve_questions(
         if attachment_error and not result.get("error"):
             result["error"] = f"Attachment download failed: {attachment_error}"
         result["attachment_path"] = str(attachment_path) if attachment_path else None
+        result["attachment_error"] = attachment_error
         result["index"] = index
         results.append(result)
     return results

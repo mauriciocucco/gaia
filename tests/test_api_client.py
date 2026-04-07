@@ -61,6 +61,30 @@ def test_download_file_writes_response_to_disk() -> None:
     assert result.name == "abc__note.txt"
 
 
+def test_download_file_falls_back_to_task_and_filename_path() -> None:
+    body = b"png-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/files/abc":
+            return httpx.Response(404)
+        if request.url.path == "/files/abc/board.png":
+            return httpx.Response(
+                200,
+                content=body,
+                headers={"content-disposition": 'attachment; filename="board.png"'},
+            )
+        raise AssertionError(f"Unexpected path {request.url.path}")
+
+    client = ScoringAPIClient(
+        base_url="https://example.test",
+        transport=httpx.MockTransport(handler),
+        download_dir=_case_dir("download-file-fallback"),
+    )
+    result = client.download_file("abc", "board.png")
+    assert result.read_bytes() == body
+    assert result.name == "abc__board.png"
+
+
 def test_submit_answers_serializes_expected_payload() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/submit"

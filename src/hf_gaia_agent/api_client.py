@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import quote
 
 import httpx
 
@@ -78,14 +79,45 @@ class ScoringAPIClient:
         return [Question(**item) for item in payload]
 
     def download_file(self, task_id: str, file_name: str | None = None) -> Path:
-        response = self._client.get(f"/files/{task_id}")
-        response.raise_for_status()
+        response: httpx.Response | None = None
+        last_http_error: httpx.HTTPStatusError | None = None
+        for candidate_path in self._candidate_file_paths(task_id, file_name):
+            response = self._client.get(candidate_path)
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    last_http_error = exc
+                    continue
+                raise
+            break
+        else:
+            if last_http_error is not None:
+                raise last_http_error
+            raise RuntimeError(f"Unable to download attachment for task {task_id}.")
 
         resolved_name = file_name or self._filename_from_response(response, task_id)
         safe_name = resolved_name.replace("/", "_").replace("\\", "_")
         destination = self.download_dir / f"{task_id}__{safe_name}"
         destination.write_bytes(response.content)
         return destination
+
+    @staticmethod
+    def _candidate_file_paths(task_id: str, file_name: str | None) -> list[str]:
+        candidates = [f"/files/{task_id}"]
+        if file_name:
+            encoded_name = quote(file_name, safe="")
+            candidates.extend(
+                [
+                    f"/files/{task_id}/{encoded_name}",
+                    f"/files/{encoded_name}",
+                ]
+            )
+        deduped: list[str] = []
+        for candidate in candidates:
+            if candidate not in deduped:
+                deduped.append(candidate)
+        return deduped
 
     def submit_answers(
         self,

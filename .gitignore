@@ -2,10 +2,13 @@
 .uv-cache/
 .cache/
 .tmp/
+.tmp_pytest/
 .pytest_tmp/
 .test-artifacts/
+.test-tmp/
 .pytest_cache/
 pytest-cache-files-*/
+testtmpbase/
 __pycache__/
 *.py[cod]
 .env

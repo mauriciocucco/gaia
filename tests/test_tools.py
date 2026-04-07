@@ -11,6 +11,9 @@ from hf_gaia_agent.tools import (
     _download_video,
     _extract_frames,
     _encode_frame_base64,
+    _extract_json_object,
+    _extract_max_count_from_payload,
+    _is_counting_visual_question,
     extract_youtube_video_id,
 )
 
@@ -44,6 +47,26 @@ def test_check_binary_missing() -> None:
 def test_check_binary_found() -> None:
     path = _check_binary("python")
     assert path is not None
+
+
+def test_is_counting_visual_question() -> None:
+    assert _is_counting_visual_question(
+        "What is the highest number of bird species to be on camera simultaneously?"
+    )
+    assert not _is_counting_visual_question("What does the person say in the clip?")
+
+
+def test_extract_json_object_from_fenced_payload() -> None:
+    payload = _extract_json_object(
+        '```json\n{"frames":[{"timestamp_s":0,"count":2}],"max_count":3}\n```'
+    )
+    assert payload == {"frames": [{"timestamp_s": 0, "count": 2}], "max_count": 3}
+
+
+def test_extract_max_count_from_payload_frames() -> None:
+    assert _extract_max_count_from_payload(
+        {"frames": [{"count": 1}, {"count": "3"}, {"species_count": 2}]}
+    ) == 3
 
 
 def test_encode_frame_base64(tmp_path: Path) -> None:
@@ -114,7 +137,7 @@ def test_analyze_youtube_video_tool_integration(tmp_path: Path, monkeypatch) -> 
     monkeypatch.setattr("hf_gaia_agent.tools._extract_frames", fake_extract)
 
     fake_response = MagicMock()
-    fake_response.content = "There are 3 bird species visible simultaneously."
+    fake_response.content = '{"frames":[{"timestamp_s":0,"count":2},{"timestamp_s":5,"count":3}],"max_count":3}'
 
     fake_vision_model = MagicMock()
     fake_vision_model.invoke.return_value = fake_response
@@ -128,4 +151,8 @@ def test_analyze_youtube_video_tool_integration(tmp_path: Path, monkeypatch) -> 
             "question": "How many bird species are on camera simultaneously?",
         })
 
-    assert "3 bird species" in result
+    message = fake_vision_model.invoke.call_args[0][0][0]
+    image_items = [item for item in message.content if isinstance(item, dict) and item.get("type") == "image_url"]
+    assert image_items
+    assert all(item["image_url"]["detail"] == "high" for item in image_items)
+    assert result == "3"
