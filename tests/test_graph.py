@@ -104,6 +104,38 @@ class FakeModelWithToolFailureAndInvalidFinal:
         )
 
 
+class FakeModelWithEvidenceSalvage:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "name": "extract_tables_from_url",
+                        "args": {
+                            "url": "https://example.com/olympics",
+                            "text_filter": "athletes",
+                        },
+                    }
+                ],
+            )
+        if self.calls == 2:
+            return AIMessage(
+                content="The available information does not make the answer explicit."
+            )
+        raise AssertionError(
+            "Structured evidence solver should answer before a salvage model call."
+        )
+
+
 class FakeModelWithMissingAttachmentMeta:
     def bind_tools(self, _tools):
         return self
@@ -194,6 +226,40 @@ def test_graph_does_not_submit_tool_failure_as_answer(monkeypatch) -> None:
     assert result["error"] == "Model produced an invalid non-answer."
 
 
+def test_graph_salvages_answer_from_existing_tool_evidence(monkeypatch) -> None:
+    @tool
+    def extract_tables_from_url(url: str, text_filter: str = "") -> str:
+        """Return table evidence from mocked page extraction."""
+        assert url == "https://example.com/olympics"
+        assert text_filter == "athletes"
+        return (
+            "Table 1\n"
+            "Participating National Olympic Committees\n"
+            "Cuba (1)\n"
+            "Panama (1)\n"
+            "Argentina (81)"
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [extract_tables_from_url])
+
+    agent = GaiaGraphAgent(model=FakeModelWithEvidenceSalvage(), max_iterations=2)
+    result = agent.solve(
+        Question(
+            task_id="2c-salvage",
+            question=(
+                "What country had the least number of athletes at the 1928 Summer Olympics? "
+                "If there's a tie for a number of athletes, return the first in alphabetical order. "
+                "Give the IOC country code as your answer."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "CUB"
+    assert any("extract_tables_from_url" in item for item in result["tool_trace"])
+    assert result["error"] is None
+
+
 def test_graph_marks_missing_attachment_meta_answer_invalid() -> None:
     agent = GaiaGraphAgent(model=FakeModelWithMissingAttachmentMeta(), max_iterations=1)
     result = agent.solve(
@@ -222,32 +288,6 @@ def test_graph_solves_reversed_opposite_prompt_heuristically() -> None:
     assert result["tool_trace"] == ["heuristic(reversed_text_opposite_word)"]
 
 
-def test_graph_solves_wikipedia_album_count_heuristically(monkeypatch) -> None:
-    def fake_counter(artist_name: str, start_year: int, end_year: int) -> int:
-        assert artist_name == "Mercedes Sosa"
-        assert start_year == 2000
-        assert end_year == 2009
-        return 3
-
-    monkeypatch.setattr(
-        graph_module,
-        "count_wikipedia_studio_album_count_for_artist",
-        fake_counter,
-    )
-
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
-    result = agent.solve(
-        Question(
-            task_id="4",
-            question="How many studio albums were published by Mercedes Sosa between 2000 and 2009 (included)? You can use the latest 2022 version of english wikipedia.",
-            file_name=None,
-        )
-    )
-
-    assert result["submitted_answer"] == "3"
-    assert result["tool_trace"] == ["heuristic(wikipedia_studio_album_count:Mercedes Sosa:2000-2009)"]
-
-
 def test_graph_solves_non_commutative_subset_heuristically() -> None:
     agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
     result = agent.solve(
@@ -273,39 +313,20 @@ def test_graph_solves_non_commutative_subset_heuristically() -> None:
     assert result["tool_trace"] == ["heuristic(non_commutative_subset)"]
 
 
-def test_graph_solves_featured_article_dinosaur_nominator_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
-    result = agent.solve(
-        Question(
-            task_id="6",
-            question="Who nominated the only Featured Article on English Wikipedia about a dinosaur that was promoted in November 2016?",
-            file_name=None,
-        )
-    )
+def test_graph_no_longer_short_circuits_benchmark_specific_questions() -> None:
+    class FakeModelWithoutTools:
+        def __init__(self) -> None:
+            self.calls = 0
 
-    assert result["submitted_answer"] == "FunkMonk"
-    assert result["tool_trace"] == ["heuristic(wikipedia_featured_article_dinosaur_nominator:2016-11)"]
+        def bind_tools(self, _tools):
+            return self
 
+        def invoke(self, _messages):
+            self.calls += 1
+            return AIMessage(content="[ANSWER]model-driven answer[/ANSWER]")
 
-def test_graph_solves_tealc_hot_quote_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
-    result = agent.solve(
-        Question(
-            task_id="7",
-            question=(
-                "Examine the video at https://www.youtube.com/watch?v=1htKBjuUWec.\n\n"
-                "What does Teal'c say in response to the question \"Isn't that hot?\""
-            ),
-            file_name=None,
-        )
-    )
-
-    assert result["submitted_answer"] == "Extremely."
-    assert result["tool_trace"] == ["heuristic(youtube_tealc_hot_quote)"]
-
-
-def test_graph_solves_polish_ray_magda_role_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
+    model = FakeModelWithoutTools()
+    agent = GaiaGraphAgent(model=model, max_iterations=2)
     result = agent.solve(
         Question(
             task_id="7b",
@@ -314,84 +335,28 @@ def test_graph_solves_polish_ray_magda_role_heuristically() -> None:
         )
     )
 
-    assert result["submitted_answer"] == "Wojciech"
-    assert result["tool_trace"] == ["heuristic(polish_ray_actor_magda_role)"]
+    assert model.calls == 1
+    assert result["submitted_answer"] == "model-driven answer"
+    assert result["tool_trace"] == []
 
 
-def test_graph_solves_libretexts_equine_veterinarian_surname_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
-    result = agent.solve(
-        Question(
-            task_id="8",
-            question=(
-                "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
-                "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory "
-                "Chemistry materials as compiled 08/21/2023?"
-            ),
-            file_name=None,
-        )
-    )
+def test_prepare_context_includes_research_hints_for_linked_article_questions() -> None:
+    state = {
+        "task_id": "hint-1",
+        "question": (
+            "On June 6, 2023, an article was published. The article links to a paper at the bottom. "
+            "Find the paper and answer a question about it."
+        ),
+        "file_name": None,
+        "local_file_path": None,
+        "messages": [],
+    }
 
-    assert result["submitted_answer"] == "Louvrier"
-    assert result["tool_trace"] == ["heuristic(libretexts_equine_veterinarian_surname)"]
+    prepared = graph_module._prepare_context(state)  # type: ignore[arg-type]
+    prompt = prepared["messages"][1].content
 
-
-def test_graph_solves_yankees_1977_walks_at_bats_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
-    result = agent.solve(
-        Question(
-            task_id="8b",
-            question="How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?",
-            file_name=None,
-        )
-    )
-
-    assert result["submitted_answer"] == "519"
-    assert result["tool_trace"] == ["heuristic(yankees_1977_walks_at_bats)"]
-
-
-def test_graph_solves_universe_today_arendt_award_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
-    result = agent.solve(
-        Question(
-            task_id="8c",
-            question=(
-                "On June 6, 2023, an article by Carolyn Collins Petersen was published in Universe Today. "
-                "This article mentions a team that produced a paper about their observations, linked at the "
-                "bottom of the article. Find this paper. Under what NASA award number was the work performed "
-                "by R. G. Arendt supported by?"
-            ),
-            file_name=None,
-        )
-    )
-
-    assert result["submitted_answer"] == "80GSFC21M0002"
-    assert result["tool_trace"] == ["heuristic(universe_today_arendt_award)"]
-
-
-def test_graph_solves_botanical_vegetable_subset_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
-    result = agent.solve(
-        Question(
-            task_id="9",
-            question=(
-                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
-                "to categorizing things. I need to add different foods to different categories on the grocery list, but if I make "
-                "a mistake, she won't buy anything inserted in the wrong category. Here's the list I have so far:\n\n"
-                "milk, eggs, flour, whole bean coffee, Oreos, sweet potatoes, fresh basil, plums, green beans, rice, corn, bell "
-                "pepper, whole allspice, acorns, broccoli, celery, zucchini, lettuce, peanuts\n\n"
-                "I need to make headings for the fruits and vegetables. Could you please create a list of just the vegetables from "
-                "my list? If you could do that, then I can figure out how to categorize the rest of the list into the appropriate "
-                "categories. But remember that my mom is a real stickler, so make sure that no botanical fruits end up on the "
-                "vegetable list, or she won't get them when she's at the store. Please alphabetize the list of vegetables, and "
-                "place each item in a comma separated list."
-            ),
-            file_name=None,
-        )
-    )
-
-    assert result["submitted_answer"] == "broccoli, celery, fresh basil, lettuce, sweet potatoes"
-    assert result["tool_trace"] == ["heuristic(botanical_vegetable_subset)"]
+    assert "Research hints:" in prompt
+    assert "extract_links_from_url" in prompt
 
 
 def test_graph_marks_audio_access_meta_answer_invalid() -> None:

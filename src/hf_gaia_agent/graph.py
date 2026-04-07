@@ -12,10 +12,10 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 
 from .api_client import Question
+from .evidence_solver import ToolEvidence, solve_answer_from_tool_evidence
 from .normalize import normalize_submitted_answer
 from .tools import (
     build_tools,
-    count_wikipedia_studio_album_count_for_artist,
     read_file_content,
 )
 
@@ -34,6 +34,17 @@ Rules:
 - For YouTube questions, fetch the transcript first when available before falling back to general web search.
 - If the question requires visual analysis of a YouTube video (e.g. counting objects, identifying
   what appears on screen, describing scenes), use the analyze_youtube_video tool.
+- If the prompt already contains the full table, list, or code needed to solve the task, reason from the prompt
+  before using web search.
+- For Wikipedia-focused questions, prefer search_wikipedia and fetch_wikipedia_page before broad web search.
+- If a webpage likely points to a paper, source document, or supporting page, use extract_links_from_url
+  to inspect its outgoing links before answering.
+- Search results are only hints. After finding a promising page, inspect it with fetch_url, find_text_in_url,
+  extract_tables_from_url, or extract_links_from_url before answering.
+- Once a tool returns a relevant table, list, transcript excerpt, or page passage, stop searching and compute
+  the answer from that evidence.
+- Return the shortest answer that satisfies the question's formatting requirements. Do not add lead-in phrases,
+  explanations, or full-sentence wrappers unless the question explicitly asks for them.
 - Preserve commas, ordering, pluralization, and formatting constraints requested by the task.
 """
 
@@ -125,34 +136,6 @@ OPPOSITE_WORDS = {
     "no": "yes",
 }
 URL_RE = re.compile(r"https?://\S+", flags=re.IGNORECASE)
-STUDIO_ALBUM_COUNT_RE = re.compile(
-    r"how many studio albums were published by (?P<artist>.+?) between (?P<start>\d{4}) and (?P<end>\d{4})",
-    flags=re.IGNORECASE,
-)
-FEATURED_DINOSAUR_NOMINATOR_RE = re.compile(
-    r"who nominated the only featured article on english wikipedia about a dinosaur that was promoted in november 2016\??",
-    flags=re.IGNORECASE,
-)
-TEALC_HOT_RE = re.compile(
-    r"examine the video at https://www\.youtube\.com/watch\?v=1htkbjuuwec\.\s*what does teal'c say in response to the question \"isn't that hot\?\"",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-POLISH_RAY_MAGDA_RE = re.compile(
-    r"who did the actor who played ray in the polish-language version of everybody loves raymond play in magda m\.\??\s*give only the first name\.",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-YANKEES_1977_WALKS_AT_BATS_RE = re.compile(
-    r"how many at bats did the yankee with the most walks in the 1977 regular season have that same season\??",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-UNIVERSE_TODAY_ARENDT_AWARD_RE = re.compile(
-    r"on june 6, 2023, an article by carolyn collins petersen was published in universe today\..*under what nasa award number was the work performed by r\. g\. arendt supported by\??",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-LIBRETEXTS_EQUINE_VET_RE = re.compile(
-    r"what is the surname of the equine veterinarian mentioned in 1\.e exercises .*libretext'?s introductory chemistry materials as compiled 08/21/2023\??",
-    flags=re.IGNORECASE | re.DOTALL,
-)
 SET_DEFINITION_RE = re.compile(r"set\s+s\s*=\s*\{(?P<body>[^}]+)\}", flags=re.IGNORECASE)
 
 
@@ -205,6 +188,7 @@ def _prepare_context(state: AgentState) -> dict[str, Any]:
     attachment_block = ""
     decoded_block = ""
     youtube_block = ""
+    research_hint_block = _build_research_hint_block(state["question"])
     decoded_question = _maybe_decode_reversed_question(state["question"])
     if decoded_question:
         decoded_block = (
@@ -248,6 +232,7 @@ def _prepare_context(state: AgentState) -> dict[str, Any]:
         f"Question:\n{state['question']}"
         f"{decoded_block}"
         f"{youtube_block}"
+        f"{research_hint_block}"
         f"{attachment_block}\n\n"
         "Work carefully. Use tools if needed. "
         "Return the final answer only as [ANSWER]...[/ANSWER]."
@@ -270,7 +255,8 @@ class GaiaGraphAgent:
     def __init__(self, *, model: Any | None = None, max_iterations: int | None = None):
         self.tools = build_tools()
         self.tools_by_name = {tool_.name: tool_ for tool_ in self.tools}
-        self.model = (model or _build_model()).bind_tools(self.tools)
+        self.answer_model = model or _build_model()
+        self.model = self.answer_model.bind_tools(self.tools)
         self.max_iterations = max_iterations or int(os.getenv("GAIA_MAX_ITERATIONS", "6"))
         self.app = self._build_graph().compile()
 
@@ -378,6 +364,12 @@ class GaiaGraphAgent:
             )
             if fallback_answer:
                 return {"final_answer": fallback_answer, "error": None}
+            structured_answer = self._structured_answer_from_evidence(state)
+            if structured_answer:
+                return {"final_answer": structured_answer, "error": None}
+            salvaged_answer = self._salvage_answer_from_evidence(state)
+            if salvaged_answer:
+                return {"final_answer": salvaged_answer, "error": None}
             final_answer = ""
             error = error or "Model produced an invalid non-answer."
         if not final_answer:
@@ -386,6 +378,12 @@ class GaiaGraphAgent:
             )
             if fallback_answer:
                 return {"final_answer": fallback_answer, "error": None}
+            structured_answer = self._structured_answer_from_evidence(state)
+            if structured_answer:
+                return {"final_answer": structured_answer, "error": None}
+            salvaged_answer = self._salvage_answer_from_evidence(state)
+            if salvaged_answer:
+                return {"final_answer": salvaged_answer, "error": None}
             error = error or "Model did not produce a final answer."
         return {"final_answer": final_answer, "error": error}
 
@@ -394,10 +392,80 @@ class GaiaGraphAgent:
             content=(
                 "Your previous reply was invalid because it was not a concrete answer. "
                 "Do not apologize, do not mention access issues, and do not ask to try again later. "
-                "Use additional tool calls if needed, then respond only with [ANSWER]the factual answer[/ANSWER]."
+                "First review the existing tool outputs already in the conversation. "
+                "If they contain a relevant table, list, passage, or transcript excerpt, compute the answer from that evidence "
+                "instead of doing more broad searches. Only make another tool call if the existing evidence is clearly insufficient. "
+                "Respond only with [ANSWER]the factual answer[/ANSWER]."
             )
         )
         return {"messages": [reminder]}
+
+    def _salvage_answer_from_evidence(self, state: AgentState) -> str | None:
+        evidence_blocks: list[str] = []
+        for message in state["messages"]:
+            if not isinstance(message, ToolMessage):
+                continue
+            content = normalize_submitted_answer(str(message.content))
+            if not content or self._is_invalid_tool_output(content):
+                continue
+            tool_name = (getattr(message, "name", "") or "tool").strip()
+            evidence_blocks.append(f"Tool: {tool_name}\n{content}")
+
+        if not evidence_blocks:
+            return None
+
+        evidence_text = "\n\n".join(evidence_blocks[-6:])
+        evidence_text = evidence_text[-12000:]
+        response = self.answer_model.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "Answer the question using only the provided evidence from previous tool outputs. "
+                        "Do not mention uncertainty, access limits, or missing information. "
+                        "If the evidence is insufficient, respond exactly with [INSUFFICIENT]. "
+                        "If the evidence is sufficient, respond only with [ANSWER]final answer[/ANSWER]. "
+                        "Return the shortest answer that satisfies the requested format."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Question:\n{state['question']}\n\n"
+                        f"Evidence:\n{evidence_text}"
+                    )
+                ),
+            ]
+        )
+        content = str(getattr(response, "content", "") or "").strip()
+        if content == "[INSUFFICIENT]":
+            return None
+        candidate = normalize_submitted_answer(content)
+        if not candidate or self._is_invalid_final_response(candidate):
+            return None
+        return candidate
+
+    @staticmethod
+    def _structured_answer_from_evidence(state: AgentState) -> str | None:
+        tool_outputs: list[ToolEvidence] = []
+        for message in state["messages"]:
+            if not isinstance(message, ToolMessage):
+                continue
+            raw_content = str(message.content).strip()
+            normalized = normalize_submitted_answer(raw_content)
+            if not normalized or GaiaGraphAgent._is_invalid_tool_output(normalized):
+                continue
+            tool_outputs.append(
+                ToolEvidence(
+                    tool_name=(getattr(message, "name", "") or "tool").strip(),
+                    content=raw_content,
+                )
+            )
+
+        if not tool_outputs:
+            return None
+        candidate = solve_answer_from_tool_evidence(state["question"], tool_outputs)
+        if not candidate or GaiaGraphAgent._is_invalid_final_response(candidate):
+            return None
+        return candidate
 
     @staticmethod
     def _last_ai_message(messages: list[Any]) -> AIMessage | None:
@@ -551,46 +619,9 @@ class GaiaGraphAgent:
                     if opposite:
                         return opposite, "heuristic(reversed_text_opposite_word)"
 
-        album_match = STUDIO_ALBUM_COUNT_RE.search(question)
-        if album_match and "wikipedia" in question.lower():
-            artist = album_match.group("artist").strip(" ?.")
-            start_year = int(album_match.group("start"))
-            end_year = int(album_match.group("end"))
-            try:
-                count = count_wikipedia_studio_album_count_for_artist(
-                    artist_name=artist,
-                    start_year=start_year,
-                    end_year=end_year,
-                )
-            except Exception:
-                return None, None
-            return str(count), f"heuristic(wikipedia_studio_album_count:{artist}:{start_year}-{end_year})"
-
-        if FEATURED_DINOSAUR_NOMINATOR_RE.fullmatch(question.strip()):
-            return "FunkMonk", "heuristic(wikipedia_featured_article_dinosaur_nominator:2016-11)"
-
-        if TEALC_HOT_RE.fullmatch(" ".join(question.split())):
-            return "Extremely.", "heuristic(youtube_tealc_hot_quote)"
-
-        if POLISH_RAY_MAGDA_RE.fullmatch(" ".join(question.split())):
-            return "Wojciech", "heuristic(polish_ray_actor_magda_role)"
-
-        if YANKEES_1977_WALKS_AT_BATS_RE.fullmatch(" ".join(question.split())):
-            return "519", "heuristic(yankees_1977_walks_at_bats)"
-
-        if UNIVERSE_TODAY_ARENDT_AWARD_RE.fullmatch(" ".join(question.split())):
-            return "80GSFC21M0002", "heuristic(universe_today_arendt_award)"
-
-        if LIBRETEXTS_EQUINE_VET_RE.fullmatch(" ".join(question.split())):
-            return "Louvrier", "heuristic(libretexts_equine_veterinarian_surname)"
-
         non_commutative_subset = _find_non_commutative_subset(question)
         if non_commutative_subset:
             return ", ".join(non_commutative_subset), "heuristic(non_commutative_subset)"
-
-        botanical_vegetables = _find_botanical_vegetable_subset(question)
-        if botanical_vegetables:
-            return ", ".join(botanical_vegetables), "heuristic(botanical_vegetable_subset)"
         return None, None
 
     def solve(
@@ -658,6 +689,50 @@ def _is_youtube_url(url: str) -> bool:
     return "youtube.com/" in lowered or "youtu.be/" in lowered
 
 
+def _build_research_hint_block(question: str) -> str:
+    lowered = question.lower()
+    hints: list[str] = []
+
+    if (
+        "|---|" in question
+        or "here's the list i have so far:" in lowered
+        or "comma separated list" in lowered and "," in question
+        or "attached python code" in lowered
+    ):
+        hints.append(
+            "This task may be solvable from the information already present in the prompt. "
+            "Before searching the web, check whether direct reasoning over the provided table, list, or code is enough."
+        )
+
+    if "wikipedia" in lowered:
+        hints.append(
+            "This task explicitly references Wikipedia. Prefer search_wikipedia and fetch_wikipedia_page before broad web search."
+        )
+
+    if (
+        "linked at the bottom of the article" in lowered
+        or "linked at the bottom" in lowered
+        or "links to a paper at the bottom" in lowered
+        or "link to a paper at the bottom" in lowered
+    ):
+        hints.append(
+            "This task refers to an article that links to a source. Find the article page, then inspect its outgoing links "
+            "with extract_links_from_url instead of relying only on search snippets."
+        )
+
+    generic_urls = [url for url in _extract_urls(question) if not _is_youtube_url(url)]
+    if generic_urls:
+        hints.append(
+            f"This task already names a URL: {', '.join(generic_urls)}. "
+            "Inspect that page directly with fetch_url, find_text_in_url, extract_tables_from_url, or extract_links_from_url."
+        )
+
+    if not hints:
+        return ""
+    hint_body = "\n".join(f"- {hint}" for hint in hints)
+    return f"\n\nResearch hints:\n{hint_body}"
+
+
 def _find_non_commutative_subset(question: str) -> list[str] | None:
     lowered = question.lower()
     if "not commutative" not in lowered or "table defining" not in lowered:
@@ -686,43 +761,6 @@ def _find_non_commutative_subset(question: str) -> list[str] | None:
     if not involved:
         return []
     return sorted(involved)
-
-
-def _find_botanical_vegetable_subset(question: str) -> list[str] | None:
-    lowered = question.lower()
-    if "professor of botany" not in lowered or "vegetable list" not in lowered:
-        return None
-
-    marker = "here's the list i have so far:"
-    end_marker = "i need to make headings"
-    start = lowered.find(marker)
-    end = lowered.find(end_marker, start if start != -1 else 0)
-    if start == -1 or end == -1 or end <= start:
-        return None
-
-    raw_items = question[start + len(marker):end]
-    items = [item.strip() for item in raw_items.replace("\n", " ").split(",") if item.strip()]
-    if not items:
-        return None
-
-    botanical_fruits = {
-        "plums",
-        "green beans",
-        "corn",
-        "bell pepper",
-        "whole allspice",
-        "acorns",
-        "zucchini",
-        "peanuts",
-    }
-    botanical_vegetables = {
-        item for item in items
-        if item not in botanical_fruits
-        and item in {"sweet potatoes", "fresh basil", "broccoli", "celery", "lettuce"}
-    }
-    return sorted(botanical_vegetables)
-
-
 def _parse_markdown_operation_table(question: str) -> dict[tuple[str, str], str] | None:
     lines = [line.strip() for line in question.splitlines() if line.strip().startswith("|")]
     if len(lines) < 3:

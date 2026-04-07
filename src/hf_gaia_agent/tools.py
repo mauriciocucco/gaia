@@ -35,28 +35,30 @@ import shutil
 import subprocess
 import tempfile
 from typing import Any
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 import xml.etree.ElementTree as ET
+import zipfile
 
 logger = logging.getLogger(__name__)
 
 import httpx
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, Comment, Tag
 from duckduckgo_search import DDGS
 from langchain_core.tools import tool
 from pypdf import PdfReader
 
 
 _HTTP_HEADERS = {
-    "User-Agent": "GaiaAgent/1.0 (https://github.com/gaia-agent; educational research)",
-}
-_SEARCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+_SEARCH_HEADERS = {
+    **_HTTP_HEADERS,
 }
 _AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
 
@@ -99,6 +101,116 @@ def _read_pdf(path: Path) -> str:
     for page in reader.pages[:20]:
         chunks.append(page.extract_text() or "")
     return "\n".join(chunks)
+
+
+def _read_pdf_bytes(data: bytes) -> str:
+    reader = PdfReader(io.BytesIO(data))
+    chunks: list[str] = []
+    for page in reader.pages[:20]:
+        chunks.append(page.extract_text() or "")
+    return "\n".join(chunks)
+
+
+_XLSX_MAIN_NS = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+_XLSX_REL_NS = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
+_XLSX_DOC_REL_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def _read_xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    try:
+        raw_xml = archive.read("xl/sharedStrings.xml")
+    except KeyError:
+        return []
+
+    root = ET.fromstring(raw_xml)
+    values: list[str] = []
+    for item in root.findall("main:si", _XLSX_MAIN_NS):
+        text_parts = [part.text or "" for part in item.findall(".//main:t", _XLSX_MAIN_NS)]
+        values.append("".join(text_parts).strip())
+    return values
+
+
+def _read_xlsx_sheet_entries(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    rel_map = {
+        rel.attrib["Id"]: rel.attrib["Target"]
+        for rel in rels.findall("rel:Relationship", _XLSX_REL_NS)
+        if rel.attrib.get("Id") and rel.attrib.get("Target")
+    }
+
+    sheets: list[tuple[str, str]] = []
+    for sheet in workbook.findall("main:sheets/main:sheet", _XLSX_MAIN_NS):
+        name = sheet.attrib.get("name", "Sheet")
+        rel_id = sheet.attrib.get(f"{_XLSX_DOC_REL_NS}id")
+        target = rel_map.get(rel_id or "", "")
+        if not target:
+            continue
+        normalized_target = target.lstrip("/")
+        if not normalized_target.startswith("xl/"):
+            normalized_target = f"xl/{normalized_target}"
+        sheets.append((name, normalized_target))
+    return sheets
+
+
+def _read_xlsx_cell_value(cell: ET.Element, shared_strings: list[str]) -> str:
+    cell_type = cell.attrib.get("t", "")
+    value = cell.findtext("main:v", default="", namespaces=_XLSX_MAIN_NS).strip()
+    if cell_type == "s":
+        if value.isdigit():
+            index = int(value)
+            if 0 <= index < len(shared_strings):
+                return shared_strings[index]
+        return value
+    if cell_type == "inlineStr":
+        text_parts = [part.text or "" for part in cell.findall(".//main:t", _XLSX_MAIN_NS)]
+        return "".join(text_parts).strip()
+    if cell_type == "b":
+        return "TRUE" if value == "1" else "FALSE"
+    formula = cell.findtext("main:f", default="", namespaces=_XLSX_MAIN_NS).strip()
+    if formula and not value:
+        return f"={formula}"
+    return value
+
+
+def _read_xlsx(path: Path, *, max_rows: int = 80) -> str:
+    with zipfile.ZipFile(path) as archive:
+        shared_strings = _read_xlsx_shared_strings(archive)
+        sheet_entries = _read_xlsx_sheet_entries(archive)
+        if not sheet_entries:
+            raise ValueError(f"No worksheets found in {path.name}.")
+
+        lines: list[str] = []
+        rows_emitted = 0
+        for sheet_name, member_path in sheet_entries:
+            if rows_emitted >= max_rows:
+                break
+            try:
+                root = ET.fromstring(archive.read(member_path))
+            except KeyError:
+                continue
+
+            sheet_rows: list[str] = []
+            for row in root.findall(".//main:sheetData/main:row", _XLSX_MAIN_NS):
+                values = [
+                    cell_value
+                    for cell in row.findall("main:c", _XLSX_MAIN_NS)
+                    if (cell_value := _read_xlsx_cell_value(cell, shared_strings))
+                ]
+                if not values:
+                    continue
+                sheet_rows.append(", ".join(values))
+                rows_emitted += 1
+                if rows_emitted >= max_rows:
+                    break
+
+            if sheet_rows:
+                lines.append(f"Sheet: {sheet_name}")
+                lines.extend(sheet_rows)
+
+        if not lines:
+            raise ValueError(f"No readable worksheet rows found in {path.name}.")
+        return "\n".join(lines)
 
 
 def _audio_api_config() -> tuple[str, str, str]:
@@ -169,6 +281,8 @@ def read_file_content(path: str) -> str:
         content = _html_to_text(candidate.read_text(encoding="utf-8", errors="replace"))
     elif suffix == ".pdf":
         content = _read_pdf(candidate)
+    elif suffix == ".xlsx":
+        content = _read_xlsx(candidate)
     elif suffix in _AUDIO_SUFFIXES:
         content = _transcribe_audio(candidate)
     else:
@@ -333,6 +447,237 @@ def _normalize_search_result(
     }
 
 
+def _format_search_results(results: list[dict[str, str]]) -> str:
+    lines = []
+    for index, item in enumerate(results, start=1):
+        title = item.get("title") or "Untitled"
+        href = item.get("href") or item.get("url") or ""
+        body = item.get("body") or ""
+        lines.append(f"{index}. {title}\nURL: {href}\nSnippet: {body}")
+    return "\n\n".join(lines)
+
+
+def _wikipedia_page_url(title: str) -> str:
+    normalized_title = title.strip().replace(" ", "_")
+    return f"https://en.wikipedia.org/wiki/{quote(normalized_title, safe='()_')}"
+
+
+def _wikipedia_title_from_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().removeprefix("www.")
+    if not host.endswith("wikipedia.org"):
+        return None
+    if not parsed.path.startswith("/wiki/"):
+        return None
+    title = unquote(parsed.path.removeprefix("/wiki/")).strip()
+    if not title or ":" in title:
+        return None
+    return title.replace("_", " ")
+
+
+def _r_jina_ai_url(url: str) -> str:
+    return f"https://r.jina.ai/http://{url}"
+
+
+def _query_terms(value: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", value.lower())
+
+
+def _score_text_match(text: str, query: str) -> int:
+    normalized_text = text.lower()
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        return 0
+
+    score = 0
+    if normalized_query in normalized_text:
+        score += 100
+
+    terms = [term for term in _query_terms(normalized_query) if len(term) >= 3]
+    unique_terms = list(dict.fromkeys(terms))
+    for term in unique_terms:
+        if term in normalized_text:
+            score += 10
+    return score
+
+
+def _iter_html_tables(soup: BeautifulSoup) -> list[Tag]:
+    tables = list(soup.find_all("table"))
+    for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
+        comment_html = str(comment).strip()
+        if "<table" not in comment_html.lower():
+            continue
+        comment_soup = BeautifulSoup(comment_html, "html.parser")
+        tables.extend(comment_soup.find_all("table"))
+    return tables
+
+
+def _fetch_html_text(url: str) -> tuple[str, str]:
+    with httpx.Client(timeout=30.0, follow_redirects=True, headers=_HTTP_HEADERS) as client:
+        direct_error: Exception | None = None
+        response: httpx.Response | None = None
+        try:
+            response = client.get(url)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "text/html" not in content_type:
+                raise RuntimeError(f"URL did not return HTML content: {url}")
+            response_url = str(getattr(response, "url", "") or url)
+            return response.text, response_url
+        except Exception as exc:
+            direct_error = exc
+
+        page_title = _wikipedia_title_from_url(url)
+        if page_title:
+            response = client.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "parse",
+                    "format": "json",
+                    "page": page_title,
+                    "prop": "text",
+                    "redirects": "1",
+                    "formatversion": "2",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            html = str(payload.get("parse", {}).get("text") or "").strip()
+            resolved_title = str(payload.get("parse", {}).get("title") or page_title).strip()
+            if html:
+                return html, _wikipedia_page_url(resolved_title)
+
+        if direct_error is not None:
+            raise direct_error
+        raise RuntimeError(f"Unable to fetch HTML content from URL: {url}")
+
+
+def _fetch_r_jina_markdown(url: str) -> str:
+    with httpx.Client(timeout=30.0, follow_redirects=True, headers=_HTTP_HEADERS) as client:
+        response = client.get(_r_jina_ai_url(url))
+        response.raise_for_status()
+    return response.text
+
+
+def _clean_markdown_cell(value: str) -> str:
+    cleaned = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", value)
+    cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
+    cleaned = re.sub(r"\[\[edit\]\([^)]+\)\]", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip(" |")
+
+
+def _render_markdown_tables(
+    markdown_text: str,
+    *,
+    text_filter: str,
+    max_tables: int,
+    max_rows_per_table: int,
+) -> str:
+    lowered_filter = text_filter.strip().lower()
+    lines = markdown_text.splitlines()
+    rendered_candidates: list[tuple[int, str]] = []
+    current_table: list[str] = []
+    pending_heading = ""
+
+    def _flush_current_table() -> None:
+        nonlocal current_table, pending_heading
+        if len(current_table) < 2:
+            current_table = []
+            return
+
+        rows: list[str] = []
+        if pending_heading:
+            rows.append(f"Caption: {pending_heading}")
+
+        for raw_line in current_table:
+            stripped = raw_line.strip()
+            if re.fullmatch(r"\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?", stripped):
+                continue
+            cells = [_clean_markdown_cell(cell) for cell in stripped.strip().strip("|").split("|")]
+            cells = [cell for cell in cells if cell]
+            if cells:
+                rows.append(" | ".join(cells))
+            if len(rows) >= max_rows_per_table + (1 if pending_heading else 0):
+                break
+
+        current_table = []
+        if not rows:
+            return
+
+        rendered = "\n".join(rows)
+        score = _score_text_match(rendered, lowered_filter) if lowered_filter else 1
+        if lowered_filter and score <= 0:
+            return
+        rendered_candidates.append((score, rendered))
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if stripped.startswith("#"):
+            pending_heading = stripped.lstrip("#").strip()
+        if stripped.startswith("|") and stripped.count("|") >= 2:
+            current_table.append(stripped)
+            continue
+        if current_table:
+            _flush_current_table()
+
+    if current_table:
+        _flush_current_table()
+
+    rendered_candidates.sort(key=lambda item: -item[0])
+    rendered_tables = [
+        f"Table {index}\n{rendered}"
+        for index, (_score, rendered) in enumerate(rendered_candidates[:max_tables], start=1)
+    ]
+    if not rendered_tables:
+        return "No readable HTML tables found."
+    return _truncate("\n\n".join(rendered_tables), max_chars=20000)
+
+
+def _fetch_url_text(url: str) -> str:
+    response: httpx.Response | None = None
+    direct_error: Exception | None = None
+    with httpx.Client(timeout=30.0, follow_redirects=True, headers=_HTTP_HEADERS) as client:
+        try:
+            response = client.get(url)
+            response.raise_for_status()
+        except Exception as exc:
+            direct_error = exc
+            response = None
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                raise
+            fallback_response = client.get(_r_jina_ai_url(url))
+            fallback_response.raise_for_status()
+            response = fallback_response
+
+    if response is None:
+        if direct_error is not None:
+            raise direct_error
+        raise RuntimeError(f"Unable to fetch URL: {url}")
+
+    content_type = response.headers.get("content-type", "")
+    response_url = str(response.url)
+    if "application/json" in content_type:
+        text = json.dumps(response.json(), ensure_ascii=True, indent=2)
+    elif "application/pdf" in content_type or response_url.lower().endswith(".pdf"):
+        text = _read_pdf_bytes(response.content)
+    elif "text/html" in content_type:
+        title = ""
+        soup = BeautifulSoup(response.text, "html.parser")
+        if soup.title:
+            title = soup.title.get_text(" ", strip=True)
+        body_text = _html_to_text(response.text)
+        if title:
+            text = f"Title: {title}\nURL: {response_url}\n\n{body_text}"
+        else:
+            text = body_text
+    else:
+        text = response.text
+    return _truncate(text)
+
+
 def _merge_search_results(
     existing: list[dict[str, str]],
     incoming: list[dict[str, str]],
@@ -461,31 +806,258 @@ def web_search(query: str, max_results: int = 5) -> str:
         if errors:
             raise RuntimeError("All search providers failed: " + " | ".join(errors))
         return "No results found."
+    return _format_search_results(results)
 
-    lines = []
-    for index, item in enumerate(results, start=1):
-        title = item.get("title") or "Untitled"
-        href = item.get("href") or item.get("url") or ""
-        body = item.get("body") or ""
-        lines.append(f"{index}. {title}\nURL: {href}\nSnippet: {body}")
-    return "\n\n".join(lines)
+
+@tool
+def search_wikipedia(query: str, max_results: int = 5) -> str:
+    """Search English Wikipedia and return candidate pages with snippets."""
+    with httpx.Client(timeout=20.0, follow_redirects=True, headers=_HTTP_HEADERS) as client:
+        response = client.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "format": "json",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": str(max_results),
+                "utf8": "1",
+            },
+        )
+        response.raise_for_status()
+
+    payload = response.json()
+    raw_results = payload.get("query", {}).get("search", [])
+    results: list[dict[str, str]] = []
+    for item in raw_results:
+        title = str(item.get("title") or "").strip()
+        snippet_html = str(item.get("snippet") or "").strip()
+        snippet = BeautifulSoup(snippet_html, "html.parser").get_text(" ", strip=True)
+        normalized = _normalize_search_result(
+            title=title,
+            url=_wikipedia_page_url(title),
+            snippet=snippet,
+        )
+        if normalized is not None:
+            results.append(normalized)
+
+    if not results:
+        return "No Wikipedia results found."
+    return _format_search_results(results)
 
 
 @tool
 def fetch_url(url: str) -> str:
     """Fetch a URL and return text extracted from the response body."""
-    with httpx.Client(timeout=30.0, follow_redirects=True, headers=_HTTP_HEADERS) as client:
-        response = client.get(url)
+    return _fetch_url_text(url)
+
+
+@tool
+def fetch_wikipedia_page(title: str) -> str:
+    """Fetch the plain-text extract for an English Wikipedia page by title."""
+    with httpx.Client(timeout=20.0, follow_redirects=True, headers=_HTTP_HEADERS) as client:
+        response = client.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "format": "json",
+                "prop": "extracts|info",
+                "explaintext": "1",
+                "redirects": "1",
+                "inprop": "url",
+                "titles": title,
+                "formatversion": "2",
+            },
+        )
         response.raise_for_status()
 
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        text = json.dumps(response.json(), ensure_ascii=True, indent=2)
-    elif "text/html" in content_type:
-        text = _html_to_text(response.text)
-    else:
-        text = response.text
-    return _truncate(text)
+    pages = response.json().get("query", {}).get("pages", [])
+    if not pages:
+        raise RuntimeError(f"Wikipedia returned no page data for title '{title}'.")
+    page = pages[0]
+    if page.get("missing"):
+        raise RuntimeError(f"Wikipedia page not found for title '{title}'.")
+
+    page_title = str(page.get("title") or title).strip()
+    full_url = str(page.get("fullurl") or _wikipedia_page_url(page_title)).strip()
+    extract = str(page.get("extract") or "").strip()
+    if not extract:
+        raise RuntimeError(f"Wikipedia page '{page_title}' returned no extract text.")
+    return _truncate(f"Title: {page_title}\nURL: {full_url}\n\n{extract}", max_chars=20000)
+
+
+def _same_registered_host(left: str, right: str) -> bool:
+    def _normalize(host: str) -> str:
+        return host.lower().removeprefix("www.")
+
+    return _normalize(left) == _normalize(right)
+
+
+@tool
+def extract_links_from_url(
+    url: str,
+    text_filter: str = "",
+    max_results: int = 20,
+    same_domain_only: bool = False,
+) -> str:
+    """Fetch an HTML page and list links, optionally filtered by anchor text or restricted to the same domain."""
+    html, base_url = _fetch_html_text(url)
+    base_host = urlparse(base_url).netloc
+    lowered_filter = text_filter.strip().lower()
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for anchor in soup.select("a[href]"):
+        href = str(anchor.get("href") or "").strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:")):
+            continue
+        resolved = urljoin(base_url, href)
+        resolved_host = urlparse(resolved).netloc
+        if same_domain_only and not _same_registered_host(base_host, resolved_host):
+            continue
+
+        text = re.sub(r"\s+", " ", anchor.get_text(" ", strip=True)).strip()
+        title_attr = re.sub(r"\s+", " ", str(anchor.get("title") or "").strip())
+        haystack = " ".join(part for part in (text, title_attr, resolved) if part).lower()
+        if lowered_filter and lowered_filter not in haystack:
+            continue
+        if resolved in seen:
+            continue
+
+        normalized = _normalize_search_result(
+            title=text or title_attr or resolved,
+            url=resolved,
+            snippet=title_attr,
+        )
+        if normalized is None:
+            continue
+        results.append(normalized)
+        seen.add(resolved)
+        if len(results) >= max_results:
+            break
+
+    if not results:
+        return "No matching links found."
+    return _format_search_results(results)
+
+
+@tool
+def find_text_in_url(url: str, query: str, max_matches: int = 8) -> str:
+    """Fetch a URL and return the most relevant lines or snippets containing the query text."""
+    text = _fetch_url_text(url)
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        raise ValueError("query must not be empty.")
+
+    matches: list[str] = []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in lines:
+        if normalized_query in line.lower():
+            matches.append(line)
+            if len(matches) >= max_matches:
+                break
+
+    if matches:
+        return "\n".join(matches)
+
+    scored_lines = [
+        (line, _score_text_match(line, normalized_query))
+        for line in lines
+    ]
+    scored_lines = [(line, score) for line, score in scored_lines if score > 0]
+    if scored_lines:
+        scored_lines.sort(key=lambda item: (-item[1], len(item[0])))
+        return "\n".join(line for line, _score in scored_lines[:max_matches])
+
+    window_matches: list[str] = []
+    lowered_text = text.lower()
+    start = 0
+    while len(window_matches) < max_matches:
+        index = lowered_text.find(normalized_query, start)
+        if index == -1:
+            break
+        snippet_start = max(0, index - 140)
+        snippet_end = min(len(text), index + len(normalized_query) + 140)
+        snippet = re.sub(r"\s+", " ", text[snippet_start:snippet_end]).strip()
+        if snippet and snippet not in window_matches:
+            window_matches.append(snippet)
+        start = index + len(normalized_query)
+
+    if window_matches:
+        return "\n".join(window_matches)
+
+    words = [word for word in _query_terms(normalized_query) if len(word) >= 3]
+    if not words:
+        return "No matches found."
+
+    snippets: list[tuple[str, int]] = []
+    for line in lines:
+        score = _score_text_match(line, normalized_query)
+        if score <= 0:
+            continue
+        snippets.append((line, score))
+    if snippets:
+        snippets.sort(key=lambda item: (-item[1], len(item[0])))
+        return "\n".join(text for text, _score in snippets[:max_matches])
+    return "No matches found."
+
+
+@tool
+def extract_tables_from_url(
+    url: str,
+    text_filter: str = "",
+    max_tables: int = 5,
+    max_rows_per_table: int = 15,
+) -> str:
+    """Fetch an HTML page and extract readable text from its tables, optionally filtering to relevant tables."""
+    try:
+        html, _resolved_url = _fetch_html_text(url)
+    except Exception:
+        markdown_text = _fetch_r_jina_markdown(url)
+        return _render_markdown_tables(
+            markdown_text,
+            text_filter=text_filter,
+            max_tables=max_tables,
+            max_rows_per_table=max_rows_per_table,
+        )
+
+    soup = BeautifulSoup(html, "html.parser")
+    lowered_filter = text_filter.strip().lower()
+    tables = _iter_html_tables(soup)
+    rendered_tables: list[str] = []
+    rendered_candidates: list[tuple[int, str]] = []
+    for table in tables:
+        rows: list[str] = []
+        caption_el = table.find("caption")
+        if caption_el:
+            caption_text = caption_el.get_text(" ", strip=True)
+            if caption_text:
+                rows.append(f"Caption: {caption_text}")
+        for row in table.find_all("tr")[:max_rows_per_table]:
+            cells = row.find_all(["th", "td"])
+            if not cells:
+                continue
+            values = [re.sub(r"\s+", " ", cell.get_text(" ", strip=True)).strip() for cell in cells]
+            values = [value for value in values if value]
+            if values:
+                rows.append(" | ".join(values))
+        if not rows:
+            continue
+
+        rendered = "\n".join(rows)
+        score = _score_text_match(rendered, lowered_filter) if lowered_filter else 1
+        if lowered_filter and score <= 0:
+            continue
+        rendered_candidates.append((score, rendered))
+
+    rendered_candidates.sort(key=lambda item: -item[0])
+    for table_index, (_score, rendered) in enumerate(rendered_candidates[:max_tables], start=1):
+        rendered_tables.append(f"Table {table_index}\n{rendered}")
+
+    if not rendered_tables:
+        return "No readable HTML tables found."
+    return _truncate("\n\n".join(rendered_tables), max_chars=20000)
 
 
 @tool
@@ -767,7 +1339,7 @@ def count_wikipedia_studio_albums(
 
 @tool
 def read_local_file(path: str) -> str:
-    """Read a local text, CSV, JSON, HTML, PDF, or supported audio file."""
+    """Read a local text, CSV, JSON, HTML, PDF, XLSX, or supported audio file."""
     return read_file_content(path)
 
 
@@ -840,7 +1412,12 @@ def calculate(expression: str) -> str:
 def build_tools() -> list[Any]:
     return [
         web_search,
+        search_wikipedia,
         fetch_url,
+        fetch_wikipedia_page,
+        extract_links_from_url,
+        find_text_in_url,
+        extract_tables_from_url,
         get_youtube_transcript,
         analyze_youtube_video,
         count_wikipedia_studio_albums,

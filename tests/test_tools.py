@@ -3,6 +3,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import shutil
+import zipfile
 
 import pytest
 
@@ -14,6 +15,7 @@ from hf_gaia_agent.tools import (
     _extract_json_object,
     _extract_max_count_from_payload,
     _is_counting_visual_question,
+    _read_xlsx,
     extract_youtube_video_id,
 )
 
@@ -75,6 +77,61 @@ def test_encode_frame_base64(tmp_path: Path) -> None:
     encoded = _encode_frame_base64(frame)
     assert isinstance(encoded, str)
     assert len(encoded) > 0
+
+
+def test_read_xlsx_extracts_sheet_rows(tmp_path: Path) -> None:
+    workbook = tmp_path / "sales.xlsx"
+    with zipfile.ZipFile(workbook, "w") as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+              <sheets>
+                <sheet name="Menu" sheetId="1" r:id="rId1"/>
+              </sheets>
+            </workbook>""",
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+              <Relationship Id="rId1"
+                            Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+                            Target="worksheets/sheet1.xml"/>
+            </Relationships>""",
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="3" uniqueCount="3">
+              <si><t>Item</t></si>
+              <si><t>Total</t></si>
+              <si><t>Burger</t></si>
+            </sst>""",
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData>
+                <row r="1">
+                  <c r="A1" t="s"><v>0</v></c>
+                  <c r="B1" t="s"><v>1</v></c>
+                </row>
+                <row r="2">
+                  <c r="A2" t="s"><v>2</v></c>
+                  <c r="B2"><v>12.50</v></c>
+                </row>
+              </sheetData>
+            </worksheet>""",
+        )
+
+    text = _read_xlsx(workbook)
+
+    assert "Sheet: Menu" in text
+    assert "Item, Total" in text
+    assert "Burger, 12.50" in text
 
 
 def test_download_video_calls_yt_dlp(tmp_path: Path, monkeypatch) -> None:
