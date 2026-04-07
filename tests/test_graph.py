@@ -76,6 +76,34 @@ class FakeModelWithInvalidFinalAfterTool:
         )
 
 
+class FakeModelWithToolFailureAndInvalidFinal:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "name": "analyze_youtube_video",
+                        "args": {
+                            "url": "https://www.youtube.com/watch?v=L1vXCYZAYYM",
+                            "question": "What is the highest number of bird species to be on camera simultaneously?",
+                        },
+                    }
+                ],
+            )
+        return AIMessage(
+            content="The answer cannot be determined from the available information."
+        )
+
+
 class ExplodingModel:
     def bind_tools(self, _tools):
         return self
@@ -131,6 +159,29 @@ def test_graph_falls_back_to_tool_answer_when_final_response_is_invalid(monkeypa
 
     assert result["submitted_answer"] == "3"
     assert result["error"] is None
+
+
+def test_graph_does_not_submit_tool_failure_as_answer(monkeypatch) -> None:
+    @tool
+    def analyze_youtube_video(url: str, question: str) -> str:
+        """Return an operational failure message from mocked video analysis."""
+        assert url == "https://www.youtube.com/watch?v=L1vXCYZAYYM"
+        assert "highest number of bird species" in question.lower()
+        return "Failed to download video L1vXCYZAYYM: 'yt-dlp' not found on PATH. Install it first."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [analyze_youtube_video])
+
+    agent = GaiaGraphAgent(model=FakeModelWithToolFailureAndInvalidFinal(), max_iterations=2)
+    result = agent.solve(
+        Question(
+            task_id="2c",
+            question="In the video https://www.youtube.com/watch?v=L1vXCYZAYYM, what is the highest number of bird species to be on camera simultaneously?",
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == ""
+    assert result["error"] == "Model produced an invalid non-answer."
 
 
 def test_graph_solves_reversed_opposite_prompt_heuristically() -> None:

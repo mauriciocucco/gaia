@@ -2,6 +2,7 @@
 .uv-cache/
 .cache/
 .tmp/
+.pytest_tmp/
 .test-artifacts/
 .pytest_cache/
 pytest-cache-files-*/

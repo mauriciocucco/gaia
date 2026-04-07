@@ -74,6 +74,16 @@ NUMERIC_QUESTION_PREFIXES = (
     "what is the maximum number",
     "what is the total number",
 )
+INVALID_TOOL_OUTPUT_PATTERNS = (
+    "failed to ",
+    "tool error:",
+    "transcript unavailable",
+    "no frames extracted",
+    "not found on path",
+    "install it first",
+    "could not retrieve",
+    "download video",
+)
 
 COMMON_ENGLISH_HINTS = {
     "the",
@@ -363,6 +373,8 @@ class GaiaGraphAgent:
         normalized = normalize_submitted_answer(content)
         if not normalized:
             return None
+        if GaiaGraphAgent._is_invalid_tool_output(normalized):
+            return None
         if tool_name in {"calculate", "count_wikipedia_studio_albums"}:
             return normalized
         if tool_name == "analyze_youtube_video":
@@ -405,6 +417,13 @@ class GaiaGraphAgent:
         if len(numbers) == 1:
             return numbers[0]
         return None
+
+    @staticmethod
+    def _is_invalid_tool_output(text: str) -> bool:
+        normalized = normalize_submitted_answer(text).strip().lower()
+        if not normalized:
+            return True
+        return any(pattern in normalized for pattern in INVALID_TOOL_OUTPUT_PATTERNS)
 
     @staticmethod
     def _is_invalid_final_response(text: str) -> bool:
