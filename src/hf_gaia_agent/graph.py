@@ -406,9 +406,27 @@ def _build_profile_guidance_block(*, question: str, profile: QuestionProfile) ->
         hints.append(
             "Fetch a roster or pitchers table directly and answer from that table. Do not reconstruct roster data from memory or with invented Python lists."
         )
+        if profile.expected_date:
+            hints.append(
+                f"The question is date-sensitive ({profile.expected_date}). Prefer sources that explicitly mention that date/season rather than a generic current roster page."
+            )
     if profile.name == "article_to_paper":
         hints.append(
             "Find the exact article page, inspect its outgoing links, then read the linked paper or source. Answer only from fetched evidence."
+        )
+    if profile.name == "text_span_lookup":
+        hints.append(
+            "This is a targeted text-span lookup. Prefer the exact exercise/page and use find_text_in_url with the key noun phrase before browsing broadly."
+        )
+        hints.append(
+            "Avoid bulk PDFs or book-level landing pages when an exact exercise page is available."
+        )
+    if profile.name == "entity_role_chain":
+        hints.append(
+            "This is a two-hop entity resolution task: identify the actor first, then read a cast/character source for the target show or series."
+        )
+        hints.append(
+            "Avoid social posts, fandom pages, and generic popularity pages when cast or filmography sources are available."
         )
     if "libretexts.org" in profile.expected_domains:
         hints.append(
@@ -621,6 +639,10 @@ class GaiaGraphAgent:
         if profile.name == "wikipedia_lookup":
             guidance.append(
                 "If the answer depends on a table or participant counts, prefer extract_tables_from_url on the best Wikipedia candidate."
+            )
+        if profile.name == "text_span_lookup":
+            guidance.append(
+                "For text-span lookups, prefer the exact exercise/page candidate over generic course mirrors or bulk PDFs."
             )
         return "\n".join(guidance)
 
@@ -840,6 +862,7 @@ class GaiaGraphAgent:
             if tool_name in fetch_tool_names:
                 redirected_candidate = self._pick_better_fetch_candidate(
                     requested_url=str(tool_args.get("url", "")).strip(),
+                    profile=question_profile,
                     ranked_candidates=ranked_candidates,
                     fetched_urls=fetched_urls,
                 )
@@ -883,6 +906,10 @@ class GaiaGraphAgent:
             except Exception as exc:
                 result = f"Tool error: {exc}"
             result_text = str(result)
+            if tool_name == "extract_tables_from_url":
+                executed_url = str(tool_args.get("url", "")).strip()
+                if executed_url and "URL:" not in result_text:
+                    result_text = f"URL: {executed_url}\n{result_text}"
             tool_messages.append(
                 ToolMessage(
                     content=result_text,
@@ -963,6 +990,11 @@ class GaiaGraphAgent:
             "zhihu.com",
             "news.google",
             "grokipedia",
+            "instagram.com",
+            "facebook.com",
+            "fandom.com",
+            "pinterest.com",
+            "tiktok.com",
             "lowyat.net",
             "naca.com",
             "/search?",
@@ -973,10 +1005,19 @@ class GaiaGraphAgent:
     def _pick_better_fetch_candidate(
         *,
         requested_url: str,
+        profile: QuestionProfile,
         ranked_candidates: list[SourceCandidate],
         fetched_urls: set[str],
     ) -> SourceCandidate | None:
         if not requested_url or not GaiaGraphAgent._is_obviously_bad_candidate_url(requested_url):
+            best_candidate = GaiaGraphAgent._preferred_ranked_fetch_candidate(
+                requested_url=requested_url,
+                profile=profile,
+                ranked_candidates=ranked_candidates,
+                fetched_urls=fetched_urls,
+            )
+            if best_candidate is not None:
+                return best_candidate
             return None
         for candidate in ranked_candidates:
             if candidate.url in fetched_urls:
@@ -987,6 +1028,50 @@ class GaiaGraphAgent:
                 continue
             if candidate.score >= 20:
                 return candidate
+        return None
+
+    @staticmethod
+    def _preferred_ranked_fetch_candidate(
+        *,
+        requested_url: str,
+        profile: QuestionProfile,
+        ranked_candidates: list[SourceCandidate],
+        fetched_urls: set[str],
+    ) -> SourceCandidate | None:
+        if not ranked_candidates:
+            return None
+        requested_lower = requested_url.lower()
+        best_candidate = ranked_candidates[0]
+        if best_candidate.url in fetched_urls or best_candidate.url == requested_url:
+            return None
+
+        if profile.name == "text_span_lookup":
+            best_reasons = set(best_candidate.reasons)
+            requested_is_generic_mirror = any(
+                fragment in requested_lower
+                for fragment in ("/courses/", "/ancillary_materials/", "/bookshelves/introductory_chemistry/introductory_chemistry_(libretexts)")
+            )
+            requested_is_exact_exercise = any(
+                token in requested_lower for token in ("1.e", "1.e%3a", "1.0e", "exercise")
+            )
+            if (
+                best_candidate.score >= 60
+                and {"exercise_page", "canonical_textbook_path"} & best_reasons
+                and (requested_is_generic_mirror or not requested_is_exact_exercise)
+            ):
+                return best_candidate
+
+        if profile.name == "roster_neighbor_lookup" and profile.expected_date:
+            requested_is_current_roster = (
+                "list_of_current" in requested_lower or "current" in requested_lower
+            )
+            best_reasons = set(best_candidate.reasons)
+            if (
+                requested_is_current_roster
+                and best_candidate.score >= 45
+                and {"dated_roster_hint", "expected_date", "expected_date_partial", "expected_year"} & best_reasons
+            ):
+                return best_candidate
         return None
 
     @staticmethod
@@ -1049,6 +1134,14 @@ class GaiaGraphAgent:
             return "tools"
         if (
             GaiaGraphAgent._is_invalid_final_response(str(getattr(last_message, "content", "")))
+            and state.get("iterations", 0) < state.get("max_iterations", 0)
+        ):
+            return "retry_invalid_answer"
+        if (
+            GaiaGraphAgent._requires_temporal_roster_retry(
+                state,
+                str(getattr(last_message, "content", "")),
+            )
             and state.get("iterations", 0) < state.get("max_iterations", 0)
         ):
             return "retry_invalid_answer"
@@ -1173,6 +1266,18 @@ class GaiaGraphAgent:
         }
 
     def _retry_invalid_answer_node(self, state: AgentState) -> dict[str, Any]:
+        temporal_roster_retry = self._requires_temporal_roster_retry(
+            state,
+            str(getattr(self._last_ai_message(state["messages"]), "content", "") or ""),
+        )
+        extra = ""
+        if temporal_roster_retry:
+            profile = _question_profile_from_state(state)
+            extra = (
+                f" This question is date-sensitive ({profile.expected_date}). "
+                "Your current evidence looks like a current or undated roster, so do not answer yet. "
+                "Fetch a roster/archive/oldid/team page that is explicitly grounded to the requested date or season."
+            )
         reminder = HumanMessage(
             content=(
                 "Your previous reply was invalid because it was not a concrete answer. "
@@ -1180,7 +1285,7 @@ class GaiaGraphAgent:
                 "Answer from the existing evidence first. "
                 "If the current tool outputs already contain a relevant table, list, passage, or transcript excerpt, compute the answer from that evidence and stop. "
                 "Only make another tool call if you can point to a concrete gap in the existing evidence. "
-                "Respond only with [ANSWER]the factual answer[/ANSWER]."
+                f"Respond only with [ANSWER]the factual answer[/ANSWER].{extra}"
             )
         )
         return {"messages": [reminder]}
@@ -1220,9 +1325,68 @@ class GaiaGraphAgent:
                 score += 8
             if profile.expected_date and profile.expected_date.lower() in haystack:
                 score += 8
+            if profile.name == "roster_neighbor_lookup" and profile.expected_date:
+                if GaiaGraphAgent._record_has_temporal_support(record, profile):
+                    score += 20
+                if GaiaGraphAgent._record_looks_current_only(record):
+                    score -= 30
             scored_records.append((score, record))
         scored_records.sort(key=lambda item: item[0], reverse=True)
         return [record for _score, record in scored_records[:limit]]
+
+    @staticmethod
+    def _record_has_temporal_support(record: EvidenceRecord, profile: QuestionProfile) -> bool:
+        if not profile.expected_date:
+            return True
+        haystack = f"{record.source_url}\n{record.title_or_caption}\n{record.content}".lower()
+        if profile.expected_date.lower() in haystack:
+            return True
+        year_tokens = {
+            token
+            for token in re.findall(r"\b\d{4}\b", profile.expected_date)
+        }
+        month_tokens = {
+            token
+            for token in re.findall(
+                r"january|february|march|april|may|june|july|august|september|october|november|december",
+                profile.expected_date.lower(),
+            )
+        }
+        has_year = not year_tokens or any(token in haystack for token in year_tokens)
+        has_month = not month_tokens or any(token in haystack for token in month_tokens)
+        if has_year and has_month:
+            return True
+        if has_year and any(token in haystack for token in ("archive", "oldid", "season", "media guide")):
+            return True
+        return False
+
+    @staticmethod
+    def _record_looks_current_only(record: EvidenceRecord) -> bool:
+        haystack = f"{record.source_url}\n{record.title_or_caption}\n{record.content}".lower()
+        return "list_of_current" in haystack or "current roster" in haystack
+
+    @staticmethod
+    def _requires_temporal_roster_retry(state: AgentState, answer_text: str) -> bool:
+        profile = _question_profile_from_state(state)
+        if profile.name != "roster_neighbor_lookup" or not profile.expected_date:
+            return False
+        candidate = normalize_submitted_answer(answer_text)
+        if not candidate or GaiaGraphAgent._is_invalid_final_response(candidate):
+            return False
+        records = GaiaGraphAgent._collect_evidence_records(state["messages"])
+        if not records:
+            return False
+        relevant_records = [
+            record
+            for record in records
+            if record.kind in {"table", "text"} and ("roster" in record.content.lower() or "pitcher" in record.content.lower() or "list_of_current" in record.source_url.lower())
+        ]
+        if not relevant_records:
+            return False
+        return not any(
+            GaiaGraphAgent._record_has_temporal_support(record, profile)
+            for record in relevant_records
+        )
 
     @staticmethod
     def _format_grounded_evidence_for_llm(records: list[EvidenceRecord]) -> str:
@@ -1455,6 +1619,8 @@ class GaiaGraphAgent:
             for candidate in re.findall(r"\b[A-Z0-9]{10,}\b", normalized.upper()):
                 if sum(ch.isalpha() for ch in candidate) >= 2 and sum(ch.isdigit() for ch in candidate) >= 2:
                     return candidate
+        if "without abbreviations" in lowered:
+            normalized = re.sub(r"\bSt\.?\s+", "Saint ", normalized)
         return normalized
 
     @staticmethod

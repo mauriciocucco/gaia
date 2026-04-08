@@ -136,6 +136,15 @@ TEXT_SPAN_ATTRIBUTE_HINTS = (
     "first name",
     "city name",
 )
+METRIC_TOKEN_ALIASES = {
+    "at bats": {"ab"},
+    "walks": {"bb"},
+    "bases on balls": {"bb"},
+    "runs batted in": {"rbi"},
+    "home runs": {"hr"},
+    "wins": {"w"},
+    "losses": {"l"},
+}
 
 
 @dataclass(frozen=True)
@@ -273,6 +282,8 @@ IOC_COUNTRY_CODES = {
 def solve_answer_from_tool_evidence(
     question: str, tool_outputs: Sequence[ToolEvidence]
 ) -> str | None:
+    if _parse_metric_row_lookup_question(question) is not None:
+        return None
     comparison_mode = _comparison_mode(question)
     if comparison_mode is None:
         return None
@@ -300,6 +311,10 @@ def solve_answer_from_evidence_records(
     question: str,
     evidence_records: Sequence[EvidenceRecord],
 ) -> tuple[str | None, str | None]:
+    metric_lookup_candidate = _solve_metric_row_lookup_from_records(question, evidence_records)
+    if metric_lookup_candidate:
+        return metric_lookup_candidate, "metric_row_lookup"
+
     table_outputs = [
         ToolEvidence(tool_name=record.extraction_method, content=record.content)
         for record in evidence_records
@@ -358,6 +373,8 @@ def _solve_roster_neighbor_from_records(
 
     for record in evidence_records:
         if record.kind != "table":
+            continue
+        if not _record_matches_roster_temporal_request(record, question):
             continue
         tables = _extract_pipe_tables(_clean_tool_content(record.content))
         for rows in tables:
@@ -420,6 +437,26 @@ def _solve_roster_neighbor_from_records(
     return None
 
 
+def _record_matches_roster_temporal_request(record: EvidenceRecord, question: str) -> bool:
+    lowered = question.lower()
+    if "as of " not in lowered:
+        return True
+    haystack = f"{record.source_url}\n{record.title_or_caption}\n{record.content}".lower()
+    expected_bits = re.findall(
+        r"january|february|march|april|may|june|july|august|september|october|november|december|\b\d{4}\b",
+        lowered,
+    )
+    if expected_bits and all(bit in haystack for bit in expected_bits):
+        return True
+    year_bits = [bit for bit in expected_bits if re.fullmatch(r"\d{4}", bit)]
+    if year_bits and any(bit in haystack for bit in year_bits):
+        if any(token in haystack for token in ("archive", "oldid", "season", "media guide")):
+            return True
+    if "list_of_current" in haystack or "current roster" in haystack:
+        return False
+    return not expected_bits
+
+
 def _solve_award_number_from_records(
     question: str,
     evidence_records: Sequence[EvidenceRecord],
@@ -436,6 +473,38 @@ def _solve_award_number_from_records(
             if len(candidate) >= 8:
                 return candidate
     return None
+
+
+def _solve_metric_row_lookup_from_records(
+    question: str,
+    evidence_records: Sequence[EvidenceRecord],
+) -> str | None:
+    parsed = _parse_metric_row_lookup_question(question)
+    if parsed is None:
+        return None
+    answer_metric, comparison_mode, select_metric = parsed
+
+    best: _CandidateAnswer | None = None
+    for record in evidence_records:
+        if record.kind != "table":
+            continue
+        content = _clean_tool_content(record.content)
+        if not content:
+            continue
+        candidate = _solve_metric_row_lookup_from_table(
+            question=question,
+            content=content,
+            tool_name=record.extraction_method,
+            answer_metric=answer_metric,
+            comparison_mode=comparison_mode,
+            select_metric=select_metric,
+        )
+        if candidate is None:
+            continue
+        if best is None or candidate.score > best.score:
+            best = candidate
+
+    return best.answer if best is not None else None
 
 
 def _solve_temporal_row_filter_from_records(
@@ -594,6 +663,99 @@ def _solve_parenthetical_rows(
         content[:800], _tokenize(question)
     )
     return _CandidateAnswer(answer=answer, score=score)
+
+
+def _parse_metric_row_lookup_question(
+    question: str,
+) -> tuple[str, str, str] | None:
+    match = re.search(
+        r"how many\s+(?P<answer_metric>.+?)\s+did\s+.+?\s+with\s+the\s+"
+        r"(?P<comparison>most|least|fewest|highest|lowest|minimum|maximum|smallest|largest)\s+"
+        r"(?P<select_metric>.+?)\s+have",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    comparison_word = match.group("comparison").lower()
+    comparison_mode = "max" if comparison_word in MAX_COMPARISON_HINTS else "min"
+    answer_metric = match.group("answer_metric").strip()
+    select_metric = match.group("select_metric").strip()
+    if not answer_metric or not select_metric:
+        return None
+    return answer_metric, comparison_mode, select_metric
+
+
+def _solve_metric_row_lookup_from_table(
+    *,
+    question: str,
+    content: str,
+    tool_name: str,
+    answer_metric: str,
+    comparison_mode: str,
+    select_metric: str,
+) -> _CandidateAnswer | None:
+    best: _CandidateAnswer | None = None
+    question_tokens = _tokenize(question)
+    answer_metric_tokens = _metric_tokens(answer_metric)
+    select_metric_tokens = _metric_tokens(select_metric)
+
+    for rows in _extract_pipe_tables(content):
+        if len(rows) < 2:
+            continue
+        headers = rows[0]
+        data_rows = rows[1:]
+        column_count = min(len(row) for row in rows)
+        if column_count < 2:
+            continue
+
+        numeric_counts = [
+            sum(_parse_number(row[index]) is not None for row in data_rows)
+            for index in range(column_count)
+        ]
+        answer_column = _pick_metric_column_for_tokens(headers, numeric_counts, answer_metric_tokens)
+        select_column = _pick_metric_column_for_tokens(headers, numeric_counts, select_metric_tokens)
+        if answer_column is None or select_column is None or answer_column == select_column:
+            continue
+
+        best_row: list[str] | None = None
+        best_selector_value: float | None = None
+        for row in data_rows:
+            if len(row) <= max(answer_column, select_column):
+                continue
+            selector_value = _parse_number(row[select_column])
+            answer_value = _parse_number(row[answer_column])
+            if selector_value is None or answer_value is None:
+                continue
+            if best_row is None or best_selector_value is None:
+                best_row = row
+                best_selector_value = selector_value
+                continue
+            if comparison_mode == "max" and selector_value > best_selector_value:
+                best_row = row
+                best_selector_value = selector_value
+            elif comparison_mode == "min" and selector_value < best_selector_value:
+                best_row = row
+                best_selector_value = selector_value
+
+        if best_row is None:
+            continue
+
+        answer_value = _parse_number(best_row[answer_column])
+        if answer_value is None:
+            continue
+
+        score = (
+            _tool_priority(tool_name)
+            + 18
+            + 6 * _token_overlap_score(headers[answer_column], question_tokens | answer_metric_tokens)
+            + 6 * _token_overlap_score(headers[select_column], question_tokens | select_metric_tokens)
+        )
+        candidate = _CandidateAnswer(answer=_format_number(answer_value), score=score)
+        if best is None or candidate.score > best.score:
+            best = candidate
+
+    return best
 
 
 def _iter_named_rows(
@@ -856,6 +1018,45 @@ def _pick_metric_column(
     if best_score is not None and best_score[0] <= 0:
         return None
     return best_index
+
+
+def _pick_metric_column_for_tokens(
+    headers: list[str],
+    numeric_counts: list[int],
+    metric_tokens: set[str],
+) -> int | None:
+    if not metric_tokens:
+        return None
+    best_index = None
+    best_score: tuple[int, int, int] | None = None
+    for index, count in enumerate(numeric_counts):
+        if count < 1:
+            continue
+        header = headers[index] if index < len(headers) else ""
+        normalized_header = _normalize_text(header)
+        overlap = _token_overlap_score(header, metric_tokens)
+        if normalized_header in metric_tokens:
+            overlap += 3
+        if normalized_header in GENERIC_NUMERIC_HEADERS:
+            overlap -= 1
+        score = (overlap, count, -index)
+        if best_score is None or score > best_score:
+            best_index = index
+            best_score = score
+    if best_index is None:
+        return None
+    if best_score is not None and best_score[0] <= 0:
+        return None
+    return best_index
+
+
+def _metric_tokens(value: str) -> set[str]:
+    tokens = _tokenize(value)
+    lowered = value.lower()
+    for phrase, aliases in METRIC_TOKEN_ALIASES.items():
+        if phrase in lowered:
+            tokens.update(aliases)
+    return tokens
 
 
 def _pick_label_column(

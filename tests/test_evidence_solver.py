@@ -60,3 +60,34 @@ def test_solve_answer_from_evidence_records_filters_temporal_rows() -> None:
 
     assert answer == "Claus"
     assert reducer == "temporal_row_filter"
+
+
+def test_solve_answer_from_evidence_records_selects_row_by_metric_and_returns_other_column() -> None:
+    question = (
+        "How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?"
+    )
+    records = [
+        EvidenceRecord(
+            kind="table",
+            source_url="https://www.baseball-reference.com/teams/NYY/1977.shtml",
+            source_type="table",
+            adapter_name="StatsTableAdapter",
+            content=(
+                "Table 1\n"
+                "Caption: Batting\n"
+                "Player | AB | BB\n"
+                "Thurman Munson | 519 | 82\n"
+                "Reggie Jackson | 589 | 66\n"
+                "Graig Nettles | 566 | 80\n"
+            ),
+            title_or_caption="Batting",
+            confidence=0.8,
+            extraction_method="extract_tables_from_url",
+            derived_from=("extract_tables_from_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "519"
+    assert reducer == "metric_row_lookup"

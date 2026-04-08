@@ -227,6 +227,85 @@ class FakeModelForAutoFetch:
         return AIMessage(content="[ANSWER]done[/ANSWER]")
 
 
+class FakeModelForBadFetchRedirect:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-search",
+                        "name": "web_search",
+                        "args": {
+                            "query": "actor who played Ray in Polish Everybody Loves Raymond Magda M. character",
+                            "max_results": 5,
+                        },
+                    }
+                ],
+            )
+        if self.calls == 2:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-fetch",
+                        "name": "fetch_url",
+                        "args": {
+                            "url": "https://www.instagram.com/popular/actor-who-played-ray-in-polish-version-of-everybody-loves-raymond/"
+                        },
+                    }
+                ],
+            )
+        return AIMessage(content="[ANSWER]done[/ANSWER]")
+
+
+class FakeModelForTextSpanRedirect:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-search",
+                        "name": "web_search",
+                        "args": {
+                            "query": "equine veterinarian libretexts ck-12 1.E exercises",
+                            "max_results": 5,
+                        },
+                    }
+                ],
+            )
+        if self.calls == 2:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-find",
+                        "name": "find_text_in_url",
+                        "args": {
+                            "url": "https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01%3A_Chemistry_in_our_Lives/1.E%3A_Exercises",
+                            "query": "equine veterinarian",
+                        },
+                    }
+                ],
+            )
+        return AIMessage(content="[ANSWER]done[/ANSWER]")
+
+
 class FakeModelWithGroundedTextSalvage:
     def __init__(self) -> None:
         self.calls = 0
@@ -262,6 +341,50 @@ class FakeModelWithGroundedTextSalvage:
         assert "Question profile:" in last_prompt
         assert "Dr. Rivera" in last_prompt
         return AIMessage(content="[ANSWER]Rivera[/ANSWER]")
+
+
+class FakeModelWithTemporalRosterRetry:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-current-roster",
+                        "name": "extract_tables_from_url",
+                        "args": {
+                            "url": "https://en.wikipedia.org/wiki/List_of_current_Nippon_Professional_Baseball_team_rosters",
+                            "text_filter": "Hokkaido Nippon-Ham Fighters pitchers",
+                        },
+                    }
+                ],
+            )
+        if self.calls == 2:
+            return AIMessage(content="[ANSWER]Yamasaki, Uehara[/ANSWER]")
+        if self.calls == 3:
+            reminder_text = " ".join(str(getattr(msg, "content", "")) for msg in messages)
+            assert "date-sensitive (as of July 2023)" in reminder_text
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-archive-roster",
+                        "name": "extract_tables_from_url",
+                        "args": {
+                            "url": "https://npb.example.com/fighters/archive/2023-07-roster",
+                            "text_filter": "pitchers",
+                        },
+                    }
+                ],
+            )
+        return AIMessage(content="[ANSWER]Yoshida, Uehara[/ANSWER]")
 
 
 def test_graph_runs_tools_and_normalizes_answer() -> None:
@@ -381,6 +504,19 @@ def test_graph_canonicalizes_award_number_answers() -> None:
     )
 
     assert result["submitted_answer"] == "80NSSC20K0533"
+
+
+def test_graph_expands_city_abbreviations_when_question_forbids_abbreviations() -> None:
+    agent = GaiaGraphAgent(model=FakeModelSingleAnswer("[ANSWER]St. Petersburg[/ANSWER]"), max_iterations=1)
+    result = agent.solve(
+        Question(
+            task_id="city-no-abbrev",
+            question="Where were the specimens eventually deposited? Just give me the city name without abbreviations.",
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "Saint Petersburg"
 
 
 def test_graph_marks_missing_attachment_meta_answer_invalid() -> None:
@@ -625,6 +761,94 @@ def test_graph_auto_fetch_uses_ranked_candidate_instead_of_first_raw_url(monkeyp
     assert not any("forums.example.com" in item for item in result["tool_trace"] if item.startswith("fetch_url("))
 
 
+def test_graph_redirects_bad_fetch_candidate_for_entity_role_chain(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return a bad social URL plus a better cast page."""
+        assert max_results == 5
+        assert "Magda M." in query
+        return (
+            "1. Popular actor post\n"
+            "URL: https://www.instagram.com/popular/actor-who-played-ray-in-polish-version-of-everybody-loves-raymond/\n"
+            "Snippet: social post about the actor\n\n"
+            "2. Magda M. cast list\n"
+            "URL: https://en.wikipedia.org/wiki/Magda_M.\n"
+            "Snippet: cast and characters from Magda M.\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Fetch the chosen source page."""
+        assert "instagram.com" not in url
+        assert url == "https://en.wikipedia.org/wiki/Magda_M."
+        return "Title: Magda M.\nURL: https://en.wikipedia.org/wiki/Magda_M.\nCast list."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModelForBadFetchRedirect(), max_iterations=3)
+    result = agent.solve(
+        Question(
+            task_id="role-fetch-redirect",
+            question=(
+                "Who did the actor who played Ray in the Polish-language version of Everybody Loves Raymond play in Magda M.? "
+                "Give only the first name."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "done"
+    assert any(
+        item.startswith("fetch_url(") and "https://en.wikipedia.org/wiki/Magda_M." in item
+        for item in result["tool_trace"]
+    )
+
+
+def test_graph_redirects_generic_libretexts_lookup_to_ranked_exact_page(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return a generic course mirror plus the canonical CK-12 exercise page."""
+        assert max_results == 5
+        assert "equine veterinarian" in query
+        return (
+            "1. Course mirror exercises\n"
+            "URL: https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01%3A_Chemistry_in_our_Lives/1.E%3A_Exercises\n"
+            "Snippet: Introductory chemistry course mirror exercise page\n\n"
+            "2. CK-12 1.E Exercises\n"
+            "URL: https://chem.libretexts.org/Bookshelves/Introductory_Chemistry/Book%3A_Introductory_Chemistry_(CK-12)/1%3A_Atoms_Molecules_and_Ions/1.E%3A_Exercises\n"
+            "Snippet: Introductory Chemistry CK-12 1.E Exercises equine veterinarian\n"
+        )
+
+    @tool
+    def find_text_in_url(url: str, query: str) -> str:
+        """Read the redirected exercise page."""
+        assert "Bookshelves/Introductory_Chemistry" in url
+        assert "/Courses/" not in url
+        assert query == "equine veterinarian"
+        return "The equine veterinarian mentioned in the exercise is Dr. Louvrier."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, find_text_in_url])
+
+    agent = GaiaGraphAgent(model=FakeModelForTextSpanRedirect(), max_iterations=3)
+    result = agent.solve(
+        Question(
+            task_id="text-span-fetch-redirect",
+            question=(
+                "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+                "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials "
+                "as compiled 08/21/2023?"
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "done"
+    assert any(
+        item.startswith("find_text_in_url(") and "Bookshelves/Introductory_Chemistry" in item
+        for item in result["tool_trace"]
+    )
+
+
 def test_graph_salvages_answer_from_grounded_text_without_new_reducer(monkeypatch) -> None:
     @tool
     def find_text_in_url(url: str, query: str) -> str:
@@ -649,6 +873,49 @@ def test_graph_salvages_answer_from_grounded_text_without_new_reducer(monkeypatc
 
     assert result["submitted_answer"] == "Rivera"
     assert result["error"] is None
+
+
+def test_graph_retries_date_sensitive_roster_answer_without_temporal_grounding(monkeypatch) -> None:
+    @tool
+    def extract_tables_from_url(url: str, text_filter: str = "") -> str:
+        """Return either a current roster table or a dated archive roster table."""
+        assert text_filter
+        if "List_of_current" in url:
+            return (
+                "Table 1\n"
+                "Caption: Hokkaido Nippon-Ham Fighters roster\n"
+                "No. | Name\n"
+                "18 | Sachiya Yamasaki\n"
+                "19 | Taisho Tamai\n"
+                "20 | Kenta Uehara\n"
+            )
+        assert "2023-07-roster" in url
+        return (
+            "Table 1\n"
+            "Caption: July 2023 Hokkaido Nippon-Ham Fighters pitchers\n"
+            "No. | Name\n"
+            "18 | Koki Yoshida\n"
+            "19 | Taisho Tamai\n"
+            "20 | Kenta Uehara\n"
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [extract_tables_from_url])
+
+    agent = GaiaGraphAgent(model=FakeModelWithTemporalRosterRetry(), max_iterations=4)
+    result = agent.solve(
+        Question(
+            task_id="temporal-roster-retry",
+            question=(
+                "Who are the pitchers with the number before and after Taishō Tamai's number as of July 2023? "
+                "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "Yoshida, Uehara"
+    assert any("List_of_current_Nippon_Professional_Baseball_team_rosters" in item for item in result["tool_trace"])
+    assert any("2023-07-roster" in item for item in result["tool_trace"])
 
 
 def test_graph_rejects_hallucinated_answer_when_required_attachment_is_missing() -> None:

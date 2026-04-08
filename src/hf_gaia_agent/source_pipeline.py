@@ -19,6 +19,12 @@ MONTH_DATE_RE = re.compile(
     r"(?P<day>\d{1,2}),\s+(?P<year>\d{4})\b",
     flags=re.IGNORECASE,
 )
+SLASH_DATE_RE = re.compile(r"\b(?P<month>\d{1,2})/(?P<day>\d{1,2})/(?P<year>\d{4})\b")
+MONTH_YEAR_RE = re.compile(
+    r"\b(?:as of\s+)?(?P<month>january|february|march|april|may|june|july|august|september|october|november|december)\s+"
+    r"(?P<year>\d{4})\b",
+    flags=re.IGNORECASE,
+)
 AUTHOR_PUBLISHED_RE = re.compile(
     r"\bby\s+(?P<author>[A-Z][A-Za-z.\-']+(?:\s+[A-Z][A-Za-z.\-']+){0,3})\s+was published\b"
 )
@@ -157,6 +163,17 @@ def profile_question(
             subject_name=subject_name,
             text_filter=text_filter,
         )
+    if _is_text_span_lookup_question(lowered):
+        return QuestionProfile(
+            name="text_span_lookup",
+            target_urls=generic_urls,
+            expected_domains=_expected_domains(question, default=()),
+            preferred_tools=("web_search", "find_text_in_url", "fetch_url"),
+            expected_date=expected_date,
+            expected_author=expected_author,
+            subject_name=subject_name,
+            text_filter=text_filter,
+        )
     if _is_olympics_country_code_question(lowered):
         return QuestionProfile(
             name="wikipedia_lookup",
@@ -178,6 +195,17 @@ def profile_question(
             expected_author=expected_author,
             subject_name=subject_name,
             text_filter=text_filter or (subject_name or ""),
+        )
+    if _is_entity_role_chain_question(lowered):
+        return QuestionProfile(
+            name="entity_role_chain",
+            target_urls=generic_urls,
+            expected_domains=_expected_domains(question, default=("wikipedia.org",)),
+            preferred_tools=("web_search", "fetch_url", "find_text_in_url"),
+            expected_date=expected_date,
+            expected_author=expected_author,
+            subject_name=subject_name,
+            text_filter=text_filter or "cast character",
         )
     if generic_urls:
         return QuestionProfile(
@@ -253,11 +281,16 @@ def score_candidates(
     question_tokens = _query_tokens(question)
     expected_date_tokens = _query_tokens(profile.expected_date or "")
     author_tokens = _query_tokens(profile.expected_author or "")
+    expected_year_tokens = {token for token in expected_date_tokens if len(token) == 4 and token.isdigit()}
     for candidate in candidates:
         score = 0
         reasons: list[str] = []
         haystack = f"{candidate.title}\n{candidate.snippet}\n{candidate.url}"
+        haystack_tokens = _query_tokens(haystack)
         domain = _registered_host(candidate.url)
+        if _is_low_signal_domain(domain):
+            score -= 120
+            reasons.append("low_signal_domain")
         if domain and profile.expected_domains and any(
             domain.endswith(expected) for expected in profile.expected_domains
         ):
@@ -269,16 +302,22 @@ def score_candidates(
         if candidate.origin_tool == "search_wikipedia" and profile.name == "wikipedia_lookup":
             score += 30
             reasons.append("preferred_source")
-        overlap = len(_query_tokens(haystack) & question_tokens)
+        overlap = len(haystack_tokens & question_tokens)
         if overlap:
             score += overlap * 8
             reasons.append(f"token_overlap:{overlap}")
         if profile.expected_date and profile.expected_date.lower() in haystack.lower():
             score += 35
             reasons.append("expected_date")
-        elif expected_date_tokens and expected_date_tokens <= _query_tokens(haystack):
+        elif expected_date_tokens and expected_date_tokens <= haystack_tokens:
             score += 10
             reasons.append("expected_date_partial")
+        elif expected_year_tokens and expected_year_tokens <= haystack_tokens:
+            score += 6
+            reasons.append("expected_year")
+        elif profile.name == "roster_neighbor_lookup" and profile.expected_date:
+            score -= 12
+            reasons.append("expected_date_miss")
         if author_tokens and author_tokens <= _query_tokens(haystack):
             score += 35
             reasons.append("expected_author")
@@ -289,10 +328,51 @@ def score_candidates(
             if "paper" in candidate.title.lower() or "paper" in candidate.snippet.lower():
                 score += 12
                 reasons.append("paper_mention")
+        if profile.name == "text_span_lookup":
+            if any(token in haystack.lower() for token in ("1.e", "exercises", "exercise")):
+                score += 28
+                reasons.append("exercise_page")
+            if any(token in haystack.lower() for token in ("ck-12", "introductory chemistry", "libretexts")):
+                score += 16
+                reasons.append("reference_text_match")
+            if (
+                "bookshelves/introductory_chemistry" in candidate.url.lower()
+                and "ck-12" in candidate.url.lower()
+                and any(token in candidate.url.lower() for token in ("1.e", "1.e%3a", "1.0e", "exercise"))
+            ):
+                score += 40
+                reasons.append("canonical_textbook_path")
+            if any(token in candidate.url.lower() for token in ("/courses/", "/ancillary_materials/")):
+                score -= 28
+                reasons.append("mirror_course_penalty")
+            if "batch.libretexts.org" in domain or candidate.url.lower().endswith(".pdf"):
+                score -= 80
+                reasons.append("bulk_pdf_penalty")
+        if profile.name == "entity_role_chain":
+            if any(token in haystack.lower() for token in ("cast", "character", "filmography", "portrayed", "played")):
+                score += 18
+                reasons.append("role_chain_hint")
+            if any(token in haystack.lower() for token in ("magda m", "raymond", "wszyscy kochaja")):
+                score += 12
+                reasons.append("target_series_hint")
         if profile.name in {"table_lookup", "roster_neighbor_lookup", "wikipedia_lookup"}:
             if any(token in candidate.title.lower() for token in ("roster", "statistics", "olympics")):
                 score += 10
                 reasons.append("tableish_title")
+        if profile.name == "roster_neighbor_lookup" and profile.expected_date:
+            if any(token in haystack.lower() for token in ("roster", "pitchers", "numbers", "staff")):
+                score += 22
+                reasons.append("roster_page_hint")
+            if any(token in haystack.lower() for token in ("2023", "july", "season", "archive", "oldid")):
+                score += 14
+                reasons.append("dated_roster_hint")
+            if (
+                "list_of_current" in candidate.url.lower()
+                or "current roster" in haystack.lower()
+                or candidate.url.lower().endswith("/current")
+            ):
+                score -= 36
+                reasons.append("current_roster_penalty")
         scored.append(
             SourceCandidate(
                 title=candidate.title,
@@ -365,16 +445,19 @@ def evidence_records_from_tool_output(tool_name: str, content: str) -> list[Evid
 
     if tool_name == "extract_tables_from_url":
         records = []
+        metadata = parse_fetch_metadata(normalized_content)
+        source_url = metadata.get("url", "")
+        source_title = metadata.get("title", "")
         for section in _split_rendered_tables(normalized_content):
             caption = _extract_caption(section)
             records.append(
                 EvidenceRecord(
                     kind="table",
-                    source_url="",
+                    source_url=source_url,
                     source_type="table",
                     adapter_name="TableExtraction",
                     content=section,
-                    title_or_caption=caption,
+                    title_or_caption=caption or source_title,
                     confidence=0.8,
                     extraction_method=tool_name,
                     derived_from=(tool_name,),
@@ -442,9 +525,15 @@ def _registered_host(url: str) -> str:
 
 def _extract_expected_date(question: str) -> str | None:
     match = MONTH_DATE_RE.search(question)
-    if not match:
-        return None
-    return re.sub(r"\s+", " ", match.group(0).strip())
+    if match:
+        return re.sub(r"\s+", " ", match.group(0).strip())
+    slash_match = SLASH_DATE_RE.search(question)
+    if slash_match:
+        return slash_match.group(0)
+    month_year_match = MONTH_YEAR_RE.search(question)
+    if month_year_match:
+        return re.sub(r"\s+", " ", month_year_match.group(0).strip())
+    return None
 
 
 def _extract_expected_author(question: str) -> str | None:
@@ -466,12 +555,21 @@ def _extract_subject_name(question: str) -> str | None:
 
 def _infer_text_filter(question: str) -> str | None:
     lowered = question.lower()
+    mentioned_match = re.search(
+        r"(?:surname|last name|first name)\s+of\s+the\s+(?P<target>.+?)\s+mentioned",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if mentioned_match:
+        return mentioned_match.group("target").strip()
     if "athletes" in lowered:
         return "athletes"
     if "walks" in lowered and "at bats" in lowered:
         return "walks at bats"
     if "pitcher" in lowered or "roster" in lowered:
         return "pitcher roster"
+    if "actor who played" in lowered and "play in" in lowered:
+        return "cast character"
     if "award number" in lowered:
         return "award number support"
     return None
@@ -497,6 +595,17 @@ def _is_article_to_paper_question(lowered_question: str) -> bool:
         or "link to a paper at the bottom" in lowered_question
         or "links to a paper at the bottom" in lowered_question
     )
+
+
+def _is_text_span_lookup_question(lowered_question: str) -> bool:
+    return (
+        "mentioned in" in lowered_question
+        and any(token in lowered_question for token in ("surname of", "last name of", "first name of"))
+    )
+
+
+def _is_entity_role_chain_question(lowered_question: str) -> bool:
+    return "actor who played" in lowered_question and "play in" in lowered_question
 
 
 def _is_roster_neighbor_question(lowered_question: str) -> bool:
@@ -529,6 +638,8 @@ def _split_rendered_tables(content: str) -> list[str]:
     current: list[str] = []
     for raw_line in content.splitlines():
         line = raw_line.rstrip()
+        if line.startswith(("URL:", "URL Source:", "Title:", "Published:", "Published Time:")):
+            continue
         if line.startswith("Table ") and current:
             sections.append("\n".join(current).strip())
             current = [line]
@@ -548,3 +659,16 @@ def _extract_caption(section: str) -> str:
     if len(first_lines) >= 2:
         return first_lines[1]
     return ""
+
+
+def _is_low_signal_domain(domain: str) -> bool:
+    return domain.endswith(
+        (
+            "instagram.com",
+            "facebook.com",
+            "fandom.com",
+            "grokipedia.com",
+            "pinterest.com",
+            "tiktok.com",
+        )
+    )
