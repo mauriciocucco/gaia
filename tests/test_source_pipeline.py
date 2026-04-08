@@ -91,3 +91,69 @@ def test_evidence_records_from_table_output_splits_tables() -> None:
     assert records[0].kind == "table"
     assert records[0].title_or_caption == "Roster"
     assert "18 | Yoshida" in records[0].content
+
+
+def test_score_candidates_prefers_libretexts_for_text_span_lookup() -> None:
+    question = (
+        "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+        "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials "
+        "as compiled 08/21/2023?"
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Forum Thread\n"
+        "URL: https://forums.example.com/equine-veterinarian-thread\n"
+        "Snippet: equine veterinarian discussion board\n\n"
+        "2. 1.E Exercises\n"
+        "URL: https://chem.libretexts.org/Bookshelves/Introductory_Chemistry/Book%3A_Introductory_Chemistry_(CK-12)/1%3A_Atoms_Molecules_and_Ions/1.E%3A_Exercises\n"
+        "Snippet: Introductory Chemistry CK-12 1.E Exercises equine veterinarian\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert "libretexts.org" in scored[0].url
+    assert "expected_domain" in scored[0].reasons
+
+
+def test_score_candidates_prefers_roster_page_for_roster_neighbor_lookup() -> None:
+    question = (
+        "Who are the pitchers with the number before and after Taishō Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Taisho Tamai player profile\n"
+        "URL: https://example.com/player/tamai\n"
+        "Snippet: player profile and season overview\n\n"
+        "2. Hokkaido Nippon-Ham Fighters roster\n"
+        "URL: https://en.wikipedia.org/wiki/Hokkaido_Nippon-Ham_Fighters\n"
+        "Snippet: roster, pitchers, numbers and staff\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://en.wikipedia.org/wiki/Hokkaido_Nippon-Ham_Fighters"
+    assert "tableish_title" in scored[0].reasons
+
+
+def test_score_candidates_prefers_official_winners_page_for_competition_lookup() -> None:
+    question = (
+        "What is the first name of the only Malko Competition recipient from the 20th Century (after 1977) "
+        "whose nationality on record is a country that no longer exists?"
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Malko Competition\n"
+        "URL: https://grokipedia.com/page/malko_competition\n"
+        "Snippet: general overview of the competition\n\n"
+        "2. Winners | Malko Competition\n"
+        "URL: https://malkocompetition.dk/winners/all\n"
+        "Snippet: winners list with years and nationalities\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://malkocompetition.dk/winners/all"

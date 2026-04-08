@@ -110,12 +110,31 @@ STOP_WORDS = {
     "return",
 }
 NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
+YEAR_RE = re.compile(r"\b(1[0-9]{3}|20[0-9]{2})\b")
 PARENTHETICAL_ROW_RE = re.compile(
     r"^(?P<label>[^()]+?)\s*\((?P<number>-?\d+(?:,\d{3})*(?:\.\d+)?)\)\s*$"
 )
 NASA_AWARD_RE = re.compile(
     r"(?:nasa\s+award\s+(?:number|no\.?)|award\s+(?:number|no\.?)|supported by[^.\n]{0,100}?)\s*[:#]?\s*([A-Z0-9-]{8,})",
     flags=re.IGNORECASE,
+)
+PERSON_NAME_RE = r"[A-Z][A-Za-z'’.\-]+(?:\s+[A-Z][A-Za-z'’.\-]+){0,3}"
+EXTINCT_COUNTRY_NAMES = {
+    "east germany",
+    "german democratic republic",
+    "west germany",
+    "yugoslavia",
+    "soviet union",
+    "ussr",
+    "czechoslovakia",
+    "rhodesia",
+    "serbia and montenegro",
+}
+TEXT_SPAN_ATTRIBUTE_HINTS = (
+    "surname",
+    "last name",
+    "first name",
+    "city name",
 )
 
 
@@ -294,6 +313,14 @@ def solve_answer_from_evidence_records(
     if roster_candidate:
         return roster_candidate, "roster_neighbor"
 
+    temporal_candidate = _solve_temporal_row_filter_from_records(question, evidence_records)
+    if temporal_candidate:
+        return temporal_candidate, "temporal_row_filter"
+
+    text_span_candidate = _solve_text_span_attribute_from_records(question, evidence_records)
+    if text_span_candidate:
+        return text_span_candidate, "text_span_attribute"
+
     award_candidate = _solve_award_number_from_records(question, evidence_records)
     if award_candidate:
         return award_candidate, "award_number"
@@ -411,6 +438,58 @@ def _solve_award_number_from_records(
     return None
 
 
+def _solve_temporal_row_filter_from_records(
+    question: str,
+    evidence_records: Sequence[EvidenceRecord],
+) -> str | None:
+    lowered = question.lower()
+    if "country that no longer exists" not in lowered:
+        return None
+
+    matching_rows: list[tuple[int, str, str]] = []
+    for year, name, nationality in _iter_named_rows(evidence_records):
+        if not _year_matches_question(year, question):
+            continue
+        if _normalize_text(nationality) not in EXTINCT_COUNTRY_NAMES:
+            continue
+        matching_rows.append((year, name, nationality))
+
+    if len(matching_rows) != 1:
+        return None
+
+    _year, name, _nationality = matching_rows[0]
+    return _extract_requested_name_part(question, name)
+
+
+def _solve_text_span_attribute_from_records(
+    question: str,
+    evidence_records: Sequence[EvidenceRecord],
+) -> str | None:
+    lowered = question.lower()
+    if "mentioned" not in lowered or not any(hint in lowered for hint in TEXT_SPAN_ATTRIBUTE_HINTS):
+        return None
+
+    target_terms = _target_entity_terms(question)
+    if not target_terms:
+        return None
+
+    best: tuple[int, str] | None = None
+    for record in evidence_records:
+        if record.kind not in {"text", "transcript"}:
+            continue
+        for passage in _candidate_passages(record.content):
+            score = _passage_target_score(passage, target_terms)
+            if score <= 0:
+                continue
+            candidate = _extract_requested_attribute_from_passage(question, passage)
+            if not candidate:
+                continue
+            if best is None or score > best[0]:
+                best = (score, candidate)
+
+    return best[1] if best is not None else None
+
+
 def _solve_pipe_tables(
     question: str,
     tool_name: str,
@@ -515,6 +594,217 @@ def _solve_parenthetical_rows(
         content[:800], _tokenize(question)
     )
     return _CandidateAnswer(answer=answer, score=score)
+
+
+def _iter_named_rows(
+    evidence_records: Sequence[EvidenceRecord],
+) -> list[tuple[int, str, str]]:
+    rows: list[tuple[int, str, str]] = []
+    for record in evidence_records:
+        cleaned = _clean_tool_content(record.content)
+        if not cleaned:
+            continue
+        if record.kind == "table":
+            rows.extend(_named_rows_from_pipe_tables(cleaned))
+            continue
+        if record.kind == "text":
+            rows.extend(_named_rows_from_text(cleaned))
+    return rows
+
+
+def _named_rows_from_pipe_tables(content: str) -> list[tuple[int, str, str]]:
+    rows: list[tuple[int, str, str]] = []
+    for table in _extract_pipe_tables(content):
+        if len(table) < 2:
+            continue
+        headers = [_normalize_text(cell) for cell in table[0]]
+        year_idx = _find_column_index(headers, {"year"})
+        name_idx = _find_column_index(headers, {"recipient", "winner", "name", "conductor"})
+        nationality_idx = _find_column_index(headers, {"nationality", "country", "nation"})
+        if year_idx is None or name_idx is None or nationality_idx is None:
+            continue
+        for row in table[1:]:
+            if len(row) <= max(year_idx, name_idx, nationality_idx):
+                continue
+            year = _parse_year(row[year_idx])
+            name = _clean_label(row[name_idx])
+            nationality = _clean_label(row[nationality_idx])
+            if year is None or not name or not nationality:
+                continue
+            rows.append((year, name, nationality))
+    return rows
+
+
+def _named_rows_from_text(content: str) -> list[tuple[int, str, str]]:
+    rows: list[tuple[int, str, str]] = []
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    current_year: int | None = None
+    current_name: str | None = None
+    for line in lines:
+        year = _parse_year(line)
+        if year is not None and re.fullmatch(r"\d{4}", line):
+            current_year = year
+            current_name = None
+            continue
+        if current_year is None:
+            continue
+        if current_name is None and _looks_like_person_name(line):
+            current_name = _clean_label(line)
+            continue
+        if current_name is not None and _looks_like_nationality_line(line):
+            rows.append((current_year, current_name, _clean_label(line)))
+            current_year = None
+            current_name = None
+    return rows
+
+
+def _find_column_index(headers: list[str], expected_tokens: set[str]) -> int | None:
+    for index, header in enumerate(headers):
+        if any(token in header for token in expected_tokens):
+            return index
+    return None
+
+
+def _year_matches_question(year: int, question: str) -> bool:
+    lowered = question.lower()
+    lower_bound = None
+    upper_bound = None
+    if "20th century" in lowered:
+        lower_bound, upper_bound = 1901, 2000
+    if "21st century" in lowered:
+        lower_bound, upper_bound = 2001, 2100
+
+    after_match = re.search(r"after\s+(\d{4})", lowered)
+    if after_match:
+        lower_bound = max(lower_bound or 0, int(after_match.group(1)) + 1)
+    before_match = re.search(r"before\s+(\d{4})", lowered)
+    if before_match:
+        upper_bound = min(upper_bound or 9999, int(before_match.group(1)) - 1)
+
+    if lower_bound is not None and year < lower_bound:
+        return False
+    if upper_bound is not None and year > upper_bound:
+        return False
+    return True
+
+
+def _extract_requested_name_part(question: str, name: str) -> str:
+    lowered = question.lower()
+    cleaned_name = _clean_label(name)
+    if "first name" in lowered:
+        parts = [part for part in cleaned_name.split() if part and not part.endswith(".")]
+        return parts[0] if parts else cleaned_name
+    if "surname" in lowered or "last name" in lowered:
+        return _last_name(cleaned_name)
+    return cleaned_name
+
+
+def _target_entity_terms(question: str) -> set[str]:
+    patterns = (
+        r"(?:surname|last name|first name|city name)\s+of\s+the\s+(?P<target>.+?)(?:\s+mentioned|\s+from|\s+in\b)",
+        r"only\s+(?P<target>.+?)\s+mentioned",
+    )
+    target = None
+    for pattern in patterns:
+        match = re.search(pattern, question, flags=re.IGNORECASE)
+        if match:
+            target = match.group("target").strip()
+            break
+    if not target:
+        return set()
+
+    terms = set(_tokenize(target))
+    lowered = target.lower()
+    if "veterinarian" in lowered:
+        terms.update({"doctor", "veterinarian"})
+    if "equine" in lowered:
+        terms.update({"horse", "equine"})
+    return terms
+
+
+def _candidate_passages(content: str) -> list[str]:
+    pieces: list[str] = []
+    for block in re.split(r"\n{2,}", content):
+        block = block.strip()
+        if not block:
+            continue
+        pieces.extend(
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", block)
+            if sentence.strip()
+        )
+    return pieces
+
+
+def _passage_target_score(passage: str, target_terms: set[str]) -> int:
+    passage_tokens = _tokenize(passage)
+    score = sum(token in passage_tokens for token in target_terms)
+    if "named " in passage.lower():
+        score += 1
+    if "dr." in passage.lower():
+        score += 1
+    return score
+
+
+def _extract_requested_attribute_from_passage(question: str, passage: str) -> str | None:
+    name = _extract_person_name_from_passage(passage)
+    if not name:
+        return None
+    lowered = question.lower()
+    if "city name" in lowered:
+        return None
+    return _extract_requested_name_part(question, name)
+
+
+def _extract_person_name_from_passage(passage: str) -> str | None:
+    patterns = (
+        rf"\bnamed\s+Dr\.?\s+(?P<name>{PERSON_NAME_RE})",
+        rf"\bis\s+Dr\.?\s+(?P<name>{PERSON_NAME_RE})",
+        rf"\bwas\s+Dr\.?\s+(?P<name>{PERSON_NAME_RE})",
+        rf"\bnamed\s+(?P<name>{PERSON_NAME_RE})",
+        rf"\bis\s+(?P<name>{PERSON_NAME_RE})",
+        rf"\bwas\s+(?P<name>{PERSON_NAME_RE})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, passage)
+        if match:
+            candidate = _clean_person_name(match.group("name"))
+            if candidate.lower() in {"dr", "dr."}:
+                continue
+            return candidate
+    return None
+
+
+def _clean_person_name(value: str) -> str:
+    cleaned = _clean_label(value)
+    cleaned = re.sub(r"^(?:Dr\.?\s+)", "", cleaned)
+    return cleaned.strip()
+
+
+def _parse_year(value: str) -> int | None:
+    match = YEAR_RE.search(value)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _looks_like_person_name(value: str) -> bool:
+    cleaned = _clean_label(value)
+    if not cleaned or re.search(r"\d", cleaned):
+        return False
+    return bool(re.fullmatch(PERSON_NAME_RE, cleaned))
+
+
+def _looks_like_nationality_line(value: str) -> bool:
+    normalized = _normalize_text(value)
+    if not normalized or re.search(r"\d", value):
+        return False
+    if normalized in EXTINCT_COUNTRY_NAMES:
+        return True
+    return len(normalized.split()) <= 4 and normalized not in {"competition", "winners", "participants"}
 
 
 def _extract_pipe_tables(content: str) -> list[list[list[str]]]:

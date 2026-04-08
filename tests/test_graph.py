@@ -3,6 +3,7 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
+import pytest
 import hf_gaia_agent.graph as graph_module
 
 from hf_gaia_agent.api_client import Question
@@ -165,6 +166,102 @@ class FakeModelSingleAnswer:
     def invoke(self, _messages):
         self.calls += 1
         return AIMessage(content=self.answer)
+
+
+class FakeModelWithBlockedPython:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-python",
+                        "name": "execute_python_code",
+                        "args": {"code": "print('invented dataset')"},
+                    }
+                ],
+            )
+        assert any(
+            "UNGROUNDED PYTHON BLOCKED" in str(getattr(msg, "content", ""))
+            for msg in messages
+        )
+        return AIMessage(content="[ANSWER]blocked[/ANSWER]")
+
+
+class FakeModelForAutoFetch:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.queries = [
+            "equine veterinarian libretexts exercises",
+            "introductory chemistry ck12 exercise veterinarian",
+            "chemistry materials 2023 equine surname",
+            "equine vet question chemistry license",
+        ]
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls <= len(self.queries):
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": f"call-search-{self.calls}",
+                        "name": "web_search",
+                        "args": {"query": self.queries[self.calls - 1], "max_results": 5},
+                    }
+                ],
+            )
+        assert any(
+            "AUTO-FETCH:" in str(getattr(msg, "content", "")) for msg in messages
+        )
+        return AIMessage(content="[ANSWER]done[/ANSWER]")
+
+
+class FakeModelWithGroundedTextSalvage:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-find",
+                        "name": "find_text_in_url",
+                        "args": {
+                            "url": "https://chem.libretexts.org/Bookshelves/Introductory_Chemistry/Book%3A_Introductory_Chemistry_(CK-12)/1%3A_Atoms_Molecules_and_Ions/1.E%3A_Exercises",
+                            "query": "equine veterinarian",
+                        },
+                    }
+                ],
+            )
+        if self.calls == 2:
+            return AIMessage(
+                content="The available information does not make the answer explicit."
+            )
+        if self.calls == 3:
+            return AIMessage(
+                content="The available information does not make the answer explicit."
+            )
+        last_prompt = str(getattr(messages[-1], "content", ""))
+        assert "Question profile:" in last_prompt
+        assert "Dr. Rivera" in last_prompt
+        return AIMessage(content="[ANSWER]Rivera[/ANSWER]")
 
 
 def test_graph_runs_tools_and_normalizes_answer() -> None:
@@ -385,6 +482,55 @@ def test_prepare_context_includes_research_hints_for_linked_article_questions() 
     assert "extract_links_from_url" in prompt
 
 
+def test_prepare_context_marks_self_contained_classification_questions() -> None:
+    state = {
+        "task_id": "hint-self-contained",
+        "question": (
+            "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+            "to categorizing things. Here's the list I have so far:\n\n"
+            "milk, eggs, flour, sweet potatoes, fresh basil, plums, green beans, rice, corn, bell pepper, broccoli, celery, zucchini, lettuce\n\n"
+            "Please alphabetize the vegetables and place each item in a comma separated list."
+        ),
+        "file_name": None,
+        "local_file_path": None,
+        "messages": [],
+    }
+
+    prepared = graph_module._prepare_context(state)  # type: ignore[arg-type]
+    prompt = prepared["messages"][1].content
+
+    assert "self-contained" in prompt.lower()
+    assert "avoid web tools" in prompt.lower()
+    assert "Do not use execute_python_code" in prompt
+
+
+def test_graph_solves_botanical_vegetable_list_without_model_call() -> None:
+    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=1)
+
+    result = agent.solve(
+        Question(
+            task_id="botany-list",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. I need to add different foods to different categories on the grocery list, but if I make a mistake, "
+                "she won't buy anything inserted in the wrong category. Here's the list I have so far:\n\n"
+                "milk, eggs, flour, whole bean coffee, Oreos, sweet potatoes, fresh basil, plums, green beans, rice, corn, bell pepper, "
+                "whole allspice, acorns, broccoli, celery, zucchini, lettuce, peanuts\n\n"
+                "I need to make headings for the fruits and vegetables. Could you please create a list of just the vegetables from my list? "
+                "But remember that my mom is a real stickler, so make sure that no botanical fruits end up on the vegetable list. "
+                "Please alphabetize the list of vegetables, and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert (
+        result["submitted_answer"]
+        == "broccoli, celery, fresh basil, lettuce, sweet potatoes"
+    )
+    assert result["reducer_used"] == "botanical_vegetable_list"
+
+
 def test_graph_marks_audio_access_meta_answer_invalid() -> None:
     class FakeModelWithMissingAudioMeta:
         def bind_tools(self, _tools):
@@ -409,6 +555,100 @@ def test_graph_marks_audio_access_meta_answer_invalid() -> None:
 
     assert result["submitted_answer"] == ""
     assert result["error"] == "Required attachment was not available locally."
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What country had the least number of athletes at the 1928 Summer Olympics? If there's a tie for a number of athletes, return the first in alphabetical order. Give the IOC country code as your answer.",
+        "Who are the pitchers with the number before and after Taishō Tamai's number as of July 2023? Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters.",
+        "What is the first name of the only Malko Competition recipient from the 20th Century (after 1977) whose nationality on record is a country that no longer exists?",
+    ],
+)
+def test_graph_blocks_ungrounded_python_for_lookup_questions(monkeypatch, question: str) -> None:
+    @tool
+    def execute_python_code(code: str) -> str:
+        """Tool should not be invoked when python is ungrounded."""
+        raise AssertionError("execute_python_code should have been blocked")
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [execute_python_code])
+
+    agent = GaiaGraphAgent(model=FakeModelWithBlockedPython(), max_iterations=2)
+    result = agent.solve(Question(task_id="blocked-python", question=question, file_name=None))
+
+    assert result["submitted_answer"] == "blocked"
+    assert any("execute_python_code" in item for item in result["tool_trace"])
+    assert result["error"] is None
+
+
+def test_graph_auto_fetch_uses_ranked_candidate_instead_of_first_raw_url(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return search results with a bad first URL and a better ranked LibreTexts URL."""
+        assert max_results == 5
+        assert query
+        return (
+            "1. Forum Thread\n"
+            "URL: https://forums.example.com/equine-veterinarian-thread\n"
+            "Snippet: equine veterinarian discussion board\n\n"
+            "2. 1.E Exercises\n"
+            "URL: https://chem.libretexts.org/Bookshelves/Introductory_Chemistry/Book%3A_Introductory_Chemistry_(CK-12)/1%3A_Atoms_Molecules_and_Ions/1.E%3A_Exercises\n"
+            "Snippet: Introductory Chemistry CK-12 1.E Exercises equine veterinarian\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Fetch the chosen source page."""
+        assert "libretexts.org" in url
+        assert "forums.example.com" not in url
+        return "Title: 1.E Exercises\nURL: https://chem.libretexts.org/example\nDr. Rivera is the equine veterinarian."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModelForAutoFetch(), max_iterations=6)
+    result = agent.solve(
+        Question(
+            task_id="auto-fetch-ranked",
+            question=(
+                "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+                "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials as compiled 08/21/2023?"
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "done"
+    assert any(
+        item.startswith("fetch_url(") and "libretexts.org" in item
+        for item in result["tool_trace"]
+    )
+    assert not any("forums.example.com" in item for item in result["tool_trace"] if item.startswith("fetch_url("))
+
+
+def test_graph_salvages_answer_from_grounded_text_without_new_reducer(monkeypatch) -> None:
+    @tool
+    def find_text_in_url(url: str, query: str) -> str:
+        """Return a grounded line from the fetched page."""
+        assert "libretexts.org" in url
+        assert query == "equine veterinarian"
+        return "The equine veterinarian mentioned in the exercise is Dr. Rivera."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url])
+
+    agent = GaiaGraphAgent(model=FakeModelWithGroundedTextSalvage(), max_iterations=3)
+    result = agent.solve(
+        Question(
+            task_id="grounded-salvage",
+            question=(
+                "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+                "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials as compiled 08/21/2023?"
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "Rivera"
+    assert result["error"] is None
 
 
 def test_graph_rejects_hallucinated_answer_when_required_attachment_is_missing() -> None:

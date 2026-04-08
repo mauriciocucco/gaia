@@ -1,69 +1,62 @@
-from hf_gaia_agent.evidence_solver import ToolEvidence, solve_answer_from_tool_evidence
+from hf_gaia_agent.evidence_solver import solve_answer_from_evidence_records
+from hf_gaia_agent.source_pipeline import EvidenceRecord
 
 
-def test_evidence_solver_returns_ioc_code_for_minimum_with_tie_break() -> None:
+def test_solve_answer_from_evidence_records_extracts_text_span_attribute() -> None:
     question = (
-        "What country had the least number of athletes at the 1928 Summer Olympics? "
-        "If there's a tie for a number of athletes, return the first in alphabetical order. "
-        "Give the IOC country code as your answer."
+        "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+        "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials "
+        "as compiled 08/21/2023?"
     )
-    tool_outputs = [
-        ToolEvidence(
-            tool_name="extract_tables_from_url",
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://chem.libretexts.org/example",
+            source_type="page_text",
+            adapter_name="ReferenceTextAdapter",
             content=(
-                "Table 1\n"
-                "Country | Athletes\n"
-                "Cuba | 1\n"
-                "Panama | 1\n"
-                "Argentina | 81"
+                "Around 1876, a horse doctor in eastern France named Louvrier, claimed to have invented a cure for anthrax."
             ),
+            title_or_caption="1.E: Exercises",
+            confidence=0.8,
+            extraction_method="find_text_in_url",
+            derived_from=("find_text_in_url",),
         )
     ]
 
-    result = solve_answer_from_tool_evidence(question, tool_outputs)
+    answer, reducer = solve_answer_from_evidence_records(question, records)
 
-    assert result == "CUB"
+    assert answer == "Louvrier"
+    assert reducer == "text_span_attribute"
 
 
-def test_evidence_solver_reads_parenthetical_rows_from_table_extraction() -> None:
+def test_solve_answer_from_evidence_records_filters_temporal_rows() -> None:
     question = (
-        "What country had the least number of athletes at the 1928 Summer Olympics? "
-        "If there's a tie for a number of athletes, return the first in alphabetical order. "
-        "Give the IOC country code as your answer."
+        "What is the first name of the only Malko Competition recipient from the 20th Century (after 1977) "
+        "whose nationality on record is a country that no longer exists?"
     )
-    tool_outputs = [
-        ToolEvidence(
-            tool_name="extract_tables_from_url",
+    records = [
+        EvidenceRecord(
+            kind="table",
+            source_url="https://en.wikipedia.org/wiki/Malko_Competition",
+            source_type="table",
+            adapter_name="TableExtraction",
             content=(
                 "Table 1\n"
-                "Participating National Olympic Committees\n"
-                "Cuba (1)\n"
-                "Panama (1)\n"
-                "Argentina (81)"
+                "Year | Recipient | Nationality\n"
+                "1977 | Philip Greenberg | United States\n"
+                "1980 | Maximiano Valdes | Chile\n"
+                "1983 | Claus Peter Flor | East Germany\n"
+                "1986 | Kazufumi Yamashita | Japan\n"
             ),
+            title_or_caption="Year | Recipient | Nationality",
+            confidence=0.8,
+            extraction_method="extract_tables_from_url",
+            derived_from=("extract_tables_from_url",),
         )
     ]
 
-    result = solve_answer_from_tool_evidence(question, tool_outputs)
+    answer, reducer = solve_answer_from_evidence_records(question, records)
 
-    assert result == "CUB"
-
-
-def test_evidence_solver_returns_numeric_answer_for_maximum_question() -> None:
-    question = "What is the highest number of athletes listed in the table?"
-    tool_outputs = [
-        ToolEvidence(
-            tool_name="extract_tables_from_url",
-            content=(
-                "Table 1\n"
-                "Country | Athletes\n"
-                "Cuba | 1\n"
-                "Panama | 1\n"
-                "Argentina | 81"
-            ),
-        )
-    ]
-
-    result = solve_answer_from_tool_evidence(question, tool_outputs)
-
-    assert result == "81"
+    assert answer == "Claus"
+    assert reducer == "temporal_row_filter"
