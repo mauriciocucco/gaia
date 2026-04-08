@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import dataclasses
 import os
 from pathlib import Path
 from typing import Any
@@ -59,7 +61,9 @@ def solve_questions(
         questions = questions[:limit]
 
     results: list[dict[str, Any]] = []
+    print(f"Starting evaluation of {len(questions)} questions...")
     for index, question in enumerate(questions, start=1):
+        print(f"[{index}/{len(questions)}] Solving task: {question.task_id}...")
         attachment_path = None
         attachment_error = None
         try:
@@ -117,7 +121,7 @@ def submit_command(args: argparse.Namespace) -> int:
         ]
         response = client.submit_answers(args.username, args.agent_code_url, answers)
 
-    print(json.dumps(response.__dict__, ensure_ascii=True, indent=2))
+    print(json.dumps(dataclasses.asdict(response), ensure_ascii=True, indent=2))
     return 0
 
 

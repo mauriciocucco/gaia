@@ -49,11 +49,7 @@ from pypdf import PdfReader
 
 
 _HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "GAIABot/1.0 (contact@example.com) python-httpx/0.27.0",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
@@ -513,7 +509,7 @@ def _wikipedia_title_from_url(url: str) -> str | None:
 
 
 def _r_jina_ai_url(url: str) -> str:
-    return f"https://r.jina.ai/http://{url}"
+    return f"https://r.jina.ai/{url}"
 
 
 def _query_terms(value: str) -> list[str]:
