@@ -136,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-iterations",
         type=int,
-        default=int(os.getenv("GAIA_MAX_ITERATIONS", "6")),
+        default=int(os.getenv("GAIA_MAX_ITERATIONS", "15")),
         help="Maximum agent/tool loop iterations per question.",
     )
     parser.add_argument(

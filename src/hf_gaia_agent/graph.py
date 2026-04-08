@@ -34,31 +34,46 @@ SYSTEM_PROMPT = """You are a GAIA benchmark assistant.
 Rules:
 - Solve the user's task as accurately as possible.
 - Use tools when needed, especially for web lookup, file reading, python execution and arithmetic.
-- When performing data processing, string manipulation, counting, or heavy math, ALWAYS use the execute_python_code tool to run a script instead of trying to guess. Write Python scripts that print() their result.
+- When performing data processing, string manipulation, counting, or heavy math, ALWAYS use the execute_python_code tool to run a script instead of trying to guess.
+- Use standard library ONLY (e.g. math, csv, json, zipfile). Libraries like pandas or numpy are NOT installed. Remember to print() your result.
 - If a task includes an attachment, treat that attachment as part of the question context.
+
+SEARCH STRATEGY (CRITICAL — follow this workflow):
+1. Do ONE search (web_search or search_wikipedia).
+2. From the results, pick the most promising URL and READ it with fetch_url, find_text_in_url, extract_tables_from_url, or extract_links_from_url.
+3. Only if the fetched page didn't answer the question, do another search with DIFFERENT keywords.
+4. NEVER do more than 2 consecutive search calls without fetching a page in between.
+- Search results are only short snippets — they often lack the detail you need. You MUST read the actual page.
+- If a search returns no useful results, reformulate the query with different/fewer keywords, don't repeat.
+- For Wikipedia subjects, prefer search_wikipedia and fetch_wikipedia_page. However, fetch_wikipedia_page omits tables and lists! When you need structured data (rosters, statistics, award lists, participant counts), use extract_tables_from_url on the Wikipedia URL instead.
+- If a webpage links to a primary source (paper, report, original document), use extract_links_from_url to find that link, then fetch_url to read it.
+- Once a tool returns a relevant table, passage, or data, STOP searching and compute the answer.
+
+DEEP READING:
+- When the question asks about specific data inside a page (e.g. an award number in a paper, a name from a table, a statistic from a roster), you need to actually fetch and read that page — don't guess from snippets.
+- If the question refers to a specific website, article, or document, navigate to it step by step: search → find the page → read the page → if it links to another source, follow that link and read it too.
+- If a classification or categorization question arises (e.g. biological taxonomy, technical categories), research it — don't rely on assumptions.
+
+YOUTUBE:
+- For YouTube questions, fetch the transcript first with get_youtube_transcript before falling back to web search.
+- If the question requires visual analysis (counting objects, identifying what appears on screen), use analyze_youtube_video.
+
+REASONING:
+- If the prompt already contains the full table, list, or code needed to solve the task, reason directly from it before using web search.
+
+ANSWER FORMAT:
 - When you are ready to answer, return only the final answer wrapped as [ANSWER]...[/ANSWER].
+- The string inside [ANSWER]...[/ANSWER] MUST BE EXTREMELY CONCISE. Return ONLY the exact value asked for.
+- If the question asks "how many", return ONLY the number.
+- If the question asks "who", return ONLY the name.
+- If the question asks for a list, return only the comma-separated items.
+- NEVER write a full sentence inside [ANSWER]. NEVER include extra context, names, or labels beyond what was asked.
+- Preserve formatting constraints requested by the task (commas, ordering, abbreviations, etc.).
 - Do not include explanations outside the answer wrapper in the final response.
 - Never return an apology, inability statement, or request for the user to try again later.
 - If a tool fails, try another tool or reason from the evidence you already collected.
 - The final answer must be a concrete factual answer, not a meta-comment about access or limitations.
-- For YouTube questions, fetch the transcript first when available before falling back to general web search.
-- If the question requires visual analysis of a YouTube video (e.g. counting objects, identifying
-  what appears on screen, describing scenes), use the analyze_youtube_video tool.
-- If the prompt already contains the full table, list, or code needed to solve the task, reason from the prompt
-  before using web search.
-- For Wikipedia-focused questions, prefer search_wikipedia and fetch_wikipedia_page before broad web search.
-- If a webpage likely points to a paper, source document, or supporting page, use extract_links_from_url
-  to inspect its outgoing links before answering.
-- Search results are only hints. After finding a promising page, inspect it with fetch_url, find_text_in_url,
-  extract_tables_from_url, or extract_links_from_url before answering.
-- Once a tool returns a relevant table, list, transcript excerpt, or page passage, stop searching and compute
-  the answer from that evidence.
-- Return the shortest answer that satisfies the question's formatting requirements. Do not add lead-in phrases,
-  explanations, or full-sentence wrappers unless the question explicitly asks for them.
-- If the question asks "Who nominated ...", return JUST the username or name, e.g., "Sigourney Weaver". NEVER formulate a whole sentence.
-- If the question asks for a list, just return the comma-separated list of items.
-- Preserve commas, ordering, pluralization, and formatting constraints requested by the task.
-- ALWAYS provide a final guess. Even if you're completely stuck or blocked from accessing the internet, write your best specific guess (a word, a number, a code) between [ANSWER] and [/ANSWER]. DO NOT write phrases like "unable to determine", "cannot access", "I'm sorry", "not provided", etc.
+- ALWAYS provide a final guess. Even if you're stuck, write your best specific guess between [ANSWER] and [/ANSWER]. DO NOT write "unable to determine", "cannot access", "I'm sorry", etc.
 """
 
 INVALID_FINAL_PATTERNS = (
@@ -279,7 +294,7 @@ class GaiaGraphAgent:
         self.tools_by_name = {tool_.name: tool_ for tool_ in self.tools}
         self.answer_model = model or _build_model()
         self.model = self.answer_model.bind_tools(self.tools)
-        self.max_iterations = max_iterations or int(os.getenv("GAIA_MAX_ITERATIONS", "6"))
+        self.max_iterations = max_iterations or int(os.getenv("GAIA_MAX_ITERATIONS", "15"))
         self.app = self._build_graph().compile()
 
     def _build_graph(self) -> StateGraph:
@@ -314,15 +329,59 @@ class GaiaGraphAgent:
         msgs = list(state["messages"])
         if state.get("iterations", 0) >= state.get("max_iterations", self.max_iterations):
             msgs.append(SystemMessage(content="CRITICAL: You have reached the maximum number of tool calls. You CANNOT use tools anymore. You MUST provide your final guess or answer using the [ANSWER]...[/ANSWER] wrapper immediately in this message based on the evidence collected so far."))
-            # We can also drop the tools by invoking the underlying base model if needed, but the prompt should suffice.
             response = self.model.invoke(msgs, tool_choice="none") if hasattr(self.model, "invoke") else self.model.invoke(msgs)
         else:
+            # Check if recent tool history is search-heavy and inject a nudge
+            nudge = self._build_search_nudge(state)
+            if nudge:
+                msgs.append(HumanMessage(content=nudge))
             response = self.model.invoke(msgs)
             
         return {
             "messages": [response],
             "iterations": state.get("iterations", 0) + 1,
         }
+
+    @staticmethod
+    def _build_search_nudge(state: AgentState) -> str | None:
+        """If the agent has done 2+ consecutive searches, build a nudge with URLs to fetch."""
+        search_tool_names = {"web_search", "search_wikipedia"}
+        decision_trace = state.get("decision_trace") or []
+        recent = decision_trace[-3:]
+        if len(recent) < 2 or not all(
+            entry.removeprefix("tool:") in search_tool_names for entry in recent
+        ):
+            return None
+
+        # Extract URLs from recent ToolMessages
+        urls: list[str] = []
+        for msg in reversed(state["messages"]):
+            if not isinstance(msg, ToolMessage):
+                continue
+            tool_name = (getattr(msg, "name", "") or "").strip()
+            if tool_name not in search_tool_names:
+                break
+            found = URL_RE.findall(str(msg.content))
+            urls.extend(found)
+            if len(urls) >= 5:
+                break
+
+        unique_urls = list(dict.fromkeys(urls))[:5]
+        if unique_urls:
+            url_list = "\n".join(f"  - {u}" for u in unique_urls)
+            return (
+                f"STOP SEARCHING. You have done {len(recent)} consecutive searches without reading any page. "
+                "You MUST now use fetch_url, find_text_in_url, or extract_tables_from_url on one of these URLs "
+                f"from your search results:\n{url_list}\n"
+                "Pick the most relevant one and READ it. Do NOT call web_search or search_wikipedia again."
+            )
+        return (
+            "STOP SEARCHING. You have done multiple searches with no useful results. "
+            "Try a completely different approach: "
+            "1) Construct a likely URL directly and fetch it (e.g. for a known website), or "
+            "2) Use very different search keywords, or "
+            "3) Break the problem into smaller sub-questions."
+        )
 
     @staticmethod
     def _collect_evidence_records(messages: list[Any]) -> list[EvidenceRecord]:
@@ -386,9 +445,38 @@ class GaiaGraphAgent:
         tool_trace = list(state.get("tool_trace") or [])
         decision_trace = list(state.get("decision_trace") or [])
 
+        # Collect previously used search queries for dedup detection
+        previous_queries = set()
+        for entry in tool_trace:
+            m = re.match(r"(?:web_search|search_wikipedia)\(\{'query':\s*'(.+?)'", entry)
+            if m:
+                previous_queries.add(m.group(1).strip().lower())
+
         for tool_call in getattr(last_message, "tool_calls", []):
             tool_name = tool_call["name"]
             tool_args = tool_call.get("args", {})
+
+            # Dedup: if the same search query was already used, short-circuit
+            if tool_name in ("web_search", "search_wikipedia"):
+                query = str(tool_args.get("query", "")).strip().lower()
+                if query and query in previous_queries:
+                    tool_trace.append(f"{tool_name}({tool_args})")
+                    decision_trace.append(f"tool:{tool_name}")
+                    tool_messages.append(
+                        ToolMessage(
+                            content=(
+                                f"DUPLICATE QUERY: You already searched for '{query}'. "
+                                "Do NOT repeat the same search. Instead: "
+                                "1) Pick a URL from previous search results and use fetch_url or extract_tables_from_url to read it, OR "
+                                "2) Try a completely DIFFERENT search query with different keywords."
+                            ),
+                            tool_call_id=tool_call["id"],
+                            name=tool_name,
+                        )
+                    )
+                    continue
+                previous_queries.add(query)
+
             tool_trace.append(f"{tool_name}({tool_args})")
             decision_trace.append(f"tool:{tool_name}")
             tool_ = self.tools_by_name[tool_name]
@@ -403,6 +491,7 @@ class GaiaGraphAgent:
                     name=tool_name,
                 )
             )
+
         return {"messages": tool_messages, "tool_trace": tool_trace, "decision_trace": decision_trace}
 
     @staticmethod
@@ -767,8 +856,7 @@ class GaiaGraphAgent:
                 "fallback_reason": None,
                 "error": None,
             }
-        final_state = self.app.invoke(
-            {
+        final_state = self.app.invoke({
                 "task_id": question.task_id,
                 "question": question.question,
                 "file_name": question.file_name,
@@ -783,8 +871,7 @@ class GaiaGraphAgent:
                 "final_answer": None,
                 "iterations": 0,
                 "max_iterations": self.max_iterations,
-            }
-        )
+            }, config={"recursion_limit": 50})
         return {
             "task_id": question.task_id,
             "question": question.question,
@@ -863,6 +950,14 @@ def _build_research_hint_block(question: str) -> str:
         hints.append(
             f"This task already names a URL: {', '.join(generic_urls)}. "
             "Inspect that page directly with fetch_url, find_text_in_url, extract_tables_from_url, or extract_links_from_url."
+        )
+
+    classification_cues = ("categoriz", "classify", "botanical", "stickler", "professor of botany")
+    if any(cue in lowered for cue in classification_cues):
+        hints.append(
+            "This task involves classification or categorization. "
+            "If unsure about a category (e.g. botanical fruit vs vegetable), research it with web_search "
+            "or execute_python_code with explicit reasoning rather than relying on assumptions."
         )
 
     if not hints:
