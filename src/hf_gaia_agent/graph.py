@@ -347,7 +347,7 @@ class GaiaGraphAgent:
         """If the agent has done 2+ consecutive searches, build a nudge with URLs to fetch."""
         search_tool_names = {"web_search", "search_wikipedia"}
         decision_trace = state.get("decision_trace") or []
-        recent = decision_trace[-3:]
+        recent = decision_trace[-2:]
         if len(recent) < 2 or not all(
             entry.removeprefix("tool:") in search_tool_names for entry in recent
         ):
@@ -444,24 +444,70 @@ class GaiaGraphAgent:
         tool_messages: list[ToolMessage] = []
         tool_trace = list(state.get("tool_trace") or [])
         decision_trace = list(state.get("decision_trace") or [])
+        search_tool_names = {"web_search", "search_wikipedia"}
 
         # Collect previously used search queries for dedup detection
-        previous_queries = set()
+        previous_queries: set[str] = set()
         for entry in tool_trace:
-            m = re.match(r"(?:web_search|search_wikipedia)\(\{'query':\s*'(.+?)'", entry)
+            m = re.match(r"(?:web_search|search_wikipedia)\(\{.*?'query':\s*'(.+?)'", entry)
             if m:
                 previous_queries.add(m.group(1).strip().lower())
+
+        # Count consecutive searches at the end of decision_trace
+        consecutive_searches = 0
+        for entry in reversed(decision_trace):
+            if entry.removeprefix("tool:") in search_tool_names:
+                consecutive_searches += 1
+            else:
+                break
+
+        # Collect URLs from previous tool messages for force-fetch
+        fetched_urls: set[str] = set()
+        for entry in tool_trace:
+            if entry.startswith("fetch_url(") or entry.startswith("find_text_in_url(") or entry.startswith("extract_tables_from_url("):
+                url_match = re.search(r"'url':\s*'([^']+)'", entry)
+                if url_match:
+                    fetched_urls.add(url_match.group(1))
 
         for tool_call in getattr(last_message, "tool_calls", []):
             tool_name = tool_call["name"]
             tool_args = tool_call.get("args", {})
 
-            # Dedup: if the same search query was already used, short-circuit
-            if tool_name in ("web_search", "search_wikipedia"):
+            # For search tools: dedup + force-fetch after too many consecutive searches
+            if tool_name in search_tool_names:
                 query = str(tool_args.get("query", "")).strip().lower()
+
+                # Force-fetch: after 3+ consecutive searches, auto-fetch best URL instead
+                if consecutive_searches >= 3:
+                    best_url = self._pick_best_unfetched_url(state["messages"], fetched_urls)
+                    if best_url:
+                        fetched_urls.add(best_url)
+                        tool_trace.append(f"fetch_url({{'url': '{best_url}'}})")
+                        decision_trace.append("tool:fetch_url")
+                        consecutive_searches = 0  # reset after fetch
+                        fetch_tool = self.tools_by_name.get("fetch_url")
+                        try:
+                            result = fetch_tool.invoke({"url": best_url}) if fetch_tool else f"fetch_url not available"
+                        except Exception as exc:
+                            result = f"Tool error: {exc}"
+                        tool_messages.append(
+                            ToolMessage(
+                                content=(
+                                    f"AUTO-FETCH: Your search was replaced with a fetch of {best_url} "
+                                    f"(you did {consecutive_searches + 3}+ searches without reading a page).\n\n"
+                                    f"{result}"
+                                ),
+                                tool_call_id=tool_call["id"],
+                                name=tool_name,
+                            )
+                        )
+                        continue
+
+                # Dedup: if the same search query was already used, short-circuit
                 if query and query in previous_queries:
                     tool_trace.append(f"{tool_name}({tool_args})")
                     decision_trace.append(f"tool:{tool_name}")
+                    consecutive_searches += 1
                     tool_messages.append(
                         ToolMessage(
                             content=(
@@ -476,6 +522,9 @@ class GaiaGraphAgent:
                     )
                     continue
                 previous_queries.add(query)
+                consecutive_searches += 1
+            else:
+                consecutive_searches = 0
 
             tool_trace.append(f"{tool_name}({tool_args})")
             decision_trace.append(f"tool:{tool_name}")
@@ -493,6 +542,31 @@ class GaiaGraphAgent:
             )
 
         return {"messages": tool_messages, "tool_trace": tool_trace, "decision_trace": decision_trace}
+
+    @staticmethod
+    def _pick_best_unfetched_url(messages: list[Any], fetched_urls: set[str]) -> str | None:
+        """Find the best URL from search results that hasn't been fetched yet."""
+        candidates: list[str] = []
+        for msg in reversed(messages):
+            if not isinstance(msg, ToolMessage):
+                continue
+            tool_name = (getattr(msg, "name", "") or "").strip()
+            if tool_name not in ("web_search", "search_wikipedia"):
+                continue
+            urls = URL_RE.findall(str(msg.content))
+            for url in urls:
+                url = url.rstrip(".,;:)")
+                if url not in fetched_urls and not any(
+                    skip in url for skip in ("google.com", "zhihu.com", "spotify.com", "news.google")
+                ):
+                    candidates.append(url)
+            if len(candidates) >= 10:
+                break
+        # Prefer Wikipedia and known-good domains
+        for url in candidates:
+            if "wikipedia.org" in url or "libretexts.org" in url:
+                return url
+        return candidates[0] if candidates else None
 
     @staticmethod
     def _route_after_agent(state: AgentState) -> str:

@@ -730,6 +730,25 @@ def _merge_search_results(
     return merged
 
 
+def _search_tavily(query: str, *, max_results: int) -> list[dict[str, str]]:
+    from tavily import TavilyClient  # lazy import — optional dependency
+    api_key = os.getenv("TAVILY_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TAVILY_API_KEY not set")
+    client = TavilyClient(api_key=api_key)
+    response = client.search(query, max_results=max_results)
+    results: list[dict[str, str]] = []
+    for item in response.get("results", []):
+        normalized = _normalize_search_result(
+            title=item.get("title"),
+            url=item.get("url"),
+            snippet=item.get("content"),
+        )
+        if normalized is not None:
+            results.append(normalized)
+    return results
+
+
 def _search_brave_html(query: str, *, max_results: int) -> list[dict[str, str]]:
     with httpx.Client(
         timeout=20.0,
@@ -814,6 +833,7 @@ def _search_bing_rss(query: str, *, max_results: int) -> list[dict[str, str]]:
 def web_search(query: str, max_results: int = 5) -> str:
     """Search the web and return short snippets from the top results."""
     providers = (
+        ("tavily", _search_tavily),
         ("brave", _search_brave_html),
         ("duckduckgo", _search_duckduckgo),
         ("bing", _search_bing_rss),
@@ -1178,6 +1198,28 @@ def _extract_frames(video_path: Path, output_dir: Path) -> list[Path]:
     return frames
 
 
+def _extract_audio(video_path: Path, output_dir: Path) -> Path:
+    """Extract audio track from a video file as MP3 using ffmpeg."""
+    ffmpeg = _check_binary("ffmpeg")
+    audio_path = output_dir / "audio.mp3"
+    cmd = [
+        ffmpeg,
+        "-i", str(video_path),
+        "-vn",
+        "-acodec", "libmp3lame",
+        "-ar", "16000",
+        "-ac", "1",
+        "-q:a", "4",
+        str(audio_path),
+        "-y",
+        "-loglevel", "error",
+    ]
+    subprocess.run(cmd, check=True, timeout=120)
+    if not audio_path.exists() or audio_path.stat().st_size == 0:
+        raise FileNotFoundError("ffmpeg did not produce an audio file.")
+    return audio_path
+
+
 def _encode_frame_base64(frame_path: Path) -> str:
     return base64.b64encode(frame_path.read_bytes()).decode("ascii")
 
@@ -1294,17 +1336,31 @@ def analyze_youtube_video(url: str, question: str) -> str:
         if not frames:
             return f"No frames extracted from video {video_id}."
 
+        # Extract and transcribe audio
+        audio_transcript: str = ""
+        try:
+            audio_path = _extract_audio(video_file, tmp_path)
+            audio_transcript = _transcribe_audio(audio_path)
+        except Exception:
+            pass  # Audio extraction is best-effort; proceed with frames only
+
         counting_mode = _is_counting_visual_question(question)
+        visual_prompt = _build_video_analysis_prompt(
+            question=question,
+            video_id=video_id,
+            frame_count=len(frames),
+            frame_interval_seconds=_FRAME_INTERVAL_SECONDS,
+            counting_mode=counting_mode,
+        )
+        if audio_transcript:
+            visual_prompt = (
+                f"[Audio transcript]\n{audio_transcript}\n\n"
+                f"[Visual frames below]\n{visual_prompt}"
+            )
         content: list[dict[str, Any]] = [
             {
                 "type": "text",
-                "text": _build_video_analysis_prompt(
-                    question=question,
-                    video_id=video_id,
-                    frame_count=len(frames),
-                    frame_interval_seconds=_FRAME_INTERVAL_SECONDS,
-                    counting_mode=counting_mode,
-                ),
+                "text": visual_prompt,
             }
         ]
         for i, frame in enumerate(frames):
