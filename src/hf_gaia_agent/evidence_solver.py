@@ -8,6 +8,7 @@ import unicodedata
 from typing import Sequence
 
 from .normalize import normalize_submitted_answer
+from .source_pipeline import EvidenceRecord
 
 MIN_COMPARISON_HINTS = (
     "least",
@@ -111,6 +112,10 @@ STOP_WORDS = {
 NUMBER_RE = re.compile(r"-?\d+(?:,\d{3})*(?:\.\d+)?")
 PARENTHETICAL_ROW_RE = re.compile(
     r"^(?P<label>[^()]+?)\s*\((?P<number>-?\d+(?:,\d{3})*(?:\.\d+)?)\)\s*$"
+)
+NASA_AWARD_RE = re.compile(
+    r"(?:nasa\s+award\s+(?:number|no\.?)|award\s+(?:number|no\.?)|supported by[^.\n]{0,100}?)\s*[:#]?\s*([A-Z0-9-]{8,})",
+    flags=re.IGNORECASE,
 )
 
 
@@ -272,6 +277,30 @@ def solve_answer_from_tool_evidence(
     return best.answer if best is not None else None
 
 
+def solve_answer_from_evidence_records(
+    question: str,
+    evidence_records: Sequence[EvidenceRecord],
+) -> tuple[str | None, str | None]:
+    table_outputs = [
+        ToolEvidence(tool_name=record.extraction_method, content=record.content)
+        for record in evidence_records
+        if record.kind == "table"
+    ]
+    table_candidate = solve_answer_from_tool_evidence(question, table_outputs)
+    if table_candidate:
+        return table_candidate, "table_comparison"
+
+    roster_candidate = _solve_roster_neighbor_from_records(question, evidence_records)
+    if roster_candidate:
+        return roster_candidate, "roster_neighbor"
+
+    award_candidate = _solve_award_number_from_records(question, evidence_records)
+    if award_candidate:
+        return award_candidate, "award_number"
+
+    return None, None
+
+
 def _clean_tool_content(value: str) -> str:
     text = (value or "").strip()
     if not text:
@@ -279,6 +308,107 @@ def _clean_tool_content(value: str) -> str:
     if "[ANSWER]" in text.upper():
         return normalize_submitted_answer(text)
     return text
+
+
+def _solve_roster_neighbor_from_records(
+    question: str,
+    evidence_records: Sequence[EvidenceRecord],
+) -> str | None:
+    lowered = question.lower()
+    if "number before and after" not in lowered:
+        return None
+    subject_match = re.search(
+        r"before and after\s+(?P<name>[A-Z][A-Za-z'’.\-]+(?:\s+[A-Z][A-Za-z'’.\-]+){0,3})'s number",
+        question,
+    )
+    if not subject_match:
+        return None
+    subject_tokens = {
+        token for token in _normalize_text(subject_match.group("name")).split() if token
+    }
+    if not subject_tokens:
+        return None
+
+    for record in evidence_records:
+        if record.kind != "table":
+            continue
+        tables = _extract_pipe_tables(_clean_tool_content(record.content))
+        for rows in tables:
+            if len(rows) < 2:
+                continue
+            headers = rows[0]
+            data_rows = rows[1:]
+            column_count = min(len(row) for row in rows)
+            if column_count < 2:
+                continue
+
+            numeric_columns = [
+                index
+                for index in range(column_count)
+                if sum(_parse_number(row[index]) is not None for row in data_rows) >= 2
+            ]
+            if not numeric_columns:
+                continue
+            number_column = numeric_columns[0]
+            name_column = next(
+                (
+                    index
+                    for index in range(column_count)
+                    if index != number_column
+                    and any(
+                        hint in _normalize_text(headers[index])
+                        for hint in ("name", "pitcher", "player")
+                    )
+                ),
+                None,
+            )
+            if name_column is None:
+                continue
+
+            parsed_rows: list[tuple[int, str]] = []
+            for row in data_rows:
+                if len(row) <= max(number_column, name_column):
+                    continue
+                raw_number = _parse_number(row[number_column])
+                raw_name = _clean_label(row[name_column])
+                if raw_number is None or not raw_name:
+                    continue
+                parsed_rows.append((int(raw_number), raw_name))
+            if len(parsed_rows) < 3:
+                continue
+
+            target_number = None
+            for number, raw_name in parsed_rows:
+                name_tokens = set(_normalize_text(raw_name).split())
+                if subject_tokens <= name_tokens or subject_tokens & name_tokens == subject_tokens:
+                    target_number = number
+                    break
+            if target_number is None:
+                continue
+
+            before_name = next((name for number, name in parsed_rows if number == target_number - 1), None)
+            after_name = next((name for number, name in parsed_rows if number == target_number + 1), None)
+            if before_name and after_name:
+                return f"{_last_name(before_name)}, {_last_name(after_name)}"
+    return None
+
+
+def _solve_award_number_from_records(
+    question: str,
+    evidence_records: Sequence[EvidenceRecord],
+) -> str | None:
+    lowered = question.lower()
+    if "award number" not in lowered and "supported by" not in lowered:
+        return None
+    for record in evidence_records:
+        if record.kind not in {"text", "links"}:
+            continue
+        text = _clean_tool_content(record.content)
+        for match in NASA_AWARD_RE.finditer(text):
+            candidate = match.group(1).strip().rstrip(".,;:")
+            if len(candidate) >= 8:
+                return candidate
+    return None
 
 
 def _solve_pipe_tables(
@@ -579,6 +709,13 @@ def _clean_label(value: str) -> str:
     cleaned = re.sub(r"\[[^\]]+\]", "", value).strip(" ,;:-")
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     return cleaned
+
+
+def _last_name(value: str) -> str:
+    parts = [part for part in _clean_label(value).split() if part]
+    if not parts:
+        return ""
+    return parts[-1]
 
 
 def _normalize_text(value: str) -> str:

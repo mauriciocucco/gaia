@@ -206,6 +206,48 @@ def test_fetch_url_falls_back_to_r_jina_when_direct_fetch_fails(monkeypatch) -> 
     assert "Recovered content" in result
 
 
+def test_count_wikipedia_studio_albums_falls_back_to_rendered_tables(monkeypatch) -> None:
+    class FakeStatusError(tools.httpx.HTTPError):
+        pass
+
+    class FakeResponse:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        def raise_for_status(self) -> None:
+            raise FakeStatusError("403")
+
+    class FakeClient:
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def get(self, _url: str, *_args: object, **_kwargs: object) -> FakeResponse:
+            return FakeResponse(_url)
+
+    monkeypatch.setattr(tools.httpx, "Client", lambda **_kwargs: FakeClient())
+    monkeypatch.setattr(
+        tools,
+        "extract_tables_from_url",
+        lambda url, text_filter="", max_tables=5, max_rows_per_table=15: (
+            "Table 1\n"
+            "Caption: Studio albums\n"
+            "Year | Album details\n"
+            "2000 | Misa Criolla\n"
+            "2003 | Acustico\n"
+            "2009 | Cantora 1\n"
+        ),
+    )
+
+    result = tools.count_wikipedia_studio_albums.invoke(
+        {"artist_name": "Mercedes Sosa", "start_year": 2000, "end_year": 2009}
+    )
+
+    assert result == "3"
+
+
 def test_fetch_wikipedia_page_returns_extract(monkeypatch) -> None:
     class FakeResponse:
         def raise_for_status(self) -> None:

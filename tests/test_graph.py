@@ -154,6 +154,19 @@ class ExplodingModel:
         raise AssertionError("Model should not be invoked for heuristic solve.")
 
 
+class FakeModelSingleAnswer:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        self.calls += 1
+        return AIMessage(content=self.answer)
+
+
 def test_graph_runs_tools_and_normalizes_answer() -> None:
     base = Path(".test-artifacts") / f"graph-{uuid4().hex}"
     base.mkdir(parents=True, exist_ok=True)
@@ -258,6 +271,19 @@ def test_graph_salvages_answer_from_existing_tool_evidence(monkeypatch) -> None:
     assert result["submitted_answer"] == "CUB"
     assert any("extract_tables_from_url" in item for item in result["tool_trace"])
     assert result["error"] is None
+
+
+def test_graph_canonicalizes_award_number_answers() -> None:
+    agent = GaiaGraphAgent(model=FakeModelSingleAnswer("[ANSWER]NASA award number 80NSSC20K0533[/ANSWER]"), max_iterations=1)
+    result = agent.solve(
+        Question(
+            task_id="award-number-format",
+            question="Under what NASA award number was the work performed by R. G. Arendt supported by?",
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "80NSSC20K0533"
 
 
 def test_graph_marks_missing_attachment_meta_answer_invalid() -> None:

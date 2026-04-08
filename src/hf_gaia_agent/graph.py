@@ -12,8 +12,17 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, MessagesState, StateGraph
 
 from .api_client import Question
-from .evidence_solver import ToolEvidence, solve_answer_from_tool_evidence
+from .evidence_solver import (
+    ToolEvidence,
+    solve_answer_from_evidence_records,
+    solve_answer_from_tool_evidence,
+)
 from .normalize import normalize_submitted_answer
+from .source_pipeline import (
+    EvidenceRecord,
+    evidence_records_from_tool_output,
+    serialize_evidence,
+)
 from .tools import (
     build_tools,
     read_file_content,
@@ -149,6 +158,10 @@ class AgentState(MessagesState):
     error: str | None
     iterations: int
     max_iterations: int
+    decision_trace: list[str]
+    evidence_used: list[dict[str, Any]]
+    reducer_used: str | None
+    fallback_reason: str | None
 
 
 def _build_model() -> Any:
@@ -243,6 +256,10 @@ def _prepare_context(state: AgentState) -> dict[str, Any]:
             HumanMessage(content=user_prompt),
         ],
         "tool_trace": [],
+        "decision_trace": [],
+        "evidence_used": [],
+        "reducer_used": None,
+        "fallback_reason": None,
         "error": None,
         "iterations": 0,
         "final_answer": None,
@@ -295,15 +312,73 @@ class GaiaGraphAgent:
             "iterations": state.get("iterations", 0) + 1,
         }
 
+    @staticmethod
+    def _collect_evidence_records(messages: list[Any]) -> list[EvidenceRecord]:
+        records: list[EvidenceRecord] = []
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            raw_content = str(message.content).strip()
+            normalized = normalize_submitted_answer(raw_content)
+            if not normalized or GaiaGraphAgent._is_invalid_tool_output(normalized):
+                continue
+            records.extend(
+                evidence_records_from_tool_output(
+                    (getattr(message, "name", "") or "tool").strip(),
+                    raw_content,
+                )
+            )
+        return records
+
+    @staticmethod
+    def _structured_answer_from_messages(
+        messages: list[Any],
+        question: str,
+    ) -> tuple[str | None, str | None, list[EvidenceRecord]]:
+        tool_outputs: list[ToolEvidence] = []
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                continue
+            raw_content = str(message.content).strip()
+            normalized = normalize_submitted_answer(raw_content)
+            if not normalized or GaiaGraphAgent._is_invalid_tool_output(normalized):
+                continue
+            tool_outputs.append(
+                ToolEvidence(
+                    tool_name=(getattr(message, "name", "") or "tool").strip(),
+                    content=raw_content,
+                )
+            )
+        tool_candidate = solve_answer_from_tool_evidence(question, tool_outputs)
+        records = GaiaGraphAgent._collect_evidence_records(messages)
+        if tool_candidate:
+            used_records = [record for record in records if record.kind == "table"] or records[-6:]
+            return tool_candidate, "table_comparison", used_records[:6]
+        record_candidate, reducer = solve_answer_from_evidence_records(question, records)
+        if record_candidate:
+            return record_candidate, reducer, records[-6:]
+        return None, None, []
+
+    @staticmethod
+    def _structured_answer_from_state(
+        state: AgentState,
+    ) -> tuple[str | None, str | None, list[EvidenceRecord]]:
+        return GaiaGraphAgent._structured_answer_from_messages(
+            state["messages"],
+            state["question"],
+        )
+
     def _tools_node(self, state: AgentState) -> dict[str, Any]:
         last_message = state["messages"][-1]
         tool_messages: list[ToolMessage] = []
         tool_trace = list(state.get("tool_trace") or [])
+        decision_trace = list(state.get("decision_trace") or [])
 
         for tool_call in getattr(last_message, "tool_calls", []):
             tool_name = tool_call["name"]
             tool_args = tool_call.get("args", {})
             tool_trace.append(f"{tool_name}({tool_args})")
+            decision_trace.append(f"tool:{tool_name}")
             tool_ = self.tools_by_name[tool_name]
             try:
                 result = tool_.invoke(tool_args)
@@ -316,7 +391,7 @@ class GaiaGraphAgent:
                     name=tool_name,
                 )
             )
-        return {"messages": tool_messages, "tool_trace": tool_trace}
+        return {"messages": tool_messages, "tool_trace": tool_trace, "decision_trace": decision_trace}
 
     @staticmethod
     def _route_after_agent(state: AgentState) -> str:
@@ -331,15 +406,29 @@ class GaiaGraphAgent:
         return "finalize"
 
     def _route_after_tools(self, state: AgentState) -> str:
+        structured_answer, _reducer, _used_records = self._structured_answer_from_state(state)
+        if structured_answer:
+            return "finalize"
         if state.get("iterations", 0) >= state.get("max_iterations", self.max_iterations):
             return "finalize"
         return "agent"
 
     def _finalize_node(self, state: AgentState) -> dict[str, Any]:
+        if state.get("final_answer"):
+            return {
+                "final_answer": state.get("final_answer"),
+                "error": state.get("error"),
+                "reducer_used": state.get("reducer_used"),
+                "evidence_used": state.get("evidence_used", []),
+                "fallback_reason": state.get("fallback_reason"),
+            }
         last_ai = self._last_ai_message(state["messages"])
         raw_answer = last_ai.content if last_ai else ""
         final_answer = normalize_submitted_answer(str(raw_answer))
         error = state.get("error")
+        reducer_used = state.get("reducer_used")
+        evidence_used = list(state.get("evidence_used") or [])
+        fallback_reason = state.get("fallback_reason")
         if self._attachment_required_but_missing(
             question=state["question"],
             file_name=state.get("file_name"),
@@ -349,10 +438,11 @@ class GaiaGraphAgent:
                 state["messages"], state["question"]
             )
             if fallback_answer:
-                return {"final_answer": fallback_answer, "error": None}
+                return {"final_answer": fallback_answer, "error": None, "fallback_reason": None}
             return {
                 "final_answer": "",
                 "error": error or "Required attachment was not available locally.",
+                "fallback_reason": fallback_reason or "attachment_missing",
             }
         if self._is_invalid_final_response(final_answer) or self._is_missing_attachment_non_answer(
             final_answer,
@@ -363,29 +453,57 @@ class GaiaGraphAgent:
                 state["messages"], state["question"]
             )
             if fallback_answer:
-                return {"final_answer": fallback_answer, "error": None}
-            structured_answer = self._structured_answer_from_evidence(state)
+                return {"final_answer": fallback_answer, "error": None, "fallback_reason": None}
+            structured_answer, reducer_used, used_records = self._structured_answer_from_state(state)
             if structured_answer:
-                return {"final_answer": structured_answer, "error": None}
+                return {
+                    "final_answer": structured_answer,
+                    "error": None,
+                    "reducer_used": reducer_used,
+                    "evidence_used": serialize_evidence(used_records),
+                    "fallback_reason": None,
+                }
             salvaged_answer = self._salvage_answer_from_evidence(state)
             if salvaged_answer:
-                return {"final_answer": salvaged_answer, "error": None}
+                return {
+                    "final_answer": salvaged_answer,
+                    "error": None,
+                    "fallback_reason": None,
+                }
             final_answer = ""
             error = error or "Model produced an invalid non-answer."
+            fallback_reason = fallback_reason or "invalid_model_non_answer"
         if not final_answer:
             fallback_answer = self._fallback_tool_answer(
                 state["messages"], state["question"]
             )
             if fallback_answer:
-                return {"final_answer": fallback_answer, "error": None}
-            structured_answer = self._structured_answer_from_evidence(state)
+                return {"final_answer": fallback_answer, "error": None, "fallback_reason": None}
+            structured_answer, reducer_used, used_records = self._structured_answer_from_state(state)
             if structured_answer:
-                return {"final_answer": structured_answer, "error": None}
+                return {
+                    "final_answer": structured_answer,
+                    "error": None,
+                    "reducer_used": reducer_used,
+                    "evidence_used": serialize_evidence(used_records),
+                    "fallback_reason": None,
+                }
             salvaged_answer = self._salvage_answer_from_evidence(state)
             if salvaged_answer:
-                return {"final_answer": salvaged_answer, "error": None}
+                return {
+                    "final_answer": salvaged_answer,
+                    "error": None,
+                    "fallback_reason": None,
+                }
             error = error or "Model did not produce a final answer."
-        return {"final_answer": final_answer, "error": error}
+            fallback_reason = fallback_reason or "missing_final_answer"
+        return {
+            "final_answer": final_answer,
+            "error": error,
+            "reducer_used": reducer_used,
+            "evidence_used": evidence_used,
+            "fallback_reason": fallback_reason,
+        }
 
     def _retry_invalid_answer_node(self, state: AgentState) -> dict[str, Any]:
         reminder = HumanMessage(
@@ -440,30 +558,6 @@ class GaiaGraphAgent:
             return None
         candidate = normalize_submitted_answer(content)
         if not candidate or self._is_invalid_final_response(candidate):
-            return None
-        return candidate
-
-    @staticmethod
-    def _structured_answer_from_evidence(state: AgentState) -> str | None:
-        tool_outputs: list[ToolEvidence] = []
-        for message in state["messages"]:
-            if not isinstance(message, ToolMessage):
-                continue
-            raw_content = str(message.content).strip()
-            normalized = normalize_submitted_answer(raw_content)
-            if not normalized or GaiaGraphAgent._is_invalid_tool_output(normalized):
-                continue
-            tool_outputs.append(
-                ToolEvidence(
-                    tool_name=(getattr(message, "name", "") or "tool").strip(),
-                    content=raw_content,
-                )
-            )
-
-        if not tool_outputs:
-            return None
-        candidate = solve_answer_from_tool_evidence(state["question"], tool_outputs)
-        if not candidate or GaiaGraphAgent._is_invalid_final_response(candidate):
             return None
         return candidate
 
@@ -605,6 +699,18 @@ class GaiaGraphAgent:
         return any(cue in lowered for cue in attachment_cues)
 
     @staticmethod
+    def _canonicalize_final_answer(question: str, answer: str) -> str:
+        normalized = normalize_submitted_answer(answer).strip()
+        if not normalized:
+            return ""
+        lowered = question.lower()
+        if "award number" in lowered:
+            for candidate in re.findall(r"\b[A-Z0-9]{10,}\b", normalized.upper()):
+                if sum(ch.isalpha() for ch in candidate) >= 2 and sum(ch.isdigit() for ch in candidate) >= 2:
+                    return candidate
+        return normalized
+
+    @staticmethod
     def _try_heuristic_answer(question: str) -> tuple[str | None, str | None]:
         decoded = _maybe_decode_reversed_question(question)
         if decoded:
@@ -635,9 +741,13 @@ class GaiaGraphAgent:
             return {
                 "task_id": question.task_id,
                 "question": question.question,
-                "submitted_answer": heuristic_answer,
+                "submitted_answer": self._canonicalize_final_answer(question.question, heuristic_answer),
                 "file_name": question.file_name,
                 "tool_trace": [heuristic_trace],
+                "decision_trace": ["heuristic:applied"],
+                "evidence_used": [],
+                "reducer_used": heuristic_trace.removeprefix("heuristic(").removesuffix(")"),
+                "fallback_reason": None,
                 "error": None,
             }
         final_state = self.app.invoke(
@@ -648,6 +758,10 @@ class GaiaGraphAgent:
                 "local_file_path": str(local_file_path) if local_file_path else None,
                 "messages": [],
                 "tool_trace": [],
+                "decision_trace": [],
+                "evidence_used": [],
+                "reducer_used": None,
+                "fallback_reason": None,
                 "error": None,
                 "final_answer": None,
                 "iterations": 0,
@@ -657,9 +771,16 @@ class GaiaGraphAgent:
         return {
             "task_id": question.task_id,
             "question": question.question,
-            "submitted_answer": final_state.get("final_answer", "") or "",
+            "submitted_answer": self._canonicalize_final_answer(
+                question.question,
+                final_state.get("final_answer", "") or "",
+            ),
             "file_name": question.file_name,
             "tool_trace": final_state.get("tool_trace", []),
+            "decision_trace": final_state.get("decision_trace", []),
+            "evidence_used": final_state.get("evidence_used", []),
+            "reducer_used": final_state.get("reducer_used"),
+            "fallback_reason": final_state.get("fallback_reason"),
             "error": final_state.get("error"),
         }
 

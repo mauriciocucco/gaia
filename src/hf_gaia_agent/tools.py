@@ -363,6 +363,29 @@ def _extract_albums_from_table(
     return albums
 
 
+def _extract_albums_from_rendered_tables(
+    rendered_tables: str,
+    start_year: int,
+    end_year: int,
+) -> set[str]:
+    albums: set[str] = set()
+    for raw_line in rendered_tables.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("Table ") or line.startswith("Caption:"):
+            continue
+        if line.lower() in {"year | album details", "year album details"}:
+            continue
+        match = re.match(r"^(?P<year>(?:19|20)\d{2})\s*\|\s*(?P<title>.+)$", line)
+        if not match:
+            match = re.match(r"^(?P<year>(?:19|20)\d{2})\s+(?P<title>.+)$", line)
+        if not match:
+            continue
+        year = int(match.group("year"))
+        if start_year <= year <= end_year:
+            albums.add(match.group("title").strip().lower())
+    return albums
+
+
 def count_wikipedia_studio_album_count_for_artist(
     artist_name: str,
     start_year: int,
@@ -387,6 +410,20 @@ def count_wikipedia_studio_album_count_for_artist(
                 albums = _extract_albums_from_table(table, start_year, end_year)
                 if albums:
                     return len(albums)
+
+    for url in urls:
+        try:
+            rendered_tables = extract_tables_from_url(
+                url=url,
+                text_filter="studio albums",
+                max_tables=3,
+                max_rows_per_table=80,
+            )
+        except Exception:
+            continue
+        albums = _extract_albums_from_rendered_tables(rendered_tables, start_year, end_year)
+        if albums:
+            return len(albums)
 
     # Fallback: text-based extraction from main page
     url = f"https://en.wikipedia.org/wiki/{artist_slug}"
