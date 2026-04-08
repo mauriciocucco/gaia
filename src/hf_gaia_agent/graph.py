@@ -33,7 +33,8 @@ SYSTEM_PROMPT = """You are a GAIA benchmark assistant.
 
 Rules:
 - Solve the user's task as accurately as possible.
-- Use tools when needed, especially for web lookup, file reading, and arithmetic.
+- Use tools when needed, especially for web lookup, file reading, python execution and arithmetic.
+- When performing data processing, string manipulation, counting, or heavy math, ALWAYS use the execute_python_code tool to run a script instead of trying to guess. Write Python scripts that print() their result.
 - If a task includes an attachment, treat that attachment as part of the question context.
 - When you are ready to answer, return only the final answer wrapped as [ANSWER]...[/ANSWER].
 - Do not include explanations outside the answer wrapper in the final response.
@@ -174,6 +175,7 @@ def _build_model() -> Any:
         "model": model_name,
         "temperature": 0,
         "timeout": 60,
+        "max_retries": 15,
     }
 
     if provider == "openai":

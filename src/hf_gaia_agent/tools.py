@@ -59,7 +59,7 @@ _SEARCH_HEADERS = {
 _AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
 
 
-def _truncate(value: str, *, max_chars: int = 12000) -> str:
+def _truncate(value: str, *, max_chars: int = 80000) -> str:
     if len(value) <= max_chars:
         return value
     return value[: max_chars - 15] + "\n...[truncated]"
@@ -257,7 +257,7 @@ def _transcribe_audio(path: Path) -> str:
     transcript = str(payload.get("text") or "").strip()
     if not transcript:
         raise RuntimeError(f"Audio transcription returned no text for {path.name}.")
-    return _truncate(transcript, max_chars=20000)
+    return _truncate(transcript, max_chars=80000)
 
 
 def read_file_content(path: str) -> str:
@@ -665,7 +665,7 @@ def _render_markdown_tables(
     ]
     if not rendered_tables:
         return "No readable HTML tables found."
-    return _truncate("\n\n".join(rendered_tables), max_chars=20000)
+    return _truncate("\n\n".join(rendered_tables), max_chars=80000)
 
 
 def _fetch_url_text(url: str) -> str:
@@ -916,7 +916,7 @@ def fetch_wikipedia_page(title: str) -> str:
     extract = str(page.get("extract") or "").strip()
     if not extract:
         raise RuntimeError(f"Wikipedia page '{page_title}' returned no extract text.")
-    return _truncate(f"Title: {page_title}\nURL: {full_url}\n\n{extract}", max_chars=20000)
+    return _truncate(f"Title: {page_title}\nURL: {full_url}\n\n{extract}", max_chars=80000)
 
 
 def _same_registered_host(left: str, right: str) -> bool:
@@ -1040,8 +1040,8 @@ def find_text_in_url(url: str, query: str, max_matches: int = 8) -> str:
 def extract_tables_from_url(
     url: str,
     text_filter: str = "",
-    max_tables: int = 5,
-    max_rows_per_table: int = 15,
+    max_tables: int = 10,
+    max_rows_per_table: int = 400,
 ) -> str:
     """Fetch an HTML page and extract readable text from its tables, optionally filtering to relevant tables."""
     try:
@@ -1090,7 +1090,7 @@ def extract_tables_from_url(
 
     if not rendered_tables:
         return "No readable HTML tables found."
-    return _truncate("\n\n".join(rendered_tables), max_chars=20000)
+    return _truncate("\n\n".join(rendered_tables), max_chars=80000)
 
 
 @tool
@@ -1116,7 +1116,7 @@ def get_youtube_transcript(url: str, languages_csv: str = "en,en-US") -> str:
         f"[{snippet.start:.2f}s] {snippet.text}"
         for snippet in transcript
     ]
-    return _truncate("\n".join(lines), max_chars=20000)
+    return _truncate("\n".join(lines), max_chars=80000)
 
 
 _FRAME_INTERVAL_SECONDS = 5
@@ -1442,6 +1442,30 @@ def calculate(expression: str) -> str:
     return str(result)
 
 
+@tool
+def execute_python_code(code: str) -> str:
+    """Execute generic Python scripts for data calculations or parsing and return stdout and stderr. Always use print() to output final answers."""
+    import tempfile
+    import subprocess
+    import sys
+    import os
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, encoding="utf-8") as f:
+            f.write(code)
+            temp_path = f.name
+        result = subprocess.run([sys.executable, temp_path], capture_output=True, text=True, timeout=45)
+        output = result.stdout
+        if result.stderr:
+            output += "\nSTDERR:\n" + result.stderr
+        os.remove(temp_path)
+        if not output.strip():
+            return "Execution successful, but no stdout/stderr. Did you forget to print the result?"
+        return _truncate(output, max_chars=80000)
+    except subprocess.TimeoutExpired:
+        return "Execution timed out after 45 seconds."
+    except Exception as e:
+        return f"Execution failed: {e}"
+
 def build_tools() -> list[Any]:
     return [
         web_search,
@@ -1456,4 +1480,5 @@ def build_tools() -> list[Any]:
         count_wikipedia_studio_albums,
         read_local_file,
         calculate,
+        execute_python_code,
     ]

@@ -201,7 +201,7 @@ def test_fetch_url_falls_back_to_r_jina_when_direct_fetch_fails(monkeypatch) -> 
 
     assert fake_client.calls == [
         "https://example.com/article",
-        "https://r.jina.ai/http://https://example.com/article",
+        "https://r.jina.ai/https://example.com/article",
     ]
     assert "Recovered content" in result
 
@@ -702,7 +702,7 @@ def test_extract_tables_from_url_falls_back_to_r_jina_markdown_table(monkeypatch
                 return FakeResponse(url=url, status_error=FakeHTTPStatusError("403"))
             if url == "https://en.wikipedia.org/w/api.php":
                 return FakeResponse(url=url, status_error=FakeHTTPStatusError("403"))
-            assert url == "https://r.jina.ai/http://https://en.wikipedia.org/wiki/1928_Summer_Olympics"
+            assert url == "https://r.jina.ai/https://en.wikipedia.org/wiki/1928_Summer_Olympics"
             assert params is None
             return FakeResponse(
                 text=markdown,
