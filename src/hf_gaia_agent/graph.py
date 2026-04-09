@@ -268,6 +268,18 @@ class AgentState(MessagesState):
     search_history_normalized: list[str]
 
 
+class _GraphRenderOnlyModel:
+    """Stub model used to compile the graph for documentation and introspection."""
+
+    def bind_tools(self, _tools: list[Any]) -> "_GraphRenderOnlyModel":
+        return self
+
+    def invoke(self, _messages: list[Any], *args: Any, **kwargs: Any) -> AIMessage:
+        raise RuntimeError(
+            "GraphRenderOnlyModel cannot execute the agent. Use it only for graph rendering."
+        )
+
+
 def _build_model() -> Any:
     provider = os.getenv("MODEL_PROVIDER", "openai").strip().lower()
     model_name = os.getenv("MODEL_NAME", "gpt-4.1-mini").strip()
@@ -576,6 +588,41 @@ class GaiaGraphAgent:
         self.model = self.answer_model.bind_tools(self.tools)
         self.max_iterations = max_iterations or int(os.getenv("GAIA_MAX_ITERATIONS", "15"))
         self.app = self._build_graph().compile()
+
+    @classmethod
+    def for_graph_introspection(cls) -> "GaiaGraphAgent":
+        return cls(model=_GraphRenderOnlyModel(), max_iterations=1)
+
+    def render_graph(self, *, format: str = "mermaid") -> str:
+        graph = self.app.get_graph()
+        if format == "mermaid":
+            return graph.draw_mermaid()
+        if format == "ascii":
+            try:
+                return graph.draw_ascii()
+            except ImportError:
+                return self._render_graph_ascii_fallback(graph)
+        raise ValueError(f"Unsupported graph render format '{format}'.")
+
+    def render_graph_mermaid(self) -> str:
+        return self.render_graph(format="mermaid")
+
+    def render_graph_ascii(self) -> str:
+        return self.render_graph(format="ascii")
+
+    @staticmethod
+    def _render_graph_ascii_fallback(graph: Any) -> str:
+        lines: list[str] = []
+        for node_id in graph.nodes:
+            lines.append(f"[{node_id}]")
+            outgoing = [edge for edge in graph.edges if edge.source == node_id]
+            if not outgoing:
+                lines.append("  (no outgoing edges)")
+                continue
+            for edge in outgoing:
+                connector = "-?->" if getattr(edge, "conditional", False) else "-->"
+                lines.append(f"  {connector} {edge.target}")
+        return "\n".join(lines)
 
     def _build_graph(self) -> StateGraph:
         workflow = StateGraph(AgentState)

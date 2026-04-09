@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import dataclasses
 import os
 from pathlib import Path
 from typing import Any
@@ -93,6 +92,14 @@ def _print_results(results: list[dict[str, Any]]) -> None:
     print(json.dumps(results, ensure_ascii=True, indent=2))
 
 
+def _write_text_output(content: str, destination: Path | None) -> None:
+    if destination is None:
+        print(content)
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content, encoding="utf-8")
+
+
 def run_command(args: argparse.Namespace) -> int:
     with ScoringAPIClient(base_url=args.api_url) as client:
         client.health()
@@ -122,6 +129,13 @@ def submit_command(args: argparse.Namespace) -> int:
         response = client.submit_answers(args.username, args.agent_code_url, answers)
 
     print(json.dumps(dataclasses.asdict(response), ensure_ascii=True, indent=2))
+    return 0
+
+
+def graph_command(args: argparse.Namespace) -> int:
+    agent = GaiaGraphAgent.for_graph_introspection()
+    rendered = agent.render_graph(format=args.format)
+    _write_text_output(rendered, args.output)
     return 0
 
 
@@ -162,6 +176,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit_parser.add_argument("--limit", type=int, default=None, help="Only solve the first N questions.")
     submit_parser.set_defaults(func=submit_command)
+
+    graph_parser = subparsers.add_parser("graph", help="Render the LangGraph workflow.")
+    graph_parser.add_argument(
+        "--format",
+        choices=("mermaid", "ascii"),
+        default="mermaid",
+        help="Graph output format.",
+    )
+    graph_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional destination file for the rendered graph.",
+    )
+    graph_parser.set_defaults(func=graph_command)
     return parser
 
 
