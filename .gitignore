@@ -4,6 +4,7 @@
 .tmp/
 .tmp_pytest/
 .pytest_tmp/
+.pytest_tmp_run/
 .test-artifacts/
 .test-tmp/
 .pytest_cache/

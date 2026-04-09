@@ -1,7 +1,7 @@
 from pathlib import Path
 from uuid import uuid4
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 import pytest
 import hf_gaia_agent.graph as graph_module
@@ -166,6 +166,18 @@ class FakeModelSingleAnswer:
     def invoke(self, _messages):
         self.calls += 1
         return AIMessage(content=self.answer)
+
+
+class RecordingModel:
+    def __init__(self) -> None:
+        self.messages = None
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.messages = messages
+        return AIMessage(content="[ANSWER]ok[/ANSWER]")
 
 
 class FakeModelWithBlockedPython:
@@ -387,6 +399,58 @@ class FakeModelWithTemporalRosterRetry:
         return AIMessage(content="[ANSWER]Yoshida, Uehara[/ANSWER]")
 
 
+class FakeModelWithWrongConcreteMetricAnswer:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-table",
+                        "name": "extract_tables_from_url",
+                        "args": {
+                            "url": "https://www.baseball-reference.com/teams/NYY/1977.shtml",
+                            "text_filter": "walks at bats",
+                        },
+                    }
+                ],
+            )
+        return AIMessage(content="[ANSWER]595[/ANSWER]")
+
+
+class FakeModelWithMetricTextFallback:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, _messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-metric-fallback",
+                        "name": "extract_tables_from_url",
+                        "args": {
+                            "url": "https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA",
+                            "text_filter": "walks at bats",
+                        },
+                    }
+                ],
+            )
+        raise AssertionError("Graph should finalize from auto fetch fallback before another model turn.")
+
+
 def test_graph_runs_tools_and_normalizes_answer() -> None:
     base = Path(".test-artifacts") / f"graph-{uuid4().hex}"
     base.mkdir(parents=True, exist_ok=True)
@@ -490,6 +554,77 @@ def test_graph_salvages_answer_from_existing_tool_evidence(monkeypatch) -> None:
 
     assert result["submitted_answer"] == "CUB"
     assert any("extract_tables_from_url" in item for item in result["tool_trace"])
+    assert result["error"] is None
+
+
+def test_graph_prefers_structured_metric_answer_over_wrong_concrete_model_answer(monkeypatch) -> None:
+    @tool
+    def extract_tables_from_url(url: str, text_filter: str = "") -> str:
+        """Return a batting table with enough evidence for the structured reducer."""
+        assert url == "https://www.baseball-reference.com/teams/NYY/1977.shtml"
+        assert text_filter == "walks at bats"
+        return (
+            "Table 1\n"
+            "Caption: Batting\n"
+            "Player | AB | BB\n"
+            "Thurman Munson | 519 | 82\n"
+            "Reggie Jackson | 589 | 66\n"
+            "Graig Nettles | 566 | 80\n"
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [extract_tables_from_url])
+    monkeypatch.setattr(GaiaGraphAgent, "_route_after_tools", lambda self, state: "agent")
+
+    agent = GaiaGraphAgent(model=FakeModelWithWrongConcreteMetricAnswer(), max_iterations=2)
+    result = agent.solve(
+        Question(
+            task_id="metric-preferred",
+            question="How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?",
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "519"
+    assert result["reducer_used"] == "metric_row_lookup"
+    assert result["error"] is None
+
+
+def test_graph_auto_fetches_text_when_metric_table_extraction_finds_no_html_tables(monkeypatch) -> None:
+    @tool
+    def extract_tables_from_url(url: str, text_filter: str = "") -> str:
+        """Simulate a stats page whose table is only available in fetched markdown/text."""
+        assert url == "https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA"
+        assert text_filter == "walks at bats"
+        return "URL: https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA\nNo readable HTML tables found."
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return a markdown stats table from the same page."""
+        assert url == "https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA"
+        return (
+            "Title: 1977 New York Yankees Hitting Stats by Baseball Almanac\n"
+            "URL: https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA\n\n"
+            "| Name | G | AB | RBI | BB |\n"
+            "| --- | --- | --- | --- | --- |\n"
+            "| Thurman Munson | 149 | 519 | 100 | 82 |\n"
+            "| Reggie Jackson | 146 | 525 | 110 | 74 |\n"
+            "| Graig Nettles | 158 | 589 | 107 | 68 |\n"
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [extract_tables_from_url, fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModelWithMetricTextFallback(), max_iterations=2)
+    result = agent.solve(
+        Question(
+            task_id="metric-text-fallback",
+            question="How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?",
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "519"
+    assert result["reducer_used"] == "metric_row_lookup"
+    assert any("[auto_fallback_from_extract_tables]" in item for item in result["tool_trace"])
     assert result["error"] is None
 
 
@@ -883,7 +1018,7 @@ def test_graph_retries_date_sensitive_roster_answer_without_temporal_grounding(m
         if "List_of_current" in url:
             return (
                 "Table 1\n"
-                "Caption: Hokkaido Nippon-Ham Fighters roster\n"
+                "Caption: Hokkaido Nippon-Ham Fighters current 2023 season roster\n"
                 "No. | Name\n"
                 "18 | Sachiya Yamasaki\n"
                 "19 | Taisho Tamai\n"
@@ -916,6 +1051,103 @@ def test_graph_retries_date_sensitive_roster_answer_without_temporal_grounding(m
     assert result["submitted_answer"] == "Yoshida, Uehara"
     assert any("List_of_current_Nippon_Professional_Baseball_team_rosters" in item for item in result["tool_trace"])
     assert any("2023-07-roster" in item for item in result["tool_trace"])
+
+
+def test_temporal_roster_retry_ignores_player_profile_with_year_and_season() -> None:
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after TaishÅ Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: [Official] Taisho Tamai (Hokkaido Nippon-Ham) | Pacific League | "
+                    "Player directory | 2023 season pitcher stats\n"
+                    "URL: https://pacificleague.com/en/player/517064"
+                ),
+                tool_call_id="player-page",
+                name="fetch_url",
+            ),
+            ToolMessage(
+                content=(
+                    "URL: https://en.wikipedia.org/wiki/List_of_current_Nippon_Professional_Baseball_team_rosters\n"
+                    "Table 1\n"
+                    "Caption: Hokkaido Nippon-Ham Fighters current 2023 season roster\n"
+                    "No. | Name\n"
+                    "18 | Sachiya Yamasaki\n"
+                    "19 | Taisho Tamai\n"
+                    "20 | Kenta Uehara\n"
+                ),
+                tool_call_id="current-roster",
+                name="extract_tables_from_url",
+            ),
+            ToolMessage(
+                content=(
+                    "URL: https://en.wikipedia.org/wiki/Template:Hokkaido_Nippon-Ham_Fighters_roster\n"
+                    "Table 1\n"
+                    "Caption: Hokkaido Nippon-Ham Fighters 2023 season roster\n"
+                    "No. | Name\n"
+                    "18 | Sachiya Yamasaki\n"
+                    "19 | Taisho Tamai\n"
+                    "20 | Kenta Uehara\n"
+                ),
+                tool_call_id="template-roster",
+                name="extract_tables_from_url",
+            ),
+            ToolMessage(
+                content=(
+                    "Title: 2023 Hokkaido Nippon-Ham Fighters Individual Pitching (Pacific League) | NPB.jp\n"
+                    "URL: https://npb.jp/bis/eng/2023/stats/idp1_f.html\n\n"
+                    "2023 Hokkaido Nippon-Ham Fighters Individual Pitching\n"
+                    "Pitcher\n"
+                    "Tamai, Taisho\n"
+                    "Uehara, Kenta\n"
+                    "Yoshida, Kosei\n"
+                    "Website\n"
+                    "Roster\n"
+                    "Team Roster Listing\n"
+                ),
+                tool_call_id="stats-page",
+                name="fetch_url",
+            ),
+        ],
+    }
+
+    assert GaiaGraphAgent._has_temporal_roster_grounding_gap(state) is True
+    assert GaiaGraphAgent._requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
+
+
+def test_agent_node_truncates_tool_messages_for_model_context() -> None:
+    model = RecordingModel()
+    agent = GaiaGraphAgent(model=model, max_iterations=2)
+    long_tool_output = "URL: https://example.com/data\n" + ("A" * 10000)
+
+    state = {
+        "question": "Who won the event?",
+        "messages": [
+            SystemMessage(content="system"),
+            HumanMessage(content="question"),
+            ToolMessage(
+                content=long_tool_output,
+                tool_call_id="tool-1",
+                name="fetch_url",
+            ),
+        ],
+        "iterations": 0,
+        "max_iterations": 2,
+        "question_profile": {},
+        "ranked_candidates": [],
+        "decision_trace": [],
+    }
+
+    agent._agent_node(state)
+
+    assert model.messages is not None
+    tool_messages = [message for message in model.messages if isinstance(message, ToolMessage)]
+    assert len(tool_messages) == 1
+    assert len(str(tool_messages[0].content)) < len(long_tool_output)
+    assert "[truncated for model context]" in str(tool_messages[0].content)
 
 
 def test_graph_rejects_hallucinated_answer_when_required_attachment_is_missing() -> None:

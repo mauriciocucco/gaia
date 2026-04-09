@@ -91,3 +91,35 @@ def test_solve_answer_from_evidence_records_selects_row_by_metric_and_returns_ot
 
     assert answer == "519"
     assert reducer == "metric_row_lookup"
+
+
+def test_solve_answer_from_evidence_records_reads_metric_lookup_from_markdown_text_table() -> None:
+    question = (
+        "How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?"
+    )
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA",
+            source_type="page_text",
+            adapter_name="PageTextAdapter",
+            content=(
+                "Title: 1977 New York Yankees Hitting Stats by Baseball Almanac\n\n"
+                "| ## 1977 New York Yankees Hitting Stats |\n"
+                "| --- |\n"
+                "| Name | G | AB | RBI | BB |\n"
+                "| Thurman Munson | 149 | 519 | 100 | 82 |\n"
+                "| Reggie Jackson | 146 | 525 | 110 | 74 |\n"
+                "| Graig Nettles | 158 | 589 | 107 | 68 |\n"
+            ),
+            title_or_caption="1977 New York Yankees Hitting Stats by Baseball Almanac",
+            confidence=0.8,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "519"
+    assert reducer == "metric_row_lookup"

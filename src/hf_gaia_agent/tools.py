@@ -1141,6 +1141,9 @@ def get_youtube_transcript(url: str, languages_csv: str = "en,en-US") -> str:
 
 _FRAME_INTERVAL_SECONDS = 5
 _MAX_FRAMES = 20
+_DENSE_FRAME_INTERVAL_SECONDS = 1
+_DENSE_WINDOW_RADIUS_SECONDS = 2
+_MAX_DENSE_WINDOWS = 3
 _COUNTING_VISUAL_CUES = (
     "how many",
     "highest number",
@@ -1180,21 +1183,76 @@ def _download_video(url: str, output_dir: Path) -> Path:
     return videos[0]
 
 
-def _extract_frames(video_path: Path, output_dir: Path) -> list[Path]:
+def _extract_frames(
+    video_path: Path,
+    output_dir: Path,
+    *,
+    interval_seconds: int = _FRAME_INTERVAL_SECONDS,
+    max_frames: int = _MAX_FRAMES,
+    prefix: str = "frame",
+) -> list[Path]:
     ffmpeg = _check_binary("ffmpeg")
-    pattern = output_dir / "frame_%04d.jpg"
+    pattern = output_dir / f"{prefix}_%04d.jpg"
     cmd = [
         ffmpeg,
         "-i", str(video_path),
-        "-vf", f"fps=1/{_FRAME_INTERVAL_SECONDS},scale=768:-1",
+        "-vf", f"fps=1/{interval_seconds},scale=768:-1",
         "-q:v", "2",
-        "-frames:v", str(_MAX_FRAMES),
+        "-frames:v", str(max_frames),
         str(pattern),
         "-y",
         "-loglevel", "error",
     ]
     subprocess.run(cmd, check=True, timeout=120)
-    frames = sorted(output_dir.glob("frame_*.jpg"))
+    frames = sorted(output_dir.glob(f"{prefix}_*.jpg"))
+    return frames
+
+
+def _extract_frame_at_timestamp(
+    video_path: Path,
+    output_dir: Path,
+    *,
+    timestamp_seconds: int,
+    prefix: str = "dense_frame",
+) -> Path:
+    ffmpeg = _check_binary("ffmpeg")
+    frame_path = output_dir / f"{prefix}_{timestamp_seconds:04d}.jpg"
+    cmd = [
+        ffmpeg,
+        "-ss", str(max(0, timestamp_seconds)),
+        "-i", str(video_path),
+        "-vf", "scale=768:-1",
+        "-frames:v", "1",
+        "-q:v", "2",
+        str(frame_path),
+        "-y",
+        "-loglevel", "error",
+    ]
+    subprocess.run(cmd, check=True, timeout=120)
+    if not frame_path.exists():
+        raise FileNotFoundError(
+            f"ffmpeg did not produce a dense frame for timestamp {timestamp_seconds}s."
+        )
+    return frame_path
+
+
+def _extract_dense_frames(
+    video_path: Path,
+    output_dir: Path,
+    timestamps: list[int],
+) -> list[tuple[int, Path]]:
+    frames: list[tuple[int, Path]] = []
+    for timestamp in sorted(dict.fromkeys(max(0, int(ts)) for ts in timestamps)):
+        frames.append(
+            (
+                timestamp,
+                _extract_frame_at_timestamp(
+                    video_path,
+                    output_dir,
+                    timestamp_seconds=timestamp,
+                ),
+            )
+        )
     return frames
 
 
@@ -1250,33 +1308,91 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _parse_payload_timestamp(value: Any) -> int | None:
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(round(value)))
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return max(0, int(round(float(candidate))))
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_visual_count(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _extract_frame_counts_from_payload(payload: dict[str, Any]) -> list[tuple[int, int]]:
+    frames = payload.get("frames")
+    if not isinstance(frames, list):
+        return []
+
+    counts: list[tuple[int, int]] = []
+    for index, item in enumerate(frames):
+        if not isinstance(item, dict):
+            continue
+        timestamp = _parse_payload_timestamp(
+            item.get("timestamp_s", item.get("timestamp", item.get("time_s")))
+        )
+        if timestamp is None:
+            timestamp = index
+        count = None
+        for key in ("count", "species_count", "visible_count"):
+            count = _parse_visual_count(item.get(key))
+            if count is not None:
+                break
+        if count is None:
+            species = item.get("species")
+            if isinstance(species, list):
+                count = len([name for name in species if str(name).strip()])
+        if count is None:
+            continue
+        counts.append((timestamp, count))
+    return counts
+
+
 def _extract_max_count_from_payload(payload: dict[str, Any]) -> int | None:
+    frame_counts = _extract_frame_counts_from_payload(payload)
+    if frame_counts:
+        return max(count for _timestamp, count in frame_counts)
+
     for key in ("max_count", "max_species_count", "highest_count", "highest_species_count"):
         value = payload.get(key)
         if isinstance(value, int):
             return value
         if isinstance(value, str) and value.strip().isdigit():
             return int(value.strip())
-
-    frames = payload.get("frames")
-    if not isinstance(frames, list):
-        return None
-
-    counts: list[int] = []
-    for item in frames:
-        if not isinstance(item, dict):
-            continue
-        for key in ("count", "species_count", "visible_count"):
-            value = item.get(key)
-            if isinstance(value, int):
-                counts.append(value)
-                break
-            if isinstance(value, str) and value.strip().isdigit():
-                counts.append(int(value.strip()))
-                break
-    if counts:
-        return max(counts)
     return None
+
+
+def _select_dense_timestamps_from_payload(payload: dict[str, Any]) -> list[int]:
+    frame_counts = _extract_frame_counts_from_payload(payload)
+    if not frame_counts:
+        return []
+
+    ranked = sorted(frame_counts, key=lambda item: (-item[1], item[0]))
+    if not ranked or ranked[0][1] <= 0:
+        return []
+
+    timestamps: list[int] = []
+    for timestamp, _count in ranked[:_MAX_DENSE_WINDOWS]:
+        for offset in range(
+            -_DENSE_WINDOW_RADIUS_SECONDS,
+            _DENSE_WINDOW_RADIUS_SECONDS + 1,
+            _DENSE_FRAME_INTERVAL_SECONDS,
+        ):
+            timestamps.append(max(0, timestamp + offset))
+    return sorted(dict.fromkeys(timestamps))
 
 
 def _build_video_analysis_prompt(
@@ -1286,27 +1402,76 @@ def _build_video_analysis_prompt(
     frame_count: int,
     frame_interval_seconds: int,
     counting_mode: bool,
+    prompt_mode: str = "coarse",
 ) -> str:
+    pass_description = (
+        f"sampled every {frame_interval_seconds} seconds"
+        if prompt_mode == "coarse"
+        else f"sampled around promising moments at roughly {frame_interval_seconds}-second spacing"
+    )
     if counting_mode:
+        phase_instruction = (
+            "This is the initial coarse scan. Identify the frames most likely to contain the peak simultaneous count."
+            if prompt_mode == "coarse"
+            else "This is a verification pass around previously promising moments. Re-evaluate carefully and return per-frame counts."
+        )
         return (
-            f"These are {frame_count} frames sampled every {frame_interval_seconds} seconds "
+            f"These are {frame_count} frames {pass_description} "
             f"from a YouTube video (ID: {video_id}).\n\n"
             f"Question: {question}\n\n"
+            f"{phase_instruction}\n"
             "Analyze each frame independently and count only what the question asks for.\n"
             "For species questions, count biological species, not individuals, ages, or sexes.\n"
             "Do not count chicks and adults of the same species separately.\n"
             "Look carefully for small or distant subjects in the background before deciding.\n"
+            "Include a short species list for each frame when you can identify the visible species.\n"
             "Return JSON only using this schema:\n"
-            '{\"frames\":[{\"timestamp_s\":0,\"count\":0,\"notes\":\"short note\"}],\"max_count\":0}\n'
+            '{\"frames\":[{\"timestamp_s\":0,\"species\":[\"species name\"],\"count\":0,\"notes\":\"short note\"}],\"max_count\":0}\n'
             "Use integer counts."
         )
     return (
-        f"These are {frame_count} frames sampled every {frame_interval_seconds} seconds "
+        f"These are {frame_count} frames {pass_description} "
         f"from a YouTube video (ID: {video_id}).\n\n"
         f"Question: {question}\n\n"
         "Analyze the frames carefully and answer the question. "
         "Be specific and precise."
     )
+
+
+def _prepend_audio_transcript(prompt_text: str, audio_transcript: str) -> str:
+    if not audio_transcript:
+        return prompt_text
+    return (
+        f"[Audio transcript]\n{audio_transcript}\n\n"
+        f"[Visual frames below]\n{prompt_text}"
+    )
+
+
+def _build_video_message_content(
+    *,
+    prompt_text: str,
+    frame_items: list[tuple[int, Path]],
+    detail: str,
+) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": prompt_text,
+        }
+    ]
+    for timestamp, frame in frame_items:
+        content.append({
+            "type": "text",
+            "text": f"[Frame at {timestamp}s]",
+        })
+        content.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{_encode_frame_base64(frame)}",
+                "detail": detail,
+            },
+        })
+    return content
 
 
 @tool
@@ -1345,37 +1510,6 @@ def analyze_youtube_video(url: str, question: str) -> str:
             pass  # Audio extraction is best-effort; proceed with frames only
 
         counting_mode = _is_counting_visual_question(question)
-        visual_prompt = _build_video_analysis_prompt(
-            question=question,
-            video_id=video_id,
-            frame_count=len(frames),
-            frame_interval_seconds=_FRAME_INTERVAL_SECONDS,
-            counting_mode=counting_mode,
-        )
-        if audio_transcript:
-            visual_prompt = (
-                f"[Audio transcript]\n{audio_transcript}\n\n"
-                f"[Visual frames below]\n{visual_prompt}"
-            )
-        content: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": visual_prompt,
-            }
-        ]
-        for i, frame in enumerate(frames):
-            timestamp = i * _FRAME_INTERVAL_SECONDS
-            content.append({
-                "type": "text",
-                "text": f"[Frame at {timestamp}s]",
-            })
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{_encode_frame_base64(frame)}",
-                    "detail": "high" if counting_mode else "low",
-                },
-            })
 
         provider = os.getenv("MODEL_PROVIDER", "openai").strip().lower()
         model_name = os.getenv("MODEL_NAME", "gpt-4.1-mini").strip()
@@ -1399,15 +1533,79 @@ def analyze_youtube_video(url: str, question: str) -> str:
             kwargs["base_url"] = base_url
 
         vision_model = ChatOpenAI(**kwargs)
-        response = vision_model.invoke([HM(content=content)])
-        response_text = str(response.content)
+        coarse_frame_items = [
+            (index * _FRAME_INTERVAL_SECONDS, frame)
+            for index, frame in enumerate(frames)
+        ]
+        coarse_prompt = _prepend_audio_transcript(
+            _build_video_analysis_prompt(
+                question=question,
+                video_id=video_id,
+                frame_count=len(coarse_frame_items),
+                frame_interval_seconds=_FRAME_INTERVAL_SECONDS,
+                counting_mode=counting_mode,
+                prompt_mode="coarse",
+            ),
+            audio_transcript,
+        )
+        coarse_content = _build_video_message_content(
+            prompt_text=coarse_prompt,
+            frame_items=coarse_frame_items,
+            detail="high" if counting_mode else "low",
+        )
+        coarse_response = vision_model.invoke([HM(content=coarse_content)])
+        coarse_response_text = str(coarse_response.content)
         if counting_mode:
-            payload = _extract_json_object(response_text)
-            if payload is not None:
-                max_count = _extract_max_count_from_payload(payload)
-                if max_count is not None:
-                    return str(max_count)
-        return _truncate(response_text, max_chars=8000)
+            coarse_payload = _extract_json_object(coarse_response_text)
+            coarse_max = (
+                _extract_max_count_from_payload(coarse_payload)
+                if coarse_payload is not None
+                else None
+            )
+            if coarse_payload is not None:
+                dense_timestamps = _select_dense_timestamps_from_payload(coarse_payload)
+                if dense_timestamps:
+                    dense_dir = tmp_path / "dense_frames"
+                    dense_dir.mkdir()
+                    try:
+                        dense_frames = _extract_dense_frames(
+                            video_file,
+                            dense_dir,
+                            dense_timestamps,
+                        )
+                    except Exception:
+                        dense_frames = []
+                    if dense_frames:
+                        dense_prompt = _prepend_audio_transcript(
+                            _build_video_analysis_prompt(
+                                question=question,
+                                video_id=video_id,
+                                frame_count=len(dense_frames),
+                                frame_interval_seconds=_DENSE_FRAME_INTERVAL_SECONDS,
+                                counting_mode=True,
+                                prompt_mode="verification",
+                            ),
+                            audio_transcript,
+                        )
+                        dense_content = _build_video_message_content(
+                            prompt_text=dense_prompt,
+                            frame_items=dense_frames,
+                            detail="high",
+                        )
+                        dense_response = vision_model.invoke([HM(content=dense_content)])
+                        dense_payload = _extract_json_object(str(dense_response.content))
+                        dense_max = (
+                            _extract_max_count_from_payload(dense_payload)
+                            if dense_payload is not None
+                            else None
+                        )
+                        if dense_max is not None:
+                            if coarse_max is not None:
+                                return str(max(coarse_max, dense_max))
+                            return str(dense_max)
+            if coarse_max is not None:
+                return str(coarse_max)
+        return _truncate(coarse_response_text, max_chars=8000)
 
 
 @tool

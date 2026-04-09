@@ -127,7 +127,7 @@ def profile_question(
     generic_urls = tuple(url for url in urls if not _is_youtube_url(url))
     expected_date = _extract_expected_date(question)
     expected_author = _extract_expected_author(question)
-    subject_name = _extract_subject_name(question)
+    subject_name = _extract_subject_name_unicode(question) or _extract_subject_name(question)
     text_filter = _infer_text_filter(question)
 
     if file_name and not local_file_path:
@@ -278,6 +278,7 @@ def score_candidates(
     profile: QuestionProfile,
 ) -> list[SourceCandidate]:
     scored: list[SourceCandidate] = []
+    metric_row_lookup = _is_metric_row_lookup_question(question)
     question_tokens = _query_tokens(question)
     expected_date_tokens = _query_tokens(profile.expected_date or "")
     author_tokens = _query_tokens(profile.expected_author or "")
@@ -286,11 +287,22 @@ def score_candidates(
         score = 0
         reasons: list[str] = []
         haystack = f"{candidate.title}\n{candidate.snippet}\n{candidate.url}"
+        scope = f"{candidate.title}\n{candidate.url}"
         haystack_tokens = _query_tokens(haystack)
         domain = _registered_host(candidate.url)
         if _is_low_signal_domain(domain):
             score -= 120
             reasons.append("low_signal_domain")
+        if _is_discussion_source(domain=domain, url=candidate.url, haystack=haystack):
+            if profile.name in {
+                "table_lookup",
+                "roster_neighbor_lookup",
+                "text_span_lookup",
+                "entity_attribute_lookup",
+                "wikipedia_lookup",
+            }:
+                score -= 55
+                reasons.append("discussion_source_penalty")
         if domain and profile.expected_domains and any(
             domain.endswith(expected) for expected in profile.expected_domains
         ):
@@ -316,7 +328,7 @@ def score_candidates(
             score += 6
             reasons.append("expected_year")
         elif profile.name == "roster_neighbor_lookup" and profile.expected_date:
-            score -= 12
+            score -= 18
             reasons.append("expected_date_miss")
         if author_tokens and author_tokens <= _query_tokens(haystack):
             score += 35
@@ -359,20 +371,47 @@ def score_candidates(
             if any(token in candidate.title.lower() for token in ("roster", "statistics", "olympics")):
                 score += 10
                 reasons.append("tableish_title")
+        if metric_row_lookup:
+            if (
+                any(token in haystack.lower() for token in ("hitting stats", "batting stats", "team stats", "player stats"))
+                or any(fragment in candidate.url.lower() for fragment in ("hitting.php", "batting", "/stats/"))
+            ):
+                score += 24
+                reasons.append("stats_page_hint")
+            if "roster.php" in candidate.url.lower() or "roster" in candidate.title.lower():
+                score -= 24
+                reasons.append("roster_page_penalty")
         if profile.name == "roster_neighbor_lookup" and profile.expected_date:
             if any(token in haystack.lower() for token in ("roster", "pitchers", "numbers", "staff")):
                 score += 22
                 reasons.append("roster_page_hint")
             if any(token in haystack.lower() for token in ("2023", "july", "season", "archive", "oldid")):
-                score += 14
+                score += 18
                 reasons.append("dated_roster_hint")
+            if (
+                profile.subject_name
+                and any(token.lower() in haystack.lower() for token in profile.subject_name.split())
+                and not any(token in haystack.lower() for token in ("roster", "pitchers", "numbers", "staff", "team"))
+            ):
+                score -= 34
+                reasons.append("subject_profile_penalty")
+            if (
+                any(token in scope.lower() for token in ("individual pitching", "individual batting", "pitching leaders", "batting leaders"))
+                or "/stats/" in candidate.url.lower()
+            ) and not any(token in scope.lower() for token in ("roster", "roster listing", "team roster", "staff")):
+                score -= 42
+                reasons.append("stats_page_penalty")
             if (
                 "list_of_current" in candidate.url.lower()
                 or "current roster" in haystack.lower()
                 or candidate.url.lower().endswith("/current")
+                or ("/wiki/template:" in candidate.url.lower() and "roster" in haystack.lower())
             ):
-                score -= 36
+                score -= 52
                 reasons.append("current_roster_penalty")
+            if _is_off_scope_roster_source(url=candidate.url, haystack=haystack):
+                score -= 60
+                reasons.append("off_scope_roster_penalty")
         scored.append(
             SourceCandidate(
                 title=candidate.title,
@@ -553,6 +592,25 @@ def _extract_subject_name(question: str) -> str | None:
     return None
 
 
+def _is_metric_row_lookup_question(question: str) -> bool:
+    return re.search(
+        r"how many\s+.+?\s+did\s+.+?\s+with\s+the\s+"
+        r"(most|least|fewest|highest|lowest|minimum|maximum|smallest|largest)\s+.+?\s+have",
+        question,
+        flags=re.IGNORECASE,
+    ) is not None
+
+
+def _extract_subject_name_unicode(question: str) -> str | None:
+    match = re.search(
+        r"before and after\s+(?P<name>.+?)'s number",
+        question,
+    )
+    if match:
+        return match.group("name").strip()
+    return None
+
+
 def _infer_text_filter(question: str) -> str | None:
     lowered = question.lower()
     mentioned_match = re.search(
@@ -670,5 +728,38 @@ def _is_low_signal_domain(domain: str) -> bool:
             "grokipedia.com",
             "pinterest.com",
             "tiktok.com",
+        )
+    )
+
+
+def _is_discussion_source(*, domain: str, url: str, haystack: str) -> bool:
+    lowered = f"{domain}\n{url}\n{haystack}".lower()
+    return any(
+        token in lowered
+        for token in (
+            "reddit.com",
+            "redd.it",
+            "forum",
+            "forums.",
+            "discussion",
+            "quora.com",
+            "stackexchange.com",
+        )
+    )
+
+
+def _is_off_scope_roster_source(*, url: str, haystack: str) -> bool:
+    lowered = f"{url}\n{haystack}".lower()
+    return any(
+        token in lowered
+        for token in (
+            "minorbaseball",
+            "minor league",
+            "minor-league",
+            "milb",
+            "triple-a",
+            "double-a",
+            "single-a",
+            "farm team",
         )
     )

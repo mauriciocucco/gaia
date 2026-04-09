@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any
+from urllib.parse import unquote
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -137,6 +138,12 @@ INVALID_TOOL_OUTPUT_PATTERNS = (
     "could not retrieve",
     "download video",
 )
+PREFERRED_STRUCTURED_REDUCERS = {
+    "metric_row_lookup",
+    "roster_neighbor",
+    "text_span_attribute",
+}
+MODEL_TOOL_MESSAGE_MAX_CHARS = 4000
 
 COMMON_ENGLISH_HINTS = {
     "the",
@@ -387,6 +394,17 @@ def _question_supports_direct_python(question: str) -> bool:
     )
 
 
+def _question_is_metric_row_lookup(question: str) -> bool:
+    return bool(
+        re.search(
+            r"how many\s+.+?\s+did\s+.+?\s+with\s+the\s+"
+            r"(?:most|least|fewest|highest|lowest|minimum|maximum|smallest|largest)\s+.+?\s+have",
+            question,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _build_profile_guidance_block(*, question: str, profile: QuestionProfile) -> str:
     hints: list[str] = [f"Question profile: {profile.name}."]
     lowered = question.lower()
@@ -397,6 +415,16 @@ def _build_profile_guidance_block(*, question: str, profile: QuestionProfile) ->
         )
         hints.append(
             "Do not use execute_python_code for open-ended classification or filtering when the prompt already contains the full list/table."
+        )
+    if _question_is_metric_row_lookup(question):
+        hints.append(
+            "This is a stat-table lookup. Once one fetched table contains both the selector metric and the requested metric, stop searching and answer from that table."
+        )
+        hints.append(
+            "Prefer structured stats sources over discussion threads, recap articles, or player-specific pages."
+        )
+        hints.append(
+            "Prefer batting, hitting, or stats pages over roster pages when the question asks for one stat of the player with the most or least of another stat."
         )
     if profile.name == "wikipedia_lookup":
         hints.append(
@@ -410,6 +438,9 @@ def _build_profile_guidance_block(*, question: str, profile: QuestionProfile) ->
             hints.append(
                 f"The question is date-sensitive ({profile.expected_date}). Prefer sources that explicitly mention that date/season rather than a generic current roster page."
             )
+            hints.append(
+                "Treat current or undated roster pages as exploratory only. Finalize only from dated, seasonal, archive, oldid, or otherwise temporally grounded evidence."
+            )
     if profile.name == "article_to_paper":
         hints.append(
             "Find the exact article page, inspect its outgoing links, then read the linked paper or source. Answer only from fetched evidence."
@@ -419,7 +450,7 @@ def _build_profile_guidance_block(*, question: str, profile: QuestionProfile) ->
             "This is a targeted text-span lookup. Prefer the exact exercise/page and use find_text_in_url with the key noun phrase before browsing broadly."
         )
         hints.append(
-            "Avoid bulk PDFs or book-level landing pages when an exact exercise page is available."
+            "Avoid mirrors, bulk PDFs, and book-level landing pages when an exact exercise page is available."
         )
     if profile.name == "entity_role_chain":
         hints.append(
@@ -575,7 +606,7 @@ class GaiaGraphAgent:
         return workflow
 
     def _agent_node(self, state: AgentState) -> dict[str, Any]:
-        msgs = list(state["messages"])
+        msgs = self._messages_for_model(state["messages"])
         if state.get("iterations", 0) >= state.get("max_iterations", self.max_iterations):
             msgs.append(SystemMessage(content="CRITICAL: You have reached the maximum number of tool calls. You CANNOT use tools anymore. You MUST provide your final guess or answer using the [ANSWER]...[/ANSWER] wrapper immediately in this message based on the evidence collected so far."))
             response = self.model.invoke(msgs, tool_choice="none") if hasattr(self.model, "invoke") else self.model.invoke(msgs)
@@ -596,6 +627,45 @@ class GaiaGraphAgent:
             "messages": [response],
             "iterations": state.get("iterations", 0) + 1,
         }
+
+    @staticmethod
+    def _messages_for_model(messages: list[Any]) -> list[Any]:
+        prepared: list[Any] = []
+        for message in messages:
+            if not isinstance(message, ToolMessage):
+                prepared.append(message)
+                continue
+            if str(getattr(message, "tool_call_id", "") or "").startswith("auto-"):
+                continue
+            content = str(message.content)
+            if len(content) <= MODEL_TOOL_MESSAGE_MAX_CHARS:
+                prepared.append(message)
+                continue
+            prepared.append(
+                ToolMessage(
+                    content=GaiaGraphAgent._truncate_for_model_context(
+                        content,
+                        max_chars=MODEL_TOOL_MESSAGE_MAX_CHARS,
+                    ),
+                    tool_call_id=str(getattr(message, "tool_call_id", "") or "tool"),
+                    name=(getattr(message, "name", "") or None),
+                )
+            )
+        return prepared
+
+    @staticmethod
+    def _truncate_for_model_context(value: str, *, max_chars: int) -> str:
+        if len(value) <= max_chars:
+            return value
+        head_chars = max_chars * 3 // 4
+        tail_chars = max_chars - head_chars - 36
+        if tail_chars <= 0:
+            return value[:max_chars]
+        return (
+            value[:head_chars]
+            + "\n...[truncated for model context]...\n"
+            + value[-tail_chars:]
+        )
 
     @staticmethod
     def _build_ranked_candidate_nudge(state: AgentState) -> str | None:
@@ -643,6 +713,14 @@ class GaiaGraphAgent:
         if profile.name == "text_span_lookup":
             guidance.append(
                 "For text-span lookups, prefer the exact exercise/page candidate over generic course mirrors or bulk PDFs."
+            )
+        if _question_is_metric_row_lookup(state["question"]):
+            guidance.append(
+                "For stat lookups, prefer batting, hitting, or stats pages over roster pages; once a fetched table contains both relevant metrics, stop and answer from that table."
+            )
+        if profile.name == "roster_neighbor_lookup":
+            guidance.append(
+                "Prefer a team roster or team page over a player biography or player profile."
             )
         return "\n".join(guidance)
 
@@ -921,6 +999,30 @@ class GaiaGraphAgent:
                 executed_url = str(tool_args.get("url", "")).strip()
                 if executed_url:
                     fetched_urls.add(executed_url)
+            if (
+                tool_name == "extract_tables_from_url"
+                and _question_is_metric_row_lookup(state["question"])
+                and "No readable HTML tables found." in result_text
+            ):
+                executed_url = str(tool_args.get("url", "")).strip()
+                fetch_tool = self.tools_by_name.get("fetch_url")
+                if executed_url and fetch_tool is not None:
+                    auto_args = {"url": executed_url}
+                    tool_trace.append(
+                        f"fetch_url({auto_args}) [auto_fallback_from_extract_tables]"
+                    )
+                    decision_trace.append("tool:fetch_url:auto_fallback")
+                    try:
+                        auto_result = fetch_tool.invoke(auto_args)
+                    except Exception as exc:
+                        auto_result = f"Tool error: {exc}"
+                    tool_messages.append(
+                        ToolMessage(
+                            content=str(auto_result),
+                            tool_call_id=f"auto-fetch-{tool_call['id']}",
+                            name="fetch_url",
+                        )
+                    )
             if tool_name in search_tool_names | {"extract_links_from_url"}:
                 parsed_candidates = parse_result_blocks(result_text, origin_tool=tool_name)
                 if parsed_candidates:
@@ -987,6 +1089,9 @@ class GaiaGraphAgent:
         bad_fragments = (
             "forum.",
             "forums.",
+            "reddit.com",
+            "redd.it",
+            "quora.com",
             "zhihu.com",
             "news.google",
             "grokipedia",
@@ -1061,15 +1166,55 @@ class GaiaGraphAgent:
             ):
                 return best_candidate
 
+        if profile.name == "table_lookup":
+            best_reasons = set(best_candidate.reasons)
+            requested_is_discussion = any(
+                fragment in requested_lower
+                for fragment in ("reddit.com", "redd.it", "forum", "forums.", "quora.com")
+            )
+            if (
+                requested_is_discussion
+                and best_candidate.score >= 35
+                and {"expected_domain", "tableish_title"} & best_reasons
+            ):
+                return best_candidate
+
         if profile.name == "roster_neighbor_lookup" and profile.expected_date:
+            decoded_requested_lower = unquote(requested_url).lower()
             requested_is_current_roster = (
                 "list_of_current" in requested_lower or "current" in requested_lower
+                or ("/wiki/template:" in requested_lower and "roster" in requested_lower)
+            )
+            requested_is_minor_or_player_page = any(
+                fragment in decoded_requested_lower
+                for fragment in (
+                    "/player/",
+                    "/players/",
+                    "minorbaseball",
+                    "minor-league",
+                    "minor_league",
+                    "milb",
+                )
+            )
+            requested_is_subject_profile = bool(
+                profile.subject_name
+                and any(
+                    token.lower() in decoded_requested_lower
+                    for token in profile.subject_name.split()
+                )
+                and "roster" not in decoded_requested_lower
             )
             best_reasons = set(best_candidate.reasons)
             if (
                 requested_is_current_roster
                 and best_candidate.score >= 45
                 and {"dated_roster_hint", "expected_date", "expected_date_partial", "expected_year"} & best_reasons
+            ):
+                return best_candidate
+            if (
+                (requested_is_minor_or_player_page or requested_is_subject_profile)
+                and best_candidate.score >= 25
+                and {"roster_page_hint", "dated_roster_hint", "tableish_title"} & best_reasons
             ):
                 return best_candidate
         return None
@@ -1148,12 +1293,72 @@ class GaiaGraphAgent:
         return "finalize"
 
     def _route_after_tools(self, state: AgentState) -> str:
-        structured_answer, _reducer, _used_records = self._structured_answer_from_state(state)
-        if structured_answer:
+        structured_answer, reducer_used, _used_records = self._structured_answer_from_state(state)
+        if structured_answer and self._structured_answer_is_temporally_usable(
+            state=state,
+            reducer_used=reducer_used,
+        ):
             return "finalize"
         # Always return to agent so it gets a chance to guess or provide a final answer
         # based on the tool results, even if we've reached the iteration limit.
         return "agent"
+
+    @staticmethod
+    def _should_prefer_structured_answer(
+        *,
+        profile: QuestionProfile,
+        reducer_used: str | None,
+    ) -> bool:
+        if reducer_used not in PREFERRED_STRUCTURED_REDUCERS:
+            return False
+        if reducer_used == "roster_neighbor":
+            return profile.name == "roster_neighbor_lookup"
+        if reducer_used == "text_span_attribute":
+            return profile.name == "text_span_lookup"
+        return True
+
+    def _structured_answer_result(
+        self,
+        state: AgentState,
+        *,
+        preferred_only: bool = False,
+    ) -> dict[str, Any] | None:
+        structured_answer, reducer_used, used_records = self._structured_answer_from_state(state)
+        if not structured_answer:
+            return None
+        profile = _question_profile_from_state(state)
+        if preferred_only and not self._should_prefer_structured_answer(
+            profile=profile,
+            reducer_used=reducer_used,
+        ):
+            return None
+        if not self._structured_answer_is_temporally_usable(
+            state=state,
+            reducer_used=reducer_used,
+        ):
+            return None
+        return {
+            "final_answer": structured_answer,
+            "error": None,
+            "reducer_used": reducer_used,
+            "evidence_used": serialize_evidence(used_records),
+            "fallback_reason": None,
+        }
+
+    @staticmethod
+    def _structured_answer_is_temporally_usable(
+        *,
+        state: AgentState,
+        reducer_used: str | None,
+    ) -> bool:
+        profile = _question_profile_from_state(state)
+        if (
+            reducer_used == "roster_neighbor"
+            and profile.name == "roster_neighbor_lookup"
+            and profile.expected_date
+        ):
+            return not GaiaGraphAgent._has_temporal_roster_grounding_gap(state)
+        return True
 
     def _finalize_node(self, state: AgentState) -> dict[str, Any]:
         if state.get("final_answer"):
@@ -1186,6 +1391,22 @@ class GaiaGraphAgent:
                 "error": error or "Required attachment was not available locally.",
                 "fallback_reason": fallback_reason or "attachment_missing",
             }
+        preferred_structured_result = self._structured_answer_result(state, preferred_only=True)
+        if preferred_structured_result:
+            return preferred_structured_result
+        if self._has_temporal_roster_grounding_gap(state):
+            fallback_answer = self._fallback_tool_answer(
+                state["messages"], state["question"]
+            )
+            if fallback_answer and not self._requires_temporal_roster_retry(
+                state, fallback_answer
+            ):
+                return {"final_answer": fallback_answer, "error": None, "fallback_reason": None}
+            return {
+                "final_answer": "",
+                "error": error or "Date-sensitive roster answer lacked temporally grounded evidence.",
+                "fallback_reason": fallback_reason or "temporal_roster_evidence_missing",
+            }
         if self._is_invalid_final_response(final_answer) or self._is_missing_attachment_non_answer(
             final_answer,
             file_name=state.get("file_name"),
@@ -1196,15 +1417,9 @@ class GaiaGraphAgent:
             )
             if fallback_answer:
                 return {"final_answer": fallback_answer, "error": None, "fallback_reason": None}
-            structured_answer, reducer_used, used_records = self._structured_answer_from_state(state)
-            if structured_answer:
-                return {
-                    "final_answer": structured_answer,
-                    "error": None,
-                    "reducer_used": reducer_used,
-                    "evidence_used": serialize_evidence(used_records),
-                    "fallback_reason": None,
-                }
+            structured_result = self._structured_answer_result(state)
+            if structured_result:
+                return structured_result
             salvaged_answer = self._salvage_answer_from_evidence(state)
             if salvaged_answer:
                 return {
@@ -1230,15 +1445,9 @@ class GaiaGraphAgent:
             )
             if fallback_answer:
                 return {"final_answer": fallback_answer, "error": None, "fallback_reason": None}
-            structured_answer, reducer_used, used_records = self._structured_answer_from_state(state)
-            if structured_answer:
-                return {
-                    "final_answer": structured_answer,
-                    "error": None,
-                    "reducer_used": reducer_used,
-                    "evidence_used": serialize_evidence(used_records),
-                    "fallback_reason": None,
-                }
+            structured_result = self._structured_answer_result(state)
+            if structured_result:
+                return structured_result
             salvaged_answer = self._salvage_answer_from_evidence(state)
             if salvaged_answer:
                 return {
@@ -1276,6 +1485,7 @@ class GaiaGraphAgent:
             extra = (
                 f" This question is date-sensitive ({profile.expected_date}). "
                 "Your current evidence looks like a current or undated roster, so do not answer yet. "
+                "Do not treat player profiles, roster templates, or season stat leaderboards as substitutes for a dated roster. "
                 "Fetch a roster/archive/oldid/team page that is explicitly grounded to the requested date or season."
             )
         reminder = HumanMessage(
@@ -1338,6 +1548,10 @@ class GaiaGraphAgent:
     def _record_has_temporal_support(record: EvidenceRecord, profile: QuestionProfile) -> bool:
         if not profile.expected_date:
             return True
+        if GaiaGraphAgent._record_looks_current_only(record):
+            return False
+        if not GaiaGraphAgent._record_has_roster_context(record):
+            return False
         haystack = f"{record.source_url}\n{record.title_or_caption}\n{record.content}".lower()
         if profile.expected_date.lower() in haystack:
             return True
@@ -1363,15 +1577,42 @@ class GaiaGraphAgent:
     @staticmethod
     def _record_looks_current_only(record: EvidenceRecord) -> bool:
         haystack = f"{record.source_url}\n{record.title_or_caption}\n{record.content}".lower()
-        return "list_of_current" in haystack or "current roster" in haystack
+        return (
+            "list_of_current" in haystack
+            or "current roster" in haystack
+            or ("/wiki/template:" in haystack and "roster" in haystack)
+        )
 
     @staticmethod
-    def _requires_temporal_roster_retry(state: AgentState, answer_text: str) -> bool:
+    def _record_has_roster_context(record: EvidenceRecord) -> bool:
+        scope = f"{record.source_url}\n{record.title_or_caption}".lower()
+        haystack = f"{scope}\n{record.content}".lower()
+        if any(fragment in haystack for fragment in ("/player/", "/players/", "player directory")):
+            return False
+        explicit_roster_markers = (
+            "roster",
+            "rosters",
+            "pitchers",
+            "staff",
+            "depth chart",
+            "roster listing",
+            "team roster",
+            "template:",
+        )
+        if any(fragment in scope for fragment in ("/stats/", "individual pitching", "individual batting")) and not any(
+            token in scope for token in explicit_roster_markers
+        ):
+            return False
+        if any(token in scope for token in explicit_roster_markers):
+            return True
+        if record.kind == "table":
+            return any(token in haystack for token in ("pitchers", "roster", "staff", "depth chart"))
+        return False
+
+    @staticmethod
+    def _has_temporal_roster_grounding_gap(state: AgentState) -> bool:
         profile = _question_profile_from_state(state)
         if profile.name != "roster_neighbor_lookup" or not profile.expected_date:
-            return False
-        candidate = normalize_submitted_answer(answer_text)
-        if not candidate or GaiaGraphAgent._is_invalid_final_response(candidate):
             return False
         records = GaiaGraphAgent._collect_evidence_records(state["messages"])
         if not records:
@@ -1379,7 +1620,8 @@ class GaiaGraphAgent:
         relevant_records = [
             record
             for record in records
-            if record.kind in {"table", "text"} and ("roster" in record.content.lower() or "pitcher" in record.content.lower() or "list_of_current" in record.source_url.lower())
+            if record.kind in {"table", "text"}
+            and GaiaGraphAgent._record_has_roster_context(record)
         ]
         if not relevant_records:
             return False
@@ -1387,6 +1629,13 @@ class GaiaGraphAgent:
             GaiaGraphAgent._record_has_temporal_support(record, profile)
             for record in relevant_records
         )
+
+    @staticmethod
+    def _requires_temporal_roster_retry(state: AgentState, answer_text: str) -> bool:
+        candidate = normalize_submitted_answer(answer_text)
+        if not candidate or GaiaGraphAgent._is_invalid_final_response(candidate):
+            return False
+        return GaiaGraphAgent._has_temporal_roster_grounding_gap(state)
 
     @staticmethod
     def _format_grounded_evidence_for_llm(records: list[EvidenceRecord]) -> str:
@@ -1615,6 +1864,21 @@ class GaiaGraphAgent:
         if not normalized:
             return ""
         lowered = question.lower()
+        if GaiaGraphAgent._question_expects_numeric_answer(question):
+            numeric = GaiaGraphAgent._extract_numeric_answer(normalized)
+            if numeric:
+                return numeric
+        if "number before and after" in lowered:
+            parts = [part.strip() for part in normalized.split(",") if part.strip()]
+            if len(parts) == 2:
+                compact_parts: list[str] = []
+                for part in parts:
+                    fragment = part.split(":")[-1].strip()
+                    tokens = fragment.split()
+                    if tokens:
+                        compact_parts.append(tokens[-1])
+                if len(compact_parts) == 2:
+                    return ", ".join(compact_parts)
         if "award number" in lowered:
             for candidate in re.findall(r"\b[A-Z0-9]{10,}\b", normalized.upper()):
                 if sum(ch.isalpha() for ch in candidate) >= 2 and sum(ch.isdigit() for ch in candidate) >= 2:

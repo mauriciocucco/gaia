@@ -213,3 +213,71 @@ def test_analyze_youtube_video_tool_integration(tmp_path: Path, monkeypatch) -> 
     assert image_items
     assert all(item["image_url"]["detail"] == "high" for item in image_items)
     assert result == "3"
+
+
+def test_analyze_youtube_video_runs_dense_verification_pass(tmp_path: Path, monkeypatch) -> None:
+    from hf_gaia_agent.tools import analyze_youtube_video
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def fake_download(url, output_dir):
+        video = output_dir / "video.mp4"
+        video.write_bytes(b"fake")
+        return video
+
+    def fake_extract(video_path, output_dir, **_kwargs):
+        frames = []
+        for index in range(2):
+            frame = output_dir / f"frame_{index:04d}.jpg"
+            frame.write_bytes(b"\xff\xd8\xff\xe0sample")
+            frames.append(frame)
+        return frames
+
+    def fake_extract_dense(video_path, output_dir, timestamps):
+        assert timestamps == [0, 1, 2, 3, 4, 5, 6, 7]
+        dense_frames = []
+        for timestamp in timestamps:
+            frame = output_dir / f"dense_{timestamp:04d}.jpg"
+            frame.write_bytes(b"\xff\xd8\xff\xe0sample")
+            dense_frames.append((timestamp, frame))
+        return dense_frames
+
+    monkeypatch.setattr("hf_gaia_agent.tools._download_video", fake_download)
+    monkeypatch.setattr("hf_gaia_agent.tools._extract_frames", fake_extract)
+    monkeypatch.setattr("hf_gaia_agent.tools._extract_dense_frames", fake_extract_dense)
+
+    coarse_response = MagicMock()
+    coarse_response.content = (
+        '{"frames":[{"timestamp_s":0,"species":["duck"],"count":1},'
+        '{"timestamp_s":5,"species":["duck","heron"],"count":2}],"max_count":2}'
+    )
+    dense_response = MagicMock()
+    dense_response.content = (
+        '{"frames":[{"timestamp_s":4,"species":["duck","heron"],"count":2},'
+        '{"timestamp_s":5,"species":["duck","heron","egret"],"count":3},'
+        '{"timestamp_s":6,"species":["duck","heron"],"count":2}],"max_count":3}'
+    )
+
+    fake_vision_model = MagicMock()
+    fake_vision_model.invoke.side_effect = [coarse_response, dense_response]
+
+    with patch("langchain_openai.ChatOpenAI", return_value=fake_vision_model):
+        monkeypatch.setenv("MODEL_PROVIDER", "openai")
+        monkeypatch.setenv("MODEL_NAME", "gpt-4.1-mini")
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        result = analyze_youtube_video.invoke({
+            "url": "https://www.youtube.com/watch?v=L1vXCYZAYYM",
+            "question": "What is the highest number of bird species to be on camera simultaneously?",
+        })
+
+    assert fake_vision_model.invoke.call_count == 2
+    dense_message = fake_vision_model.invoke.call_args_list[1][0][0][0]
+    dense_timestamps = [
+        item["text"]
+        for item in dense_message.content
+        if isinstance(item, dict)
+        and item.get("type") == "text"
+        and str(item.get("text", "")).startswith("[Frame at ")
+    ]
+    assert "[Frame at 5s]" in dense_timestamps
+    assert result == "3"

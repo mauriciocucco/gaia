@@ -211,6 +211,28 @@ def test_score_candidates_prefers_roster_page_for_roster_neighbor_lookup() -> No
     assert "tableish_title" in scored[0].reasons
 
 
+def test_score_candidates_penalizes_subject_profile_for_roster_neighbor_lookup() -> None:
+    question = (
+        "Who are the pitchers with the number before and after TaishÅ Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. TaishÅ Tamai - Wikipedia\n"
+        "URL: https://en.wikipedia.org/wiki/Taish%C5%8D_Tamai\n"
+        "Snippet: professional Japanese baseball pitcher for the Fighters\n\n"
+        "2. Fighters roster archive\n"
+        "URL: https://npb.example.com/fighters/archive/2023-07-roster\n"
+        "Snippet: July 2023 pitchers roster and numbers archive\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://npb.example.com/fighters/archive/2023-07-roster"
+    assert "subject_profile_penalty" in scored[1].reasons
+
+
 def test_score_candidates_prefers_temporally_matching_roster_sources() -> None:
     question = (
         "Who are the pitchers with the number before and after Taishō Tamai's number as of July 2023? "
@@ -255,6 +277,74 @@ def test_score_candidates_penalizes_current_roster_list_for_dated_roster_lookup(
     assert scored[0].url == "https://npb.example.com/fighters/archive/2023-07-roster"
     assert "dated_roster_hint" in scored[0].reasons
     assert "current_roster_penalty" in scored[1].reasons
+
+
+def test_score_candidates_prefers_scoped_roster_archive_over_minor_league_or_discussion() -> None:
+    question = (
+        "Who are the pitchers with the number before and after TaishÅ Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Fighters roster discussion\n"
+        "URL: https://www.reddit.com/r/NPB/comments/example/fighters_roster_july_2023/\n"
+        "Snippet: discussion about July 2023 Fighters roster and numbers\n\n"
+        "2. Fighters minor league roster\n"
+        "URL: https://www.statscrew.com/minorbaseball/roster/t-nf13423/y-2023\n"
+        "Snippet: minor league roster and staff for 2023\n\n"
+        "3. Fighters roster archive\n"
+        "URL: https://npb.example.com/fighters/archive/2023-07-roster\n"
+        "Snippet: July 2023 pitchers roster and numbers archive\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://npb.example.com/fighters/archive/2023-07-roster"
+    assert any("discussion_source_penalty" in candidate.reasons for candidate in scored)
+    assert any("off_scope_roster_penalty" in candidate.reasons for candidate in scored)
+
+
+def test_score_candidates_prefers_stats_page_over_roster_for_metric_row_lookup() -> None:
+    question = "How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?"
+    profile = profile_question(question)
+    raw = (
+        "1. 1977 New York Yankees Roster | Baseball Almanac\n"
+        "URL: https://www.baseball-almanac.com/teamstats/roster.php?y=1977&t=NYA\n"
+        "Snippet: team roster and player list for the 1977 Yankees\n\n"
+        "2. 1977 New York Yankees Hitting Stats by Baseball Almanac\n"
+        "URL: https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA\n"
+        "Snippet: AB and BB for every 1977 Yankees hitter\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA"
+    assert "stats_page_hint" in scored[0].reasons
+    assert "roster_page_penalty" in scored[1].reasons
+
+
+def test_score_candidates_penalizes_stats_pages_for_dated_roster_lookup() -> None:
+    question = (
+        "Who are the pitchers with the number before and after TaishÃ…Â Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Fighters individual pitching stats\n"
+        "URL: https://npb.jp/bis/eng/2023/stats/idp1_f.html\n"
+        "Snippet: 2023 Hokkaido Nippon-Ham Fighters individual pitching stats and roster links\n\n"
+        "2. Fighters roster archive\n"
+        "URL: https://npb.example.com/fighters/archive/2023-07-roster\n"
+        "Snippet: July 2023 pitchers roster and numbers archive\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://npb.example.com/fighters/archive/2023-07-roster"
+    assert "stats_page_penalty" in scored[1].reasons
 
 
 def test_score_candidates_penalizes_low_signal_domains_for_entity_role_chain() -> None:

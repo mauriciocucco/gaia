@@ -352,6 +352,100 @@ def _clean_tool_content(value: str) -> str:
     return text
 
 
+def _extract_roster_subject_name(question: str) -> str | None:
+    broad_match = re.search(
+        r"before and after\s+(?P<name>.+?)'s number",
+        question,
+    )
+    if broad_match:
+        return broad_match.group("name").strip()
+    unicode_match = re.search(
+        r"before and after\s+(?P<name>[^\W\d_][\w'’.\-]+(?:\s+[^\W\d_][\w'’.\-]+){0,3})'s number",
+        question,
+    )
+    if unicode_match:
+        return unicode_match.group("name").strip()
+    return None
+
+
+def _solve_roster_neighbor_for_subject(
+    *,
+    question: str,
+    evidence_records: Sequence[EvidenceRecord],
+    subject_name: str,
+) -> str | None:
+    subject_tokens = {
+        token for token in _normalize_text(subject_name).split() if token
+    }
+    if not subject_tokens:
+        return None
+
+    for record in evidence_records:
+        if record.kind != "table":
+            continue
+        if not _record_matches_roster_temporal_request(record, question):
+            continue
+        tables = _extract_pipe_tables(_clean_tool_content(record.content))
+        for rows in tables:
+            if len(rows) < 2:
+                continue
+            headers = rows[0]
+            data_rows = rows[1:]
+            column_count = min(len(row) for row in rows)
+            if column_count < 2:
+                continue
+
+            numeric_columns = [
+                index
+                for index in range(column_count)
+                if sum(_parse_number(row[index]) is not None for row in data_rows) >= 2
+            ]
+            if not numeric_columns:
+                continue
+            number_column = numeric_columns[0]
+            name_column = next(
+                (
+                    index
+                    for index in range(column_count)
+                    if index != number_column
+                    and any(
+                        hint in _normalize_text(headers[index])
+                        for hint in ("name", "pitcher", "player")
+                    )
+                ),
+                None,
+            )
+            if name_column is None:
+                continue
+
+            parsed_rows: list[tuple[int, str]] = []
+            for row in data_rows:
+                if len(row) <= max(number_column, name_column):
+                    continue
+                raw_number = _parse_number(row[number_column])
+                raw_name = _clean_label(row[name_column])
+                if raw_number is None or not raw_name:
+                    continue
+                parsed_rows.append((int(raw_number), raw_name))
+            if len(parsed_rows) < 3:
+                continue
+
+            target_number = None
+            for number, raw_name in parsed_rows:
+                name_tokens = set(_normalize_text(raw_name).split())
+                if subject_tokens <= name_tokens or subject_tokens & name_tokens == subject_tokens:
+                    target_number = number
+                    break
+            if target_number is None:
+                continue
+
+            before_name = next((name for number, name in parsed_rows if number == target_number - 1), None)
+            after_name = next((name for number, name in parsed_rows if number == target_number + 1), None)
+            if before_name and after_name:
+                return f"{_last_name(before_name)}, {_last_name(after_name)}"
+    return None
+
+
 def _solve_roster_neighbor_from_records(
     question: str,
     evidence_records: Sequence[EvidenceRecord],
@@ -359,6 +453,15 @@ def _solve_roster_neighbor_from_records(
     lowered = question.lower()
     if "number before and after" not in lowered:
         return None
+    subject_name = _extract_roster_subject_name(question)
+    if subject_name:
+        candidate = _solve_roster_neighbor_for_subject(
+            question=question,
+            evidence_records=evidence_records,
+            subject_name=subject_name,
+        )
+        if candidate:
+            return candidate
     subject_match = re.search(
         r"before and after\s+(?P<name>[A-Z][A-Za-z'’.\-]+(?:\s+[A-Z][A-Za-z'’.\-]+){0,3})'s number",
         question,
@@ -442,6 +545,8 @@ def _record_matches_roster_temporal_request(record: EvidenceRecord, question: st
     if "as of " not in lowered:
         return True
     haystack = f"{record.source_url}\n{record.title_or_caption}\n{record.content}".lower()
+    if "list_of_current" in haystack or "current roster" in haystack:
+        return False
     expected_bits = re.findall(
         r"january|february|march|april|may|june|july|august|september|october|november|december|\b\d{4}\b",
         lowered,
@@ -452,8 +557,6 @@ def _record_matches_roster_temporal_request(record: EvidenceRecord, question: st
     if year_bits and any(bit in haystack for bit in year_bits):
         if any(token in haystack for token in ("archive", "oldid", "season", "media guide")):
             return True
-    if "list_of_current" in haystack or "current roster" in haystack:
-        return False
     return not expected_bits
 
 
@@ -486,7 +589,7 @@ def _solve_metric_row_lookup_from_records(
 
     best: _CandidateAnswer | None = None
     for record in evidence_records:
-        if record.kind != "table":
+        if record.kind not in {"table", "text"}:
             continue
         content = _clean_tool_content(record.content)
         if not content:
@@ -976,21 +1079,83 @@ def _extract_pipe_tables(content: str) -> list[list[list[str]]]:
         line = raw_line.strip()
         if "|" not in line:
             if len(current) >= 2:
-                tables.append(current)
+                tables.extend(_finalize_pipe_table_rows(current))
             current = []
             continue
 
         cells = [cell.strip() for cell in line.split("|")]
         if len(cells) < 2:
             if len(current) >= 2:
-                tables.append(current)
+                tables.extend(_finalize_pipe_table_rows(current))
             current = []
             continue
         current.append(cells)
 
     if len(current) >= 2:
-        tables.append(current)
+        tables.extend(_finalize_pipe_table_rows(current))
     return tables
+
+
+def _finalize_pipe_table_rows(rows: list[list[str]]) -> list[list[list[str]]]:
+    normalized = _normalize_pipe_table_rows(rows)
+    return [
+        segment
+        for segment in _split_pipe_table_segments(normalized)
+        if len(segment) >= 2
+    ]
+
+
+def _normalize_pipe_table_rows(rows: list[list[str]]) -> list[list[str]]:
+    normalized: list[list[str]] = []
+    for row in rows:
+        trimmed = list(row)
+        while trimmed and not trimmed[0].strip():
+            trimmed = trimmed[1:]
+        while trimmed and not trimmed[-1].strip():
+            trimmed = trimmed[:-1]
+        if not trimmed:
+            continue
+        if _is_markdown_separator_row(trimmed):
+            continue
+        normalized.append(trimmed)
+    while len(normalized) >= 2 and len(normalized[0]) < 2:
+        normalized = normalized[1:]
+    return normalized
+
+
+def _is_markdown_separator_row(row: list[str]) -> bool:
+    return all(
+        re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) is not None
+        for cell in row
+    )
+
+
+def _split_pipe_table_segments(rows: list[list[str]]) -> list[list[list[str]]]:
+    segments: list[list[list[str]]] = []
+    current: list[list[str]] = []
+    expected_width: int | None = None
+    for row in rows:
+        width = len(row)
+        if width < 2:
+            if len(current) >= 2:
+                segments.append(current)
+            current = []
+            expected_width = None
+            continue
+        if not current:
+            current = [row]
+            expected_width = width
+            continue
+        if expected_width is not None and width != expected_width:
+            if len(current) >= 2:
+                segments.append(current)
+            current = [row]
+            expected_width = width
+            continue
+        current.append(row)
+    if len(current) >= 2:
+        segments.append(current)
+    return segments
 
 
 def _pick_metric_column(
