@@ -340,6 +340,19 @@ def score_candidates(
             if "paper" in candidate.title.lower() or "paper" in candidate.snippet.lower():
                 score += 12
                 reasons.append("paper_mention")
+            if candidate.origin_tool == "extract_links_from_url":
+                if domain and not any(domain.endswith(expected) for expected in profile.expected_domains):
+                    score += 125
+                    reasons.append("linked_source")
+                if any(
+                    token in haystack.lower()
+                    for token in ("published paper", "study", "journal", "for journalists", "northwestern")
+                ):
+                    score += 28
+                    reasons.append("primary_source_hint")
+                if domain and any(domain.endswith(expected) for expected in profile.expected_domains) and "/articles/" in candidate.url:
+                    score -= 40
+                    reasons.append("article_loop_penalty")
         if profile.name == "text_span_lookup":
             if any(token in haystack.lower() for token in ("1.e", "exercises", "exercise")):
                 score += 28
@@ -388,6 +401,14 @@ def score_candidates(
             if any(token in haystack.lower() for token in ("2023", "july", "season", "archive", "oldid")):
                 score += 18
                 reasons.append("dated_roster_hint")
+            if (
+                any(fragment in candidate.url.lower() for fragment in ("/team/player/list/", "/team/player/detail/"))
+                and any(token in haystack.lower() for token in ("player directory", "show other players", "pitchers"))
+                and expected_year_tokens
+                and expected_year_tokens <= haystack_tokens
+            ):
+                score += 36
+                reasons.append("official_yearbook_hint")
             if (
                 profile.subject_name
                 and any(token.lower() in haystack.lower() for token in profile.subject_name.split())

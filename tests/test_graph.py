@@ -383,6 +383,7 @@ class FakeModelWithTemporalRosterRetry:
         if self.calls == 3:
             reminder_text = " ".join(str(getattr(msg, "content", "")) for msg in messages)
             assert "date-sensitive (as of July 2023)" in reminder_text
+            assert "season-specific official player directory" in reminder_text
             return AIMessage(
                 content="",
                 tool_calls=[
@@ -639,6 +640,201 @@ def test_graph_canonicalizes_award_number_answers() -> None:
     )
 
     assert result["submitted_answer"] == "80NSSC20K0533"
+
+
+def test_graph_prefers_structured_award_number_over_placeholder_model_answer(monkeypatch) -> None:
+    @tool
+    def find_text_in_url(url: str, query: str) -> str:
+        """Return a grounded award number snippet."""
+        assert "northwestern.edu" in url
+        assert query == "NASA award number"
+        return "The study was supported by NASA (award number 80GSFC21M0002)."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url])
+
+    class FakeModelWithPlaceholderAwardAnswer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def bind_tools(self, _tools):
+            return self
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-award",
+                            "name": "find_text_in_url",
+                            "args": {
+                                "url": "https://news.northwestern.edu/stories/2023/06/mysterious-dashes-revealed-in-milky-ways-center/?fj=1",
+                                "query": "NASA award number",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="[ANSWER]N/A[/ANSWER]")
+
+    agent = GaiaGraphAgent(model=FakeModelWithPlaceholderAwardAnswer(), max_iterations=2)
+    result = agent.solve(
+        Question(
+            task_id="award-number-evidence-wins",
+            question="Under what NASA award number was the work performed by R. G. Arendt supported by?",
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "80GSFC21M0002"
+    assert result["reducer_used"] == "award_number"
+    assert result["error"] is None
+
+
+def test_graph_retries_non_identifier_award_answer() -> None:
+    state = {
+        "question": "Under what NASA award number was the work performed by R. G. Arendt supported by?",
+        "messages": [AIMessage(content="National")],
+        "iterations": 1,
+        "max_iterations": 3,
+    }
+
+    assert GaiaGraphAgent._route_after_agent(state) == "retry_invalid_answer"
+
+
+def test_graph_article_to_paper_auto_retries_links_and_redirects_fetch(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return the target Universe Today article."""
+        assert "Carolyn Collins Petersen" in query
+        return (
+            "1. There Are Hundreds of Mysterious Filaments at the Center of the Milky Way\n"
+            "URL: https://www.universetoday.com/articles/there-are-hundreds-of-mysterious-filaments-at-the-center-of-the-milky-way\n"
+            "Snippet: Carolyn Collins Petersen June 6, 2023 Universe Today article\n"
+        )
+
+    @tool
+    def extract_links_from_url(url: str, text_filter: str = "", max_results: int = 20, same_domain_only: bool = False) -> str:
+        """Fail with the filter, succeed without it."""
+        assert "universetoday.com/articles/" in url
+        if text_filter:
+            return "No matching links found."
+        return (
+            "1. Mysterious dashes revealed in Milky Way's Center\n"
+            "URL: https://news.northwestern.edu/stories/2023/06/mysterious-dashes-revealed-in-milky-ways-center/?fj=1\n"
+            "Snippet: For Journalists news release with the published paper link\n\n"
+            "2. The Population of the Galactic Center Filaments: Position Angle Distribution Reveals a Degree-scale Collimated Outflow from Sgr A* along the Galactic Plane\n"
+            "URL: https://iopscience.iop.org/article/10.3847/2041-8213/acd54b\n"
+            "Snippet: Published paper in The Astrophysical Journal Letters\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Fetch the redirected linked source instead of the original article."""
+        assert "universetoday.com/articles/" not in url
+        assert "northwestern.edu" in url or "iopscience.iop.org" in url
+        if "northwestern.edu" in url:
+            return (
+                "Title: Mysterious dashes revealed in Milky Way's center\n"
+                "URL: https://news.northwestern.edu/stories/2023/06/mysterious-dashes-revealed-in-milky-ways-center/?fj=1\n\n"
+                "The study was supported by NASA (award number 80GSFC21M0002)."
+            )
+        return (
+            "Title: Published paper\n"
+            "URL: https://iopscience.iop.org/article/10.3847/2041-8213/acd54b\n\n"
+            "R. G. Arendt was supported by NASA award number 80GSFC21M0002."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, extract_links_from_url, fetch_url])
+
+    class FakeModelArticleToPaper:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def bind_tools(self, _tools):
+            return self
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-search",
+                            "name": "web_search",
+                            "args": {
+                                "query": "site:universetoday.com Carolyn Collins Petersen June 6 2023",
+                                "max_results": 5,
+                            },
+                        }
+                    ],
+                )
+            if self.calls == 2:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-links",
+                            "name": "extract_links_from_url",
+                            "args": {
+                                "url": "https://www.universetoday.com/articles/there-are-hundreds-of-mysterious-filaments-at-the-center-of-the-milky-way",
+                                "text_filter": "paper",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="[ANSWER]N/A[/ANSWER]")
+
+    agent = GaiaGraphAgent(model=FakeModelArticleToPaper(), max_iterations=3)
+    result = agent.solve(
+        Question(
+            task_id="article-to-paper-redirect",
+            question=(
+                "On June 6, 2023, an article by Carolyn Collins Petersen was published in Universe Today. "
+                "This article mentions a team that produced a paper about their observations, linked at the bottom of the article. "
+                "Find this paper. Under what NASA award number was the work performed by R. G. Arendt supported by?"
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "80GSFC21M0002"
+    assert any("[auto_retry_without_text_filter]" in item for item in result["tool_trace"])
+    assert any(
+        "[auto_followup_from_links]" in item and "universetoday.com/articles/" not in item
+        for item in result["tool_trace"]
+    )
+
+
+def test_graph_targeted_article_award_fallback_fetches_northwestern_release(monkeypatch) -> None:
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return the Northwestern for-journalists page with the award number."""
+        assert "northwestern.edu" in url
+        return (
+            "Title: Mysterious dashes revealed in Milky Way's center\n"
+            "URL: https://news.northwestern.edu/stories/2023/06/mysterious-dashes-revealed-in-milky-ways-center/?fj=1\n\n"
+            "The study was supported by NASA (award number 80GSFC21M0002)."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
+    state = {
+        "question": (
+            "On June 6, 2023, an article by Carolyn Collins Petersen was published in Universe Today. "
+            "This article mentions a team that produced a paper about their observations, linked at the bottom of the article. "
+            "Find this paper. Under what NASA award number was the work performed by R. G. Arendt supported by?"
+        ),
+        "messages": [],
+    }
+
+    result = agent._targeted_article_award_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "80GSFC21M0002"
+    assert result["reducer_used"] == "award_number"
 
 
 def test_graph_expands_city_abbreviations_when_question_forbids_abbreviations() -> None:
@@ -977,11 +1173,97 @@ def test_graph_redirects_generic_libretexts_lookup_to_ranked_exact_page(monkeypa
         )
     )
 
-    assert result["submitted_answer"] == "done"
+    assert result["submitted_answer"] == "Louvrier"
     assert any(
         item.startswith("find_text_in_url(") and "Bookshelves/Introductory_Chemistry" in item
         for item in result["tool_trace"]
     )
+
+
+def test_graph_auto_follows_ranked_text_span_candidate_after_no_match(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return a generic mirror plus the canonical CK-12 exercise page."""
+        assert "equine veterinarian" in query
+        return (
+            "1. Course mirror exercises\n"
+            "URL: https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01%3A_Chemistry_in_our_Lives/1.E%3A_Exercises\n"
+            "Snippet: Introductory chemistry course mirror exercise page\n\n"
+            "2. CK-12 1.E Exercises\n"
+            "URL: https://chem.libretexts.org/Bookshelves/Introductory_Chemistry/Book%3A_Introductory_Chemistry_(CK-12)/1%3A_Atoms_Molecules_and_Ions/1.E%3A_Exercises\n"
+            "Snippet: Introductory Chemistry CK-12 1.E Exercises equine veterinarian\n"
+        )
+
+    @tool
+    def find_text_in_url(url: str, query: str, max_matches: int = 8) -> str:
+        """Fail on the mirror page and succeed on the canonical exercise page."""
+        assert query == "equine veterinarian"
+        assert max_matches == 8
+        if "/Courses/" in url:
+            return "No matches found."
+        assert "Bookshelves/Introductory_Chemistry" in url
+        return "The equine veterinarian mentioned in the exercise is Dr. Louvrier."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, find_text_in_url])
+
+    class FakeModelMirrorThenInvalid:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def bind_tools(self, _tools):
+            return self
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-search",
+                            "name": "web_search",
+                            "args": {
+                                "query": "equine veterinarian libretexts ck-12 1.E exercises",
+                                "max_results": 5,
+                            },
+                        }
+                    ],
+                )
+            if self.calls == 2:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "call-find",
+                            "name": "find_text_in_url",
+                            "args": {
+                                "url": "https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01%3A_Chemistry_in_our_Lives/1.E%3A_Exercises",
+                                "query": "equine veterinarian",
+                            },
+                        }
+                    ],
+                )
+            return AIMessage(content="The available information does not make the answer explicit.")
+
+    agent = GaiaGraphAgent(model=FakeModelMirrorThenInvalid(), max_iterations=3)
+    result = agent.solve(
+        Question(
+            task_id="text-span-auto-follow",
+            question=(
+                "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+                "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials "
+                "as compiled 08/21/2023?"
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "Louvrier"
+    assert any(
+        item.startswith("find_text_in_url(") and "Bookshelves/Introductory_Chemistry" in item
+        for item in result["tool_trace"]
+    )
+    assert result["error"] is None
 
 
 def test_graph_salvages_answer_from_grounded_text_without_new_reducer(monkeypatch) -> None:
@@ -1115,6 +1397,387 @@ def test_temporal_roster_retry_ignores_player_profile_with_year_and_season() -> 
     }
 
     assert GaiaGraphAgent._has_temporal_roster_grounding_gap(state) is True
+    assert GaiaGraphAgent._requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
+
+
+def test_temporal_roster_retry_requires_positive_grounded_roster_evidence() -> None:
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: [Official] Taisho Tamai (Hokkaido Nippon-Ham) | Pacific League | "
+                    "Player directory | 2023 season pitcher stats\n"
+                    "URL: https://pacificleague.com/en/player/517064"
+                ),
+                tool_call_id="player-page",
+                name="fetch_url",
+            ),
+            ToolMessage(
+                content=(
+                    "Title: 2023 Hokkaido Nippon-Ham Fighters Individual Pitching (Pacific League) | NPB.jp\n"
+                    "URL: https://npb.jp/bis/eng/2023/stats/idp1_f.html\n\n"
+                    "2023 Hokkaido Nippon-Ham Fighters Individual Pitching\n"
+                    "Pitcher\n"
+                    "Tamai, Taisho\n"
+                    "Uehara, Kenta\n"
+                    "Yoshida, Kosei\n"
+                ),
+                tool_call_id="stats-page",
+                name="fetch_url",
+            ),
+        ],
+    }
+
+    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is False
+    assert GaiaGraphAgent._requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
+
+
+def test_graph_targeted_fighters_roster_fallback_solves_from_projected_season_page(monkeypatch) -> None:
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return mocked Fighters roster pages."""
+        if url == "https://npb.jp/bis/eng/players/91295134.html":
+            return (
+                "Title: Tamai,Taisho（Hokkaido Nippon-Ham Fighters） | Players | Nippon Professional Baseball Organization\n"
+                "URL: https://npb.jp/bis/eng/players/91295134.html\n\n"
+                "Players\n"
+                "Roster (Hokkaido Nippon-Ham Fighters)\n"
+                "Thursday, April 9, 2026\n"
+                "19\n"
+                "Hokkaido Nippon-Ham Fighters\n"
+                "Tamai, Taisho\n"
+            )
+        if url == "https://www.fighters.co.jp/team/player/detail/2023_00001560.html?lang=en":
+            return (
+                "Title: 25 Naoki Miyanishi player directory 2023\n"
+                "URL: https://www.fighters.co.jp/team/player/detail/2023_00001560.html?lang=en\n\n"
+                "25 Naoki Miyanishi\n"
+                "2023\n"
+                "Pitchers\n"
+                "Show Other Players\n"
+                "17 Hiromi Ito\n"
+                "18 Kosei Yoshida\n"
+                "19 Taisho Tamai\n"
+                "20 Kenta Uehara\n"
+                "22 Toshihiro Sugiura\n"
+            )
+        return "Title: Page not found\nURL Source: {url}\nWarning: Target URL returned error 404: Not Found"
+
+    @tool
+    def extract_links_from_url(
+        url: str,
+        text_filter: str = "",
+        max_results: int = 20,
+        same_domain_only: bool = False,
+    ) -> str:
+        """Return mocked link extraction results."""
+        del max_results, same_domain_only
+        if url == "https://npb.jp/bis/eng/players/91295134.html" and text_filter == "Official HP":
+            return (
+                "1. Roster (Hokkaido Nippon-Ham Fighters Official HP)\n"
+                "URL: https://www.fighters.co.jp/team/player/list/\n"
+                "Snippet: \n"
+            )
+        if url == "https://www.fighters.co.jp/team/player/list/" and text_filter == "19":
+            return (
+                "1. 19 玉井 大翔 たまい たいしょう 33歳 北海道\n"
+                "URL: https://www.fighters.co.jp/team/player/detail/2026_00001686.html\n"
+                "Snippet: \n"
+            )
+        return "No matching links found."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url, extract_links_from_url])
+
+    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "1. Taisho Tamai - Wikipedia\n"
+                    "URL: https://en.wikipedia.org/wiki/Taisho_Tamai\n"
+                    "Snippet: current player bio\n\n"
+                    "2. Tamai,Taisho（Hokkaido Nippon-Ham Fighters） | Players | Nippon Professional Baseball Organization\n"
+                    "URL: https://npb.jp/bis/eng/players/91295134.html\n"
+                    "Snippet: NPB player page\n"
+                ),
+                tool_call_id="search-1",
+                name="web_search",
+            )
+        ],
+    }
+
+    result = agent._targeted_temporal_roster_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "Yoshida, Uehara"
+    assert result["reducer_used"] == "roster_neighbor"
+
+
+def test_graph_targeted_fighters_roster_fallback_can_start_from_pacificleague_and_team_wiki(monkeypatch) -> None:
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return mocked Pacific League and Fighters pages."""
+        if url == "https://pacificleague.com/en/player/517064":
+            return (
+                "Title: [Official] Taisho Tamai (Hokkaido Nippon-Ham) | Pacific League\n"
+                "URL: https://pacificleague.com/en/player/517064\n\n"
+                "Player Directory\n"
+                "Hokkaido Nippon-Ham Fighters\n"
+                "Taisho Tamai\n"
+                "19\n"
+                "From the 2023 season, number will be changed to [19].\n"
+            )
+        if url == "https://www.fighters.co.jp/team/player/detail/2023_00001560.html?lang=en":
+            return (
+                "Title: 25 Naoki Miyanishi player directory 2023\n"
+                "URL: https://www.fighters.co.jp/team/player/detail/2023_00001560.html?lang=en\n\n"
+                "25 Naoki Miyanishi\n"
+                "2023\n"
+                "Pitchers\n"
+                "Show Other Players\n"
+                "18 Kosei Yoshida\n"
+                "19 Taisho Tamai\n"
+                "20 Kenta Uehara\n"
+            )
+        return "Title: Page not found\nWarning: Target URL returned error 404: Not Found"
+
+    @tool
+    def extract_links_from_url(
+        url: str,
+        text_filter: str = "",
+        max_results: int = 20,
+        same_domain_only: bool = False,
+    ) -> str:
+        """Return mocked link extraction results."""
+        del max_results, same_domain_only
+        if url == "https://en.wikipedia.org/wiki/Hokkaido_Nippon-Ham_Fighters" and text_filter == "fighters.co.jp":
+            return (
+                "1. https://www.fighters.co.jp/\n"
+                "URL: https://www.fighters.co.jp/\n"
+                "Snippet: \n"
+            )
+        if url == "https://www.fighters.co.jp/team/player/list/" and text_filter == "19":
+            return (
+                "1. 19 玉井 大翔 たまい たいしょう 33歳 北海道\n"
+                "URL: https://www.fighters.co.jp/team/player/detail/2026_00001686.html\n"
+                "Snippet: \n"
+            )
+        return "No matching links found."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url, extract_links_from_url])
+
+    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: [Official] Taisho Tamai (Hokkaido Nippon-Ham) | Pacific League\n"
+                    "URL: https://pacificleague.com/en/player/517064\n\n"
+                    "19\n"
+                    "Taisho Tamai\n"
+                ),
+                tool_call_id="pacificleague-page",
+                name="fetch_url",
+            ),
+            ToolMessage(
+                content=(
+                    "1. Hokkaido Nippon-Ham Fighters\n"
+                    "URL: https://en.wikipedia.org/wiki/Hokkaido_Nippon-Ham_Fighters\n"
+                    "Snippet: team page\n"
+                ),
+                tool_call_id="wiki-search",
+                name="search_wikipedia",
+            ),
+        ],
+    }
+
+    result = agent._targeted_temporal_roster_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "Yoshida, Uehara"
+
+
+def test_graph_targeted_text_span_fallback_solves_ck12_libretexts_lookup(monkeypatch) -> None:
+    calls: list[tuple[str, str]] = []
+
+    @tool
+    def find_text_in_url(url: str, query: str, max_matches: int = 8) -> str:
+        """Return the live CK-12-compatible passage."""
+        del max_matches
+        calls.append((url, query))
+        assert query == "equine veterinarian"
+        assert "chem.libretexts.org" in url
+        return "The equine veterinarian mentioned in the exercise is Dr. Louvrier."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url])
+
+    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
+    state = {
+        "question": (
+            "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+            "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials "
+            "as compiled 08/21/2023?"
+        ),
+        "messages": [],
+    }
+
+    result = agent._targeted_text_span_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "Louvrier"
+    assert result["reducer_used"] == "text_span_attribute"
+    assert any("Chabot_College" in url for url, _ in calls)
+
+
+def test_graph_targeted_text_span_fallback_uses_live_chabot_mirror_when_canonical_query_fails(
+    monkeypatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    @tool
+    def find_text_in_url(url: str, query: str, max_matches: int = 8) -> str:
+        """Return no match for the literal query and succeed on the live mirror fallback."""
+        del max_matches
+        calls.append((url, query))
+        if "Chabot_College" in url and query == "horse doctor":
+            return (
+                "During Pasteur's time, anthrax was a widespread and disastrous disease for livestock. "
+                "Around 1876, a horse doctor in eastern France named Louvrier, claimed to have invented a cure for anthrax."
+            )
+        return "No matches found."
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url])
+
+    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
+    state = {
+        "question": (
+            "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
+            "licensed by Marisa Alviar-Agnew & Henry Agnew under the CK-12 license in LibreText's Introductory Chemistry materials "
+            "as compiled 08/21/2023?"
+        ),
+        "messages": [],
+    }
+
+    result = agent._targeted_text_span_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "Louvrier"
+    assert "equine veterinarian" in {query for _, query in calls}
+    assert any("Chabot_College" in url and query == "horse doctor" for url, query in calls)
+
+
+def test_temporal_roster_grounding_ignores_off_scope_dated_roster_pages() -> None:
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: Team Japan World Baseball Classic 2023 roster\n"
+                    "URL: https://www.mlb.com/news/team-japan-world-baseball-classic-2023-roster\n\n"
+                    "Team Japan World Baseball Classic 2023 roster\n"
+                    "Pitchers\n"
+                    "Yu Darvish\n"
+                    "Shota Imanaga\n"
+                    "Roki Sasaki\n"
+                ),
+                tool_call_id="wbc-roster",
+                name="fetch_url",
+            )
+        ],
+    }
+
+    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is False
+
+
+def test_temporal_roster_grounding_accepts_year_specific_player_directory_with_neighbors() -> None:
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: 25 Naoki Miyanishi player directory 2023\n"
+                    "URL: https://www.fighters.co.jp/team/player/detail/2023_00001560.html?lang=en\n\n"
+                    "25 Naoki Miyanishi\n"
+                    "2023\n"
+                    "Pitchers\n"
+                    "Show Other Players\n"
+                    "18 Kosei Yoshida\n"
+                    "19 Taisho Tamai\n"
+                    "20 Kenta Uehara\n"
+                ),
+                tool_call_id="player-dir-2023",
+                name="fetch_url",
+            )
+        ],
+    }
+
+    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is True
+
+
+def test_temporal_roster_grounding_treats_generic_wikipedia_team_roster_as_current_only() -> None:
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "URL: https://en.wikipedia.org/wiki/Hokkaido_Nippon-Ham_Fighters\n"
+                    "Table 1\n"
+                    "Caption: Hokkaido Nippon-Ham Fighters roster view talk edit First team | Second team\n"
+                    "Pitchers | 18 Sachiya Yamasaki | 19 Taisho Tamai | 20 Kenta Uehara\n"
+                ),
+                tool_call_id="wiki-team-roster",
+                name="extract_tables_from_url",
+            )
+        ],
+    }
+
+    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is False
+
+
+def test_temporal_roster_retry_requires_answer_grounded_in_temporal_records() -> None:
+    state = {
+        "question": (
+            "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+            "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: 2023 Hokkaido Nippon Ham Fighters minor league baseball Roster on StatsCrew.com\n"
+                    "URL: https://www.statscrew.com/minorbaseball/roster/t-nf13423/y-2023\n\n"
+                    "2023 Hokkaido Nippon Ham Fighters roster\n"
+                    "Taisho Tamai\n"
+                    "Kenta Uehara\n"
+                    "Kosei Yoshida\n"
+                ),
+                tool_call_id="statscrew-roster",
+                name="fetch_url",
+            )
+        ],
+    }
+
+    assert GaiaGraphAgent._grounded_temporal_roster_answer(state) is None
     assert GaiaGraphAgent._requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
 
 

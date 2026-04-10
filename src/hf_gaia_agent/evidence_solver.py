@@ -119,6 +119,9 @@ NASA_AWARD_RE = re.compile(
     flags=re.IGNORECASE,
 )
 PERSON_NAME_RE = r"[A-Z][A-Za-z'’.\-]+(?:\s+[A-Z][A-Za-z'’.\-]+){0,3}"
+ROSTER_NUMBERED_NAME_RE = re.compile(
+    rf"^(?P<number>\d{{1,3}})\s+(?P<name>{PERSON_NAME_RE})$"
+)
 EXTINCT_COUNTRY_NAMES = {
     "east germany",
     "german democratic republic",
@@ -381,68 +384,15 @@ def _solve_roster_neighbor_for_subject(
         return None
 
     for record in evidence_records:
-        if record.kind != "table":
-            continue
         if not _record_matches_roster_temporal_request(record, question):
             continue
-        tables = _extract_pipe_tables(_clean_tool_content(record.content))
-        for rows in tables:
-            if len(rows) < 2:
-                continue
-            headers = rows[0]
-            data_rows = rows[1:]
-            column_count = min(len(row) for row in rows)
-            if column_count < 2:
-                continue
-
-            numeric_columns = [
-                index
-                for index in range(column_count)
-                if sum(_parse_number(row[index]) is not None for row in data_rows) >= 2
-            ]
-            if not numeric_columns:
-                continue
-            number_column = numeric_columns[0]
-            name_column = next(
-                (
-                    index
-                    for index in range(column_count)
-                    if index != number_column
-                    and any(
-                        hint in _normalize_text(headers[index])
-                        for hint in ("name", "pitcher", "player")
-                    )
-                ),
-                None,
-            )
-            if name_column is None:
-                continue
-
-            parsed_rows: list[tuple[int, str]] = []
-            for row in data_rows:
-                if len(row) <= max(number_column, name_column):
-                    continue
-                raw_number = _parse_number(row[number_column])
-                raw_name = _clean_label(row[name_column])
-                if raw_number is None or not raw_name:
-                    continue
-                parsed_rows.append((int(raw_number), raw_name))
-            if len(parsed_rows) < 3:
-                continue
-
-            target_number = None
-            for number, raw_name in parsed_rows:
-                name_tokens = set(_normalize_text(raw_name).split())
-                if subject_tokens <= name_tokens or subject_tokens & name_tokens == subject_tokens:
-                    target_number = number
-                    break
-            if target_number is None:
-                continue
-
-            before_name = next((name for number, name in parsed_rows if number == target_number - 1), None)
-            after_name = next((name for number, name in parsed_rows if number == target_number + 1), None)
-            if before_name and after_name:
-                return f"{_last_name(before_name)}, {_last_name(after_name)}"
+        parsed_rows = _extract_roster_rows(record)
+        candidate = _solve_roster_neighbor_from_parsed_rows(
+            parsed_rows=parsed_rows,
+            subject_tokens=subject_tokens,
+        )
+        if candidate:
+            return candidate
     return None
 
 
@@ -475,69 +425,155 @@ def _solve_roster_neighbor_from_records(
         return None
 
     for record in evidence_records:
-        if record.kind != "table":
-            continue
         if not _record_matches_roster_temporal_request(record, question):
             continue
-        tables = _extract_pipe_tables(_clean_tool_content(record.content))
-        for rows in tables:
-            if len(rows) < 2:
-                continue
-            headers = rows[0]
-            data_rows = rows[1:]
-            column_count = min(len(row) for row in rows)
-            if column_count < 2:
-                continue
+        parsed_rows = _extract_roster_rows(record)
+        candidate = _solve_roster_neighbor_from_parsed_rows(
+            parsed_rows=parsed_rows,
+            subject_tokens=subject_tokens,
+        )
+        if candidate:
+            return candidate
+    return None
 
-            numeric_columns = [
+
+def _solve_roster_neighbor_from_parsed_rows(
+    *,
+    parsed_rows: Sequence[tuple[int, str]],
+    subject_tokens: set[str],
+) -> str | None:
+    if len(parsed_rows) < 3 or not subject_tokens:
+        return None
+
+    target_number = None
+    for number, raw_name in parsed_rows:
+        name_tokens = set(_normalize_text(raw_name).split())
+        if _subject_tokens_match_name_tokens(subject_tokens, name_tokens):
+            target_number = number
+            break
+    if target_number is None:
+        return None
+
+    before_name = next(
+        (name for number, name in parsed_rows if number == target_number - 1),
+        None,
+    )
+    after_name = next(
+        (name for number, name in parsed_rows if number == target_number + 1),
+        None,
+    )
+    if before_name and after_name:
+        return f"{_last_name(before_name)}, {_last_name(after_name)}"
+    return None
+
+
+def _subject_tokens_match_name_tokens(
+    subject_tokens: set[str],
+    name_tokens: set[str],
+) -> bool:
+    if not subject_tokens or not name_tokens:
+        return False
+    if subject_tokens <= name_tokens or subject_tokens & name_tokens == subject_tokens:
+        return True
+    for subject_token in subject_tokens:
+        if not any(
+            subject_token == name_token
+            or (len(subject_token) >= 4 and name_token.startswith(subject_token))
+            or (len(name_token) >= 4 and subject_token.startswith(name_token))
+            for name_token in name_tokens
+        ):
+            return False
+    return True
+
+
+def _extract_roster_rows(record: EvidenceRecord) -> list[tuple[int, str]]:
+    if record.kind == "table":
+        return _extract_roster_rows_from_tables(record.content)
+    if record.kind == "text":
+        return _extract_roster_rows_from_text(record.content)
+    return []
+
+
+def _extract_roster_rows_from_tables(content: str) -> list[tuple[int, str]]:
+    tables = _extract_pipe_tables(_clean_tool_content(content))
+    for rows in tables:
+        if len(rows) < 2:
+            continue
+        headers = rows[0]
+        data_rows = rows[1:]
+        column_count = min(len(row) for row in rows)
+        if column_count < 2:
+            continue
+
+        numeric_columns = [
+            index
+            for index in range(column_count)
+            if sum(_parse_number(row[index]) is not None for row in data_rows) >= 2
+        ]
+        if not numeric_columns:
+            continue
+        number_column = numeric_columns[0]
+        name_column = next(
+            (
                 index
                 for index in range(column_count)
-                if sum(_parse_number(row[index]) is not None for row in data_rows) >= 2
-            ]
-            if not numeric_columns:
+                if index != number_column
+                and any(
+                    hint in _normalize_text(headers[index])
+                    for hint in ("name", "pitcher", "player")
+                )
+            ),
+            None,
+        )
+        if name_column is None:
+            continue
+
+        parsed_rows: list[tuple[int, str]] = []
+        for row in data_rows:
+            if len(row) <= max(number_column, name_column):
                 continue
-            number_column = numeric_columns[0]
-            name_column = next(
-                (
-                    index
-                    for index in range(column_count)
-                    if index != number_column
-                    and any(
-                        hint in _normalize_text(headers[index])
-                        for hint in ("name", "pitcher", "player")
-                    )
-                ),
-                None,
-            )
-            if name_column is None:
+            raw_number = _parse_number(row[number_column])
+            raw_name = _clean_label(row[name_column])
+            if raw_number is None or not raw_name:
+                continue
+            parsed_rows.append((int(raw_number), raw_name))
+        if len(parsed_rows) >= 3:
+            return parsed_rows
+    return []
+
+
+def _extract_roster_rows_from_text(content: str) -> list[tuple[int, str]]:
+    text = _clean_tool_content(content)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    parsed_rows: list[tuple[int, str]] = []
+    seen_numbers: set[int] = set()
+
+    index = 0
+    while index < len(lines):
+        line = _clean_label(lines[index])
+        inline_match = ROSTER_NUMBERED_NAME_RE.match(line)
+        if inline_match:
+            number = int(inline_match.group("number"))
+            name = _clean_label(inline_match.group("name"))
+            if 0 < number < 200 and number not in seen_numbers:
+                parsed_rows.append((number, name))
+                seen_numbers.add(number)
+            index += 1
+            continue
+
+        if line.isdigit() and index + 1 < len(lines):
+            number = int(line)
+            next_line = _clean_label(lines[index + 1])
+            if 0 < number < 200 and ROSTER_NUMBERED_NAME_RE.match(f"{number} {next_line}"):
+                if number not in seen_numbers:
+                    parsed_rows.append((number, next_line))
+                    seen_numbers.add(number)
+                index += 2
                 continue
 
-            parsed_rows: list[tuple[int, str]] = []
-            for row in data_rows:
-                if len(row) <= max(number_column, name_column):
-                    continue
-                raw_number = _parse_number(row[number_column])
-                raw_name = _clean_label(row[name_column])
-                if raw_number is None or not raw_name:
-                    continue
-                parsed_rows.append((int(raw_number), raw_name))
-            if len(parsed_rows) < 3:
-                continue
+        index += 1
 
-            target_number = None
-            for number, raw_name in parsed_rows:
-                name_tokens = set(_normalize_text(raw_name).split())
-                if subject_tokens <= name_tokens or subject_tokens & name_tokens == subject_tokens:
-                    target_number = number
-                    break
-            if target_number is None:
-                continue
-
-            before_name = next((name for number, name in parsed_rows if number == target_number - 1), None)
-            after_name = next((name for number, name in parsed_rows if number == target_number + 1), None)
-            if before_name and after_name:
-                return f"{_last_name(before_name)}, {_last_name(after_name)}"
-    return None
+    return parsed_rows
 
 
 def _record_matches_roster_temporal_request(record: EvidenceRecord, question: str) -> bool:
@@ -555,7 +591,20 @@ def _record_matches_roster_temporal_request(record: EvidenceRecord, question: st
         return True
     year_bits = [bit for bit in expected_bits if re.fullmatch(r"\d{4}", bit)]
     if year_bits and any(bit in haystack for bit in year_bits):
-        if any(token in haystack for token in ("archive", "oldid", "season", "media guide")):
+        if any(
+            token in haystack
+            for token in (
+                "archive",
+                "oldid",
+                "season",
+                "media guide",
+                "player directory",
+                "player list",
+                "show other players",
+                "pitchers",
+                "roster",
+            )
+        ):
             return True
     return not expected_bits
 
@@ -573,7 +622,11 @@ def _solve_award_number_from_records(
         text = _clean_tool_content(record.content)
         for match in NASA_AWARD_RE.finditer(text):
             candidate = match.group(1).strip().rstrip(".,;:")
-            if len(candidate) >= 8:
+            if (
+                len(candidate) >= 8
+                and sum(ch.isalpha() for ch in candidate) >= 2
+                and sum(ch.isdigit() for ch in candidate) >= 2
+            ):
                 return candidate
     return None
 
@@ -993,12 +1046,13 @@ def _candidate_passages(content: str) -> list[str]:
         block = block.strip()
         if not block:
             continue
+        pieces.append(block)
         pieces.extend(
             sentence.strip()
             for sentence in re.split(r"(?<=[.!?])\s+", block)
             if sentence.strip()
         )
-    return pieces
+    return list(dict.fromkeys(pieces))
 
 
 def _passage_target_score(passage: str, target_terms: set[str]) -> int:
@@ -1043,7 +1097,7 @@ def _extract_person_name_from_passage(passage: str) -> str | None:
 def _clean_person_name(value: str) -> str:
     cleaned = _clean_label(value)
     cleaned = re.sub(r"^(?:Dr\.?\s+)", "", cleaned)
-    return cleaned.strip()
+    return cleaned.strip(" .")
 
 
 def _parse_year(value: str) -> int | None:

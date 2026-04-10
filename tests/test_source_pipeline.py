@@ -61,6 +61,32 @@ def test_score_candidates_prefers_expected_domain_author_and_date() -> None:
     assert scored[0].score > scored[1].score
 
 
+def test_score_candidates_prefers_linked_primary_source_for_article_to_paper() -> None:
+    question = (
+        "On June 6, 2023, an article by Carolyn Collins Petersen was published in Universe Today. "
+        "This article mentions a team that produced a paper about their observations, linked at the bottom of the article. "
+        "Find this paper. Under what NASA award number was the work performed by R. G. Arendt supported by?"
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. There Are Hundreds of Mysterious Filaments at the Center of the Milky Way\n"
+        "URL: https://www.universetoday.com/articles/there-are-hundreds-of-mysterious-filaments-at-the-center-of-the-milky-way\n"
+        "Snippet: Universe Today article by Carolyn Collins Petersen\n\n"
+        "2. Mysterious dashes revealed in Milky Way's Center\n"
+        "URL: https://news.northwestern.edu/stories/2023/06/mysterious-dashes-revealed-in-milky-ways-center/?fj=1\n"
+        "Snippet: For Journalists news release with the published paper link\n\n"
+        "3. The Population of the Galactic Center Filaments: Position Angle Distribution Reveals a Degree-scale Collimated Outflow from Sgr A* along the Galactic Plane\n"
+        "URL: https://iopscience.iop.org/article/10.3847/2041-8213/acd54b\n"
+        "Snippet: Published paper in The Astrophysical Journal Letters\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="extract_links_from_url")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert "universetoday.com/articles/" not in scored[0].url
+    assert any(reason in scored[0].reasons for reason in ("linked_source", "primary_source_hint", "paper_mention"))
+
+
 def test_score_candidates_penalizes_expected_domain_miss() -> None:
     raw = (
         "1. Wrong Result\n"
@@ -254,6 +280,29 @@ def test_score_candidates_prefers_temporally_matching_roster_sources() -> None:
     assert scored[0].url == "https://npb.example.com/fighters/roster-2023"
     assert "expected_year" in scored[0].reasons or "expected_date_partial" in scored[0].reasons
     assert "expected_date_miss" in scored[1].reasons
+
+
+def test_score_candidates_prefers_official_yearbook_page_for_dated_roster_lookup() -> None:
+    question = (
+        "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Template:Hokkaido Nippon-Ham Fighters roster\n"
+        "URL: https://en.wikipedia.org/wiki/Template:Hokkaido_Nippon-Ham_Fighters_roster\n"
+        "Snippet: current roster template for the Fighters\n\n"
+        "2. 20 Kenta Uehara player directory 2023\n"
+        "URL: https://www.fighters.co.jp/team/player/detail/2023_00001561.html?lang=en\n"
+        "Snippet: 2023 player directory, Pitchers, Show Other Players, 19 Taisho Tamai\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://www.fighters.co.jp/team/player/detail/2023_00001561.html?lang=en"
+    assert "official_yearbook_hint" in scored[0].reasons
+    assert "current_roster_penalty" in scored[1].reasons
 
 
 def test_score_candidates_penalizes_current_roster_list_for_dated_roster_lookup() -> None:

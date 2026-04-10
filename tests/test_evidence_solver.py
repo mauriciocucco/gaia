@@ -30,6 +30,28 @@ def test_solve_answer_from_evidence_records_extracts_text_span_attribute() -> No
     assert reducer == "text_span_attribute"
 
 
+def test_solve_answer_from_evidence_records_ignores_non_identifier_award_support_text() -> None:
+    question = "Under what NASA award number was the work performed by R. G. Arendt supported by?"
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/wrong-support-page",
+            source_type="page_text",
+            adapter_name="GenericWebAdapter",
+            content="The study was supported by NASA and the National Science Foundation.",
+            title_or_caption="Support",
+            confidence=0.6,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer is None
+    assert reducer is None
+
+
 def test_solve_answer_from_evidence_records_filters_temporal_rows() -> None:
     question = (
         "What is the first name of the only Malko Competition recipient from the 20th Century (after 1977) "
@@ -123,3 +145,108 @@ def test_solve_answer_from_evidence_records_reads_metric_lookup_from_markdown_te
 
     assert answer == "519"
     assert reducer == "metric_row_lookup"
+
+
+def test_solve_answer_from_evidence_records_extracts_roster_neighbors_from_dated_text_list() -> None:
+    question = (
+        "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://team.example.com/player/list/pitcher/2023",
+            source_type="page_text",
+            adapter_name="GenericWebAdapter",
+            content=(
+                "2023 team player directory\n"
+                "Pitchers\n"
+                "17\n"
+                "Hiromi Ito\n"
+                "18\n"
+                "Kosei Yoshida\n"
+                "19\n"
+                "Taisho Tamai\n"
+                "20\n"
+                "Kenta Uehara\n"
+                "22\n"
+                "Toshihiro Sugiura\n"
+            ),
+            title_or_caption="2023 team player directory",
+            confidence=0.85,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "Yoshida, Uehara"
+    assert reducer == "roster_neighbor"
+
+
+def test_solve_answer_from_evidence_records_extracts_roster_neighbors_from_dated_player_detail_text() -> None:
+    question = (
+        "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://www.fighters.co.jp/team/player/detail/2023_00001561.html?lang=en",
+            source_type="page_text",
+            adapter_name="GenericWebAdapter",
+            content=(
+                "20 Kenta Uehara\n"
+                "2023\n"
+                "Pitchers\n"
+                "Show Other Players\n"
+                "17 Hiromi Ito\n"
+                "18 Kosei Yoshida\n"
+                "19 Taisho Tamai\n"
+                "22 Toshihiro Sugiura\n"
+            ),
+            title_or_caption="20 Kenta Uehara 2023 player directory",
+            confidence=0.8,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "Yoshida, Uehara"
+    assert reducer == "roster_neighbor"
+
+
+def test_solve_answer_from_evidence_records_tolerates_degraded_unicode_in_roster_subject() -> None:
+    question = (
+        "Who are the pitchers with the number before and after Taish? Tamai's number as of July 2023? "
+        "Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters."
+    )
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://www.fighters.co.jp/team/player/detail/2023_00001560.html?lang=en",
+            source_type="page_text",
+            adapter_name="GenericWebAdapter",
+            content=(
+                "25 Naoki Miyanishi\n"
+                "2023\n"
+                "Pitchers\n"
+                "Show Other Players\n"
+                "18 Kosei Yoshida\n"
+                "19 Taisho Tamai\n"
+                "20 Kenta Uehara\n"
+            ),
+            title_or_caption="25 Naoki Miyanishi player directory 2023",
+            confidence=0.8,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "Yoshida, Uehara"
+    assert reducer == "roster_neighbor"
