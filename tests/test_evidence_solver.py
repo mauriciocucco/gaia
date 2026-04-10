@@ -147,6 +147,202 @@ def test_solve_answer_from_evidence_records_reads_metric_lookup_from_markdown_te
     assert reducer == "metric_row_lookup"
 
 
+def test_solve_answer_from_evidence_records_reads_metric_lookup_from_linear_stat_text() -> None:
+    question = (
+        "How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?"
+    )
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://www.statmuse.com/mlb/team/new-york-yankees-76/stats/1977",
+            source_type="page_text",
+            adapter_name="GenericWebAdapter",
+            content=(
+                "Title: New York Yankees 1977 Team & Player Stats | StatMuse\n"
+                "URL: https://www.statmuse.com/mlb/team/new-york-yankees-76/stats/1977\n\n"
+                "1977\n"
+                "New York Yankees\n"
+                "Regular Season Batting Stats\n"
+                "G\n"
+                "AB\n"
+                "R\n"
+                "H\n"
+                "RBI\n"
+                "BB\n"
+                "Graig Nettles\n"
+                "G. Nettles\n"
+                "158\n"
+                "589\n"
+                "99\n"
+                "150\n"
+                "107\n"
+                "68\n"
+                "Reggie Jackson\n"
+                "R. Jackson\n"
+                "146\n"
+                "525\n"
+                "93\n"
+                "150\n"
+                "110\n"
+                "74\n"
+                "Roy White\n"
+                "R. White\n"
+                "143\n"
+                "519\n"
+                "72\n"
+                "139\n"
+                "52\n"
+                "75\n"
+            ),
+            title_or_caption="New York Yankees 1977 Team & Player Stats | StatMuse",
+            confidence=0.8,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "519"
+    assert reducer == "metric_row_lookup"
+
+
+def test_solve_answer_from_evidence_records_reads_metric_lookup_from_ranked_leaderboard_text() -> None:
+    question = (
+        "How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?"
+    )
+    records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://www.mlb.com/yankees/stats/1977",
+            source_type="page_text",
+            adapter_name="GenericWebAdapter",
+            content=(
+                "Standard\n"
+                "Expanded\n"
+                "PLAYER\n"
+                "PLAYER\n"
+                "TEAM\n"
+                "TEAM\n"
+                "G\n"
+                "G\n"
+                "AB\n"
+                "AB\n"
+                "R\n"
+                "R\n"
+                "H\n"
+                "H\n"
+                "2B\n"
+                "2B\n"
+                "3B\n"
+                "3B\n"
+                "caret-up\n"
+                "caret-down\n"
+                "HR\n"
+                "caret-up\n"
+                "caret-down\n"
+                "HR\n"
+                "RBI\n"
+                "RBI\n"
+                "BB\n"
+                "BB\n"
+                "SO\n"
+                "SO\n"
+                "SB\n"
+                "SB\n"
+                "CS\n"
+                "CS\n"
+                "AVG\n"
+                "AVG\n"
+                "OBP\n"
+                "OBP\n"
+                "SLG\n"
+                "SLG\n"
+                "OPS\n"
+                "OPS\n"
+                "1\n"
+                "Graig\n"
+                "G Nettles\n"
+                "Nettles\n"
+                "3B\n"
+                "1\n"
+                "NYY\n"
+                "158\n"
+                "589\n"
+                "99\n"
+                "150\n"
+                "23\n"
+                "4\n"
+                "37\n"
+                "107\n"
+                "68\n"
+                "79\n"
+                "2\n"
+                "5\n"
+                ".255\n"
+                ".333\n"
+                ".496\n"
+                ".829\n"
+                "2\n"
+                "Reggie\n"
+                "R Jackson\n"
+                "Jackson\n"
+                "RF\n"
+                "2\n"
+                "NYY\n"
+                "146\n"
+                "525\n"
+                "93\n"
+                "150\n"
+                "39\n"
+                "2\n"
+                "32\n"
+                "110\n"
+                "74\n"
+                "129\n"
+                "17\n"
+                "3\n"
+                ".286\n"
+                ".375\n"
+                ".550\n"
+                ".925\n"
+                "5\n"
+                "Roy\n"
+                "R White\n"
+                "White\n"
+                "LF\n"
+                "5\n"
+                "NYY\n"
+                "143\n"
+                "519\n"
+                "72\n"
+                "139\n"
+                "25\n"
+                "2\n"
+                "14\n"
+                "52\n"
+                "75\n"
+                "58\n"
+                "18\n"
+                "11\n"
+                ".268\n"
+                ".358\n"
+                ".405\n"
+                ".763\n"
+            ),
+            title_or_caption="1977 Yankees Player Hitting Stat Leaders",
+            confidence=0.8,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        )
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "519"
+    assert reducer == "metric_row_lookup"
+
+
 def test_solve_answer_from_evidence_records_extracts_roster_neighbors_from_dated_text_list() -> None:
     question = (
         "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "

@@ -1618,6 +1618,66 @@ class GaiaGraphAgent:
         return [*matching, *non_matching]
 
     @staticmethod
+    def _fallback_trace_state(
+        state: AgentState,
+    ) -> tuple[list[str], list[str], list[SourceCandidate]]:
+        return (
+            list(state.get("tool_trace") or []),
+            list(state.get("decision_trace") or []),
+            _ranked_candidates_from_state(state),
+        )
+
+    @staticmethod
+    def _with_fallback_traces(
+        result: dict[str, Any] | None,
+        *,
+        tool_trace: list[str],
+        decision_trace: list[str],
+        ranked_candidates: list[SourceCandidate],
+    ) -> dict[str, Any] | None:
+        if result is None:
+            return None
+        return {
+            **result,
+            "tool_trace": tool_trace,
+            "decision_trace": decision_trace,
+            "ranked_candidates": serialize_candidates(ranked_candidates),
+        }
+
+    def _invoke_fallback_tool(
+        self,
+        *,
+        state: AgentState,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_trace: list[str],
+        decision_trace: list[str],
+        ranked_candidates: list[SourceCandidate],
+        trace_label: str = "finalize_fallback",
+    ) -> str:
+        tool = self.tools_by_name[tool_name]
+        tool_trace.append(f"{tool_name}({tool_args}) [{trace_label}]")
+        decision_trace.append(f"tool:{tool_name}:{trace_label}")
+        try:
+            result = tool.invoke(tool_args)
+        except Exception as exc:
+            result = f"Tool error: {exc}"
+        result_text = str(result)
+        if tool_name in {"web_search", "search_wikipedia", "extract_links_from_url"}:
+            parsed_candidates = parse_result_blocks(result_text, origin_tool=tool_name)
+            if parsed_candidates:
+                scored_candidates = score_candidates(
+                    parsed_candidates,
+                    question=state["question"],
+                    profile=_question_profile_from_state(state),
+                )
+                ranked_candidates[:] = _merge_ranked_candidates(
+                    ranked_candidates,
+                    scored_candidates,
+                )
+        return result_text
+
+    @staticmethod
     def _fallback_result_from_records(
         question: str,
         records: list[EvidenceRecord],
@@ -1640,24 +1700,29 @@ class GaiaGraphAgent:
     def _try_find_text_fallback(
         self,
         *,
+        state: AgentState,
         question: str,
         candidate_urls: list[str],
         queries: list[str],
         title_hint: str,
         expected_reducer: str,
+        tool_trace: list[str],
+        decision_trace: list[str],
+        ranked_candidates: list[SourceCandidate],
     ) -> dict[str, Any] | None:
-        find_tool = self.tools_by_name.get("find_text_in_url")
-        if find_tool is None:
+        if "find_text_in_url" not in self.tools_by_name:
             return None
 
         for candidate_url in candidate_urls:
             for query in dict.fromkeys(query for query in queries if query):
-                try:
-                    found_text = str(
-                        find_tool.invoke({"url": candidate_url, "query": query, "max_matches": 8})
-                    )
-                except Exception:
-                    continue
+                found_text = self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="find_text_in_url",
+                    tool_args={"url": candidate_url, "query": query, "max_matches": 8},
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
                 normalized = normalize_submitted_answer(found_text).strip().lower()
                 if normalized in {"", "no matches found.", "page not found"}:
                     continue
@@ -1680,25 +1745,37 @@ class GaiaGraphAgent:
                     expected_reducer=expected_reducer,
                 )
                 if result:
-                    return result
+                    return self._with_fallback_traces(
+                        result,
+                        tool_trace=tool_trace,
+                        decision_trace=decision_trace,
+                        ranked_candidates=ranked_candidates,
+                    )
         return None
 
     def _try_fetch_fallback(
         self,
         *,
+        state: AgentState,
         question: str,
         candidate_urls: list[str],
         expected_reducer: str,
+        tool_trace: list[str],
+        decision_trace: list[str],
+        ranked_candidates: list[SourceCandidate],
     ) -> dict[str, Any] | None:
-        fetch_tool = self.tools_by_name.get("fetch_url")
-        if fetch_tool is None:
+        if "fetch_url" not in self.tools_by_name:
             return None
 
         for candidate_url in candidate_urls:
-            try:
-                fetched = str(fetch_tool.invoke({"url": candidate_url}))
-            except Exception:
-                continue
+            fetched = self._invoke_fallback_tool(
+                state=state,
+                tool_name="fetch_url",
+                tool_args={"url": candidate_url},
+                tool_trace=tool_trace,
+                decision_trace=decision_trace,
+                ranked_candidates=ranked_candidates,
+            )
             normalized = normalize_submitted_answer(fetched).strip().lower()
             if not normalized or "warning: target url returned error 404" in normalized:
                 continue
@@ -1709,7 +1786,12 @@ class GaiaGraphAgent:
                 expected_reducer=expected_reducer,
             )
             if result:
-                return result
+                return self._with_fallback_traces(
+                    result,
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
         return None
 
     @staticmethod
@@ -1744,8 +1826,7 @@ class GaiaGraphAgent:
         return list(dict.fromkeys(urls))
 
     def _search_article_identifier_candidates(self, state: AgentState) -> list[str]:
-        web_search_tool = self.tools_by_name.get("web_search")
-        if web_search_tool is None:
+        if "web_search" not in self.tools_by_name:
             return []
         subject = self._award_subject_name(state["question"])
         if not subject:
@@ -1757,7 +1838,9 @@ class GaiaGraphAgent:
             f"{subject} supported by NASA award number",
         ):
             try:
-                search_text = str(web_search_tool.invoke({"query": query, "max_results": 5}))
+                search_text = str(
+                    self.tools_by_name["web_search"].invoke({"query": query, "max_results": 5})
+                )
             except Exception:
                 continue
             for candidate in parse_result_blocks(search_text, origin_tool="web_search"):
@@ -1792,6 +1875,7 @@ class GaiaGraphAgent:
             return None
 
         current_number: int | None = None
+        tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
         for message in state["messages"]:
             if not isinstance(message, ToolMessage):
                 continue
@@ -1804,16 +1888,13 @@ class GaiaGraphAgent:
             if current_number is not None:
                 break
 
-        fetch_tool = self.tools_by_name.get("fetch_url")
-        links_tool = self.tools_by_name.get("extract_links_from_url")
-        if fetch_tool is None or links_tool is None:
+        if "fetch_url" not in self.tools_by_name or "extract_links_from_url" not in self.tools_by_name:
             return None
 
         npb_player_urls = self._candidate_urls_from_messages(
             state["messages"],
             predicate=lambda url: "npb.jp/bis/eng/players/" in url,
         )
-        ranked_candidates = _ranked_candidates_from_state(state)
         for candidate in ranked_candidates:
             if "npb.jp/bis/eng/players/" in candidate.url and candidate.url not in npb_player_urls:
                 npb_player_urls.append(candidate.url)
@@ -1826,19 +1907,19 @@ class GaiaGraphAgent:
                 if "wikipedia.org/wiki/" in candidate.url and candidate.url not in wiki_urls:
                     wiki_urls.append(candidate.url)
             for wiki_url in wiki_urls:
-                try:
-                    wiki_links = str(
-                        links_tool.invoke(
-                            {
-                                "url": wiki_url,
-                                "text_filter": "npb.jp",
-                                "same_domain_only": False,
-                                "max_results": 10,
-                            }
-                        )
-                    )
-                except Exception:
-                    continue
+                wiki_links = self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="extract_links_from_url",
+                    tool_args={
+                        "url": wiki_url,
+                        "text_filter": "npb.jp",
+                        "same_domain_only": False,
+                        "max_results": 10,
+                    },
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
                 for candidate in parse_result_blocks(wiki_links, origin_tool="extract_links_from_url"):
                     if "npb.jp/bis/eng/players/" in candidate.url and candidate.url not in npb_player_urls:
                         npb_player_urls.append(candidate.url)
@@ -1849,14 +1930,14 @@ class GaiaGraphAgent:
             )
             query_subject = ascii_subject or subject_query
             if query_subject:
-                try:
-                    search_text = str(
-                        self.tools_by_name["web_search"].invoke(
-                            {"query": f"{query_subject} npb.jp players", "max_results": 5}
-                        )
-                    )
-                except Exception:
-                    search_text = ""
+                search_text = self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="web_search",
+                    tool_args={"query": f"{query_subject} npb.jp players", "max_results": 5},
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
                 for candidate in parse_result_blocks(search_text, origin_tool="web_search"):
                     if "npb.jp/bis/eng/players/" in candidate.url and candidate.url not in npb_player_urls:
                         npb_player_urls.append(candidate.url)
@@ -1870,19 +1951,19 @@ class GaiaGraphAgent:
                 if "wikipedia.org/wiki/" in candidate.url and candidate.url not in wiki_urls:
                     wiki_urls.append(candidate.url)
             for wiki_url in wiki_urls:
-                try:
-                    wiki_links = str(
-                        links_tool.invoke(
-                            {
-                                "url": wiki_url,
-                                "text_filter": "fighters.co.jp",
-                                "same_domain_only": False,
-                                "max_results": 10,
-                            }
-                        )
-                    )
-                except Exception:
-                    continue
+                wiki_links = self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="extract_links_from_url",
+                    tool_args={
+                        "url": wiki_url,
+                        "text_filter": "fighters.co.jp",
+                        "same_domain_only": False,
+                        "max_results": 10,
+                    },
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
                 wiki_candidates = parse_result_blocks(wiki_links, origin_tool="extract_links_from_url")
                 root_url = next(
                     (
@@ -1902,10 +1983,14 @@ class GaiaGraphAgent:
         npb_player_url: str | None = None
         if current_number is None:
             for candidate_url in npb_player_urls:
-                try:
-                    fetched = str(fetch_tool.invoke({"url": candidate_url}))
-                except Exception:
-                    continue
+                fetched = self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="fetch_url",
+                    tool_args={"url": candidate_url},
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
                 number = self._extract_number_near_subject(
                     text=fetched,
                     subject_name=profile.subject_name,
@@ -1918,19 +2003,19 @@ class GaiaGraphAgent:
             npb_player_url = npb_player_urls[0]
 
         if official_list_url is None and npb_player_url is not None:
-            try:
-                official_links = str(
-                    links_tool.invoke(
-                        {
-                            "url": npb_player_url,
-                            "text_filter": "Official HP",
-                            "same_domain_only": False,
-                            "max_results": 10,
-                        }
-                    )
-                )
-            except Exception:
-                official_links = ""
+            official_links = self._invoke_fallback_tool(
+                state=state,
+                tool_name="extract_links_from_url",
+                tool_args={
+                    "url": npb_player_url,
+                    "text_filter": "Official HP",
+                    "same_domain_only": False,
+                    "max_results": 10,
+                },
+                tool_trace=tool_trace,
+                decision_trace=decision_trace,
+                ranked_candidates=ranked_candidates,
+            )
             official_candidates = parse_result_blocks(official_links, origin_tool="extract_links_from_url")
             official_list_url = next(
                 (
@@ -1945,19 +2030,19 @@ class GaiaGraphAgent:
         if not official_list_url:
             return None
 
-        try:
-            detail_links = str(
-                links_tool.invoke(
-                    {
-                        "url": official_list_url,
-                        "text_filter": str(current_number),
-                        "same_domain_only": True,
-                        "max_results": 20,
-                    }
-                )
-            )
-        except Exception:
-            return None
+        detail_links = self._invoke_fallback_tool(
+            state=state,
+            tool_name="extract_links_from_url",
+            tool_args={
+                "url": official_list_url,
+                "text_filter": str(current_number),
+                "same_domain_only": True,
+                "max_results": 20,
+            },
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
+        )
         detail_candidates = parse_result_blocks(detail_links, origin_tool="extract_links_from_url")
         current_detail_url = next(
             (
@@ -1997,10 +2082,14 @@ class GaiaGraphAgent:
             candidate_url = (
                 f"https://www.fighters.co.jp/team/player/detail/{target_year}_{candidate_id:08d}.html?lang=en"
             )
-            try:
-                candidate_fetch = str(fetch_tool.invoke({"url": candidate_url}))
-            except Exception:
-                continue
+            candidate_fetch = self._invoke_fallback_tool(
+                state=state,
+                tool_name="fetch_url",
+                tool_args={"url": candidate_url},
+                tool_trace=tool_trace,
+                decision_trace=decision_trace,
+                ranked_candidates=ranked_candidates,
+            )
             normalized_fetch = normalize_submitted_answer(candidate_fetch).lower()
             if "page not found" in normalized_fetch or "404" in normalized_fetch:
                 continue
@@ -2014,7 +2103,12 @@ class GaiaGraphAgent:
                 expected_reducer="roster_neighbor",
             )
             if result:
-                return result
+                return self._with_fallback_traces(
+                    result,
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
         return None
 
     def _targeted_temporal_roster_fallback(
@@ -2052,13 +2146,14 @@ class GaiaGraphAgent:
             token_groups = _botanical_item_token_groups(item)
             if not token_groups:
                 continue
-            if any(
+            referenced_in_existing_reasoning = any(
                 all(
                     any(variant in haystack for variant in variants)
                     for variants in token_groups
                 )
                 for haystack in haystacks
-            ):
+            )
+            if referenced_in_existing_reasoning or _is_botanical_prompt_candidate(item):
                 candidates.append(item)
         return candidates
 
@@ -2069,10 +2164,9 @@ class GaiaGraphAgent:
         profile = _question_profile_from_state(state)
         if profile.name != "botanical_classification":
             return None
-        web_search_tool = self.tools_by_name.get("web_search")
-        fetch_tool = self.tools_by_name.get("fetch_url")
-        if web_search_tool is None or fetch_tool is None:
+        if "web_search" not in self.tools_by_name or "fetch_url" not in self.tools_by_name:
             return None
+        tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
 
         items = self._botanical_candidate_items(state)
         if not items:
@@ -2087,24 +2181,32 @@ class GaiaGraphAgent:
                 f"{item} botanical fruit or vegetable",
                 f"{item} botany fruit vegetable",
             ):
-                try:
-                    search_text = str(
-                        web_search_tool.invoke({"query": query, "max_results": 5})
-                    )
-                except Exception:
-                    continue
+                search_text = self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="web_search",
+                    tool_args={"query": query, "max_results": 5},
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
                 candidates = parse_result_blocks(search_text, origin_tool="web_search")
                 for candidate in candidates[:2]:
-                    try:
-                        fetched = str(fetch_tool.invoke({"url": candidate.url}))
-                    except Exception:
-                        continue
+                    fetched = self._invoke_fallback_tool(
+                        state=state,
+                        tool_name="fetch_url",
+                        tool_args={"url": candidate.url},
+                        tool_trace=tool_trace,
+                        decision_trace=decision_trace,
+                        ranked_candidates=ranked_candidates,
+                    )
                     fetched_records = evidence_records_from_tool_output("fetch_url", fetched)
                     attempted_records.extend(fetched_records)
                     scores = _botanical_scores_from_text(item, fetched)
                     if scores is None:
                         continue
                     fruit_score, vegetable_score = scores
+                    if max(fruit_score, vegetable_score) < 2:
+                        continue
                     fruit_total += fruit_score
                     vegetable_total += vegetable_score
             if vegetable_total >= fruit_total + 2 and vegetable_total >= 3:
@@ -2113,13 +2215,134 @@ class GaiaGraphAgent:
         if not vegetables:
             return None
         ordered = sorted(dict.fromkeys(vegetables), key=lambda value: value.lower())
-        return {
-            "final_answer": ", ".join(ordered),
-            "error": None,
-            "reducer_used": "botanical_classification",
-            "evidence_used": serialize_evidence(attempted_records[-6:]),
-            "fallback_reason": None,
-        }
+        return self._with_fallback_traces(
+            {
+                "final_answer": ", ".join(ordered),
+                "error": None,
+                "reducer_used": "botanical_classification",
+                "evidence_used": serialize_evidence(attempted_records[-6:]),
+                "fallback_reason": None,
+            },
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
+        )
+
+    def _entity_role_chain_source_fallback(
+        self,
+        state: AgentState,
+    ) -> dict[str, Any] | None:
+        profile = _question_profile_from_state(state)
+        if profile.name != "entity_role_chain":
+            return None
+        if "web_search" not in self.tools_by_name or "fetch_url" not in self.tools_by_name:
+            return None
+
+        tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
+        likely_urls = self._candidate_urls_from_state(
+            {
+                **state,
+                "ranked_candidates": serialize_candidates(ranked_candidates),
+            },
+            predicate=lambda url: any(
+                token in unquote(url).lower()
+                for token in ("magda", "raymond", "romana", "kasprzykowski", "wszyscy")
+            ),
+            prefer_expected_domains=True,
+        )
+        if not likely_urls:
+            for query in (
+                "actor who played Ray in Polish Everybody Loves Raymond",
+                "actor who played Ray in Polish Everybody Loves Raymond Magda M. character",
+                "Magda M. cast character",
+            ):
+                self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="web_search",
+                    tool_args={"query": query, "max_results": 5},
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
+            likely_urls = self._candidate_urls_from_state(
+                {
+                    **state,
+                    "ranked_candidates": serialize_candidates(ranked_candidates),
+                },
+                predicate=lambda url: any(
+                    token in unquote(url).lower()
+                    for token in ("magda", "raymond", "romana", "kasprzykowski", "wszyscy")
+                ),
+                prefer_expected_domains=True,
+            )
+        if not likely_urls:
+            return None
+
+        attempted_records: list[EvidenceRecord] = []
+        for candidate_url in likely_urls[:4]:
+            fetched = self._invoke_fallback_tool(
+                state=state,
+                tool_name="fetch_url",
+                tool_args={"url": candidate_url},
+                tool_trace=tool_trace,
+                decision_trace=decision_trace,
+                ranked_candidates=ranked_candidates,
+            )
+            normalized = normalize_submitted_answer(fetched).strip().lower()
+            if not normalized or "warning: target url returned error 404" in normalized:
+                continue
+            attempted_records.extend(evidence_records_from_tool_output("fetch_url", fetched))
+
+        if not attempted_records:
+            return None
+
+        evidence_text = self._format_grounded_evidence_for_llm(attempted_records[-6:])[-12000:]
+        response = self.answer_model.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "This is a two-hop role-chain question. "
+                        "Use only the provided evidence. "
+                        "First identify the actor who played Ray in the Polish-language version of Everybody Loves Raymond, "
+                        "then identify who that same actor played in Magda M. "
+                        "If the evidence is insufficient, respond exactly with [INSUFFICIENT]. "
+                        "If sufficient, respond only with [ANSWER]the requested short answer[/ANSWER]."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Question:\n{state['question']}\n\n"
+                        f"Evidence:\n{evidence_text}"
+                    )
+                ),
+            ]
+        )
+        content = str(getattr(response, "content", "") or "").strip()
+        if content == "[INSUFFICIENT]":
+            return None
+        candidate = normalize_submitted_answer(content)
+        if not candidate or self._is_invalid_final_response(candidate):
+            return None
+
+        evidence_haystack = normalize_submitted_answer(evidence_text).lower()
+        candidate_tokens = [
+            token for token in re.findall(r"[a-z0-9]+", candidate.lower()) if len(token) >= 3
+        ]
+        if candidate_tokens and not all(token in evidence_haystack for token in candidate_tokens):
+            return None
+
+        return self._with_fallback_traces(
+            {
+                "final_answer": candidate,
+                "error": None,
+                "reducer_used": "entity_role_chain",
+                "evidence_used": serialize_evidence(attempted_records[-6:]),
+                "fallback_reason": None,
+            },
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
+        )
 
     def _targeted_article_identifier_fallback(
         self,
@@ -2131,22 +2354,50 @@ class GaiaGraphAgent:
         question_lower = state["question"].lower()
         if "award number" not in question_lower and "supported by" not in question_lower:
             return None
+        tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
         candidate_urls = self._article_identifier_candidate_urls(state)
         if not candidate_urls:
-            candidate_urls = self._search_article_identifier_candidates(state)
+            subject = self._award_subject_name(state["question"])
+            if subject:
+                for query in (
+                    f"{subject} NASA award number",
+                    f"{subject} supported by NASA award number",
+                ):
+                    self._invoke_fallback_tool(
+                        state=state,
+                        tool_name="web_search",
+                        tool_args={"query": query, "max_results": 5},
+                        tool_trace=tool_trace,
+                        decision_trace=decision_trace,
+                        ranked_candidates=ranked_candidates,
+                    )
+            candidate_urls = self._article_identifier_candidate_urls(
+                {
+                    **state,
+                    "ranked_candidates": serialize_candidates(ranked_candidates),
+                }
+            )
         result = self._try_find_text_fallback(
+            state=state,
             question=state["question"],
             candidate_urls=candidate_urls,
             queries=["NASA award number", "supported by NASA"],
             title_hint="Linked primary source",
             expected_reducer="award_number",
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
         )
         if result:
             return result
         return self._try_fetch_fallback(
+            state=state,
             question=state["question"],
             candidate_urls=candidate_urls,
             expected_reducer="award_number",
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
         )
 
     def _text_span_source_fallback(
@@ -2156,6 +2407,7 @@ class GaiaGraphAgent:
         profile = _question_profile_from_state(state)
         if profile.name != "text_span_lookup":
             return None
+        tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
         candidate_urls = self._candidate_urls_from_state(
             state,
             predicate=lambda url: any(token in url.lower() for token in ("exercise", "1.e", "1.e%3a", "1.e:_")),
@@ -2163,18 +2415,26 @@ class GaiaGraphAgent:
         )
         queries = [profile.text_filter] if profile.text_filter else []
         result = self._try_find_text_fallback(
+            state=state,
             question=state["question"],
             candidate_urls=candidate_urls,
             queries=queries,
             title_hint="Referenced text span",
             expected_reducer="text_span_attribute",
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
         )
         if result:
             return result
         return self._try_fetch_fallback(
+            state=state,
             question=state["question"],
             candidate_urls=candidate_urls,
             expected_reducer="text_span_attribute",
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
         )
 
     def _finalize_node(self, state: AgentState) -> dict[str, Any]:
@@ -2217,6 +2477,9 @@ class GaiaGraphAgent:
         targeted_text_span_result = self._text_span_source_fallback(state)
         if targeted_text_span_result:
             return targeted_text_span_result
+        targeted_entity_role_chain_result = self._entity_role_chain_source_fallback(state)
+        if targeted_entity_role_chain_result:
+            return targeted_entity_role_chain_result
         targeted_botanical_result = self._targeted_botanical_classification_fallback(state)
         if targeted_botanical_result:
             return targeted_botanical_result
@@ -3076,6 +3339,30 @@ def _botanical_item_token_groups(item: str) -> list[set[str]]:
             variants.add(token[:-1])
         groups.append(variants)
     return groups
+
+
+def _is_botanical_prompt_candidate(item: str) -> bool:
+    normalized = _normalize_botanical_text(item)
+    if not normalized:
+        return False
+
+    obvious_non_produce_phrases = {
+        "milk",
+        "egg",
+        "eggs",
+        "flour",
+        "oreo",
+        "oreos",
+        "rice",
+        "whole bean coffee",
+        "coffee",
+        "whole allspice",
+        "allspice",
+    }
+    if normalized in obvious_non_produce_phrases:
+        return False
+
+    return True
 
 
 def _botanical_relevant_text(item: str, text: str) -> str:

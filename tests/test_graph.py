@@ -351,6 +351,24 @@ class FakeModelForTextSpanRedirect:
         return AIMessage(content="[ANSWER]done[/ANSWER]")
 
 
+class FakeModelForEntityRoleChainFallback:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if any(
+            isinstance(message, SystemMessage)
+            and "two-hop role-chain question" in str(getattr(message, "content", "")).lower()
+            for message in messages
+        ):
+            return AIMessage(content="[ANSWER]Wojciech[/ANSWER]")
+        return AIMessage(content="[ANSWER]Ryszard[/ANSWER]")
+
+
 class FakeModelWithGroundedTextSalvage:
     def __init__(self) -> None:
         self.calls = 0
@@ -1200,6 +1218,138 @@ def test_graph_botanical_fallback_classifies_items_from_fetched_sources(monkeypa
     assert result["reducer_used"] == "botanical_classification"
 
 
+def test_graph_botanical_fallback_recovers_prompt_item_omitted_by_model(monkeypatch) -> None:
+    search_queries: list[str] = []
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return one source candidate per botanical query."""
+        assert max_results == 5
+        search_queries.append(query)
+        url_map = {
+            "fresh basil botanical fruit or vegetable": "https://example.com/basil",
+            "broccoli botanical fruit or vegetable": "https://example.com/broccoli",
+            "bell pepper botanical fruit or vegetable": "https://example.com/bell-pepper",
+            "sweet potatoes botanical fruit or vegetable": "https://example.com/sweet-potato",
+        }
+        url = url_map.get(query, "https://example.com/unknown")
+        return f"1. Source\nURL: {url}\nSnippet: botanical classification for {query}"
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return fetched botanical classification text."""
+        payloads = {
+            "https://example.com/basil": (
+                "Title: Basil\nURL: https://example.com/basil\n\n"
+                "Basil is a culinary herb whose edible leaves are used fresh."
+            ),
+            "https://example.com/broccoli": (
+                "Title: Broccoli\nURL: https://example.com/broccoli\n\n"
+                "Broccoli is eaten for its flowering head and stalk."
+            ),
+            "https://example.com/bell-pepper": (
+                "Title: Bell pepper\nURL: https://example.com/bell-pepper\n\n"
+                "Botanically, bell pepper is a fruit because it contains seeds."
+            ),
+            "https://example.com/sweet-potato": (
+                "Title: Sweet potato\nURL: https://example.com/sweet-potato\n\n"
+                "Sweet potato is an edible root vegetable."
+            ),
+        }
+        return payloads.get(
+            url,
+            f"Title: Unknown\nURL: {url}\n\nThis page does not contain a relevant botanical classification.",
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Broccoli, Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-fallback-omitted-item",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "broccoli, fresh basil, sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+    assert any(query.startswith("fresh basil botanical fruit or vegetable") for query in search_queries)
+
+
+def test_graph_botanical_fallback_ignores_low_signal_fruit_metadata_pages(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return one source candidate per botanical query."""
+        assert max_results == 5
+        url_map = {
+            "broccoli botanical fruit or vegetable": "https://example.com/broccoli",
+            "broccoli botany fruit vegetable": "https://example.com/broccoli",
+            "plums botanical fruit or vegetable": "https://example.com/plum-quora",
+            "plums botany fruit vegetable": "https://example.com/plum-britannica",
+            "sweet potatoes botanical fruit or vegetable": "https://example.com/sweet-potato",
+            "sweet potatoes botany fruit vegetable": "https://example.com/sweet-potato",
+        }
+        url = url_map.get(query, "https://example.com/unknown")
+        return f"1. Source\nURL: {url}\nSnippet: botanical classification for {query}"
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return fetched botanical classification text."""
+        payloads = {
+            "https://example.com/broccoli": (
+                "Title: Broccoli\nURL: https://example.com/broccoli\n\n"
+                "Broccoli is eaten for its flowering head and stalk."
+            ),
+            "https://example.com/plum-quora": (
+                "URL Source: https://example.com/Is-plum-a-vegetable-Why-or-why-not"
+            ),
+            "https://example.com/plum-britannica": (
+                "Title: Plum\nURL: https://example.com/plum\n\n"
+                "Plum | Description, Uses, Cultivation, History, & Facts | Britannica\n"
+                "purple-leaf plum"
+            ),
+            "https://example.com/sweet-potato": (
+                "Title: Sweet potato\nURL: https://example.com/sweet-potato\n\n"
+                "Sweet potato is an edible root vegetable."
+            ),
+        }
+        return payloads.get(
+            url,
+            f"Title: Unknown\nURL: {url}\n\nThis page does not contain a relevant botanical classification.",
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Broccoli, Plums, Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-fallback-low-signal-fruit",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "broccoli, plums, sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "broccoli, sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+
+
 def test_graph_rejects_ungrounded_botanical_classification_when_retry_budget_is_exhausted() -> None:
     agent = GaiaGraphAgent(
         model=FakeModelSingleAnswer(
@@ -1946,8 +2096,82 @@ def test_graph_text_span_source_fallback_fetches_candidate_page_after_find_miss(
 
     assert result is not None
     assert result["final_answer"] == "Louvrier"
+    assert any(item.startswith("find_text_in_url(") for item in result["tool_trace"])
+    assert any(item.startswith("fetch_url(") for item in result["tool_trace"])
+    assert any(entry.startswith("tool:find_text_in_url") for entry in result["decision_trace"])
+    assert any(entry.startswith("tool:fetch_url") for entry in result["decision_trace"])
     assert any(call.endswith(":equine veterinarian") for call in calls if call.startswith("find:"))
     assert any(call.startswith("fetch:") and "Chabot_College" in call for call in calls)
+
+
+def test_graph_entity_role_chain_fallback_overrides_ungrounded_final_answer(
+    monkeypatch,
+) -> None:
+    search_queries: list[str] = []
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return ranked entity-role-chain candidates."""
+        assert max_results == 5
+        search_queries.append(query)
+        return (
+            "1. Bartłomiej Kasprzykowski\n"
+            "URL: https://en.wikipedia.org/wiki/Bart%C5%82omiej_Kasprzykowski\n"
+            "Snippet: Polish actor who played the titular hero in Wszyscy kochają Romana.\n\n"
+            "2. Magda M. cast list\n"
+            "URL: https://en.wikipedia.org/wiki/Magda_M.\n"
+            "Snippet: cast and characters from Magda M.\n\n"
+            "3. Popular actor post\n"
+            "URL: https://www.instagram.com/popular/actor-who-played-ray-in-polish-version-of-everybody-loves-raymond/\n"
+            "Snippet: social post about the actor\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return fetched pages with enough evidence to resolve the role chain."""
+        assert "instagram.com" not in url
+        if url == "https://en.wikipedia.org/wiki/Bart%C5%82omiej_Kasprzykowski":
+            return (
+                "Title: Bartłomiej Kasprzykowski\n"
+                "URL: https://en.wikipedia.org/wiki/Bart%C5%82omiej_Kasprzykowski\n\n"
+                "Bartłomiej Kasprzykowski starred as Roman in Wszyscy kochają Romana, "
+                "the Polish-language version of Everybody Loves Raymond."
+            )
+        if url == "https://en.wikipedia.org/wiki/Magda_M.":
+            return (
+                "Title: Magda M.\n"
+                "URL: https://en.wikipedia.org/wiki/Magda_M.\n\n"
+                "Cast\n"
+                "Wojciech Płaska - Bartłomiej Kasprzykowski\n"
+            )
+        raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModelForEntityRoleChainFallback(), max_iterations=1)
+    result = agent.solve(
+        Question(
+            task_id="role-chain-fallback",
+            question=(
+                "Who did the actor who played Ray in the Polish-language version of Everybody Loves Raymond play in Magda M.? "
+                "Give only the first name."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "Wojciech"
+    assert result["reducer_used"] == "entity_role_chain"
+    assert any("Magda M." in query for query in search_queries)
+    assert any(item.startswith("web_search(") for item in result["tool_trace"])
+    assert any(
+        item.startswith("fetch_url(") and "Bart%C5%82omiej_Kasprzykowski" in item
+        for item in result["tool_trace"]
+    )
+    assert any(
+        item.startswith("fetch_url(") and "Magda_M." in item
+        for item in result["tool_trace"]
+    )
 
 
 def test_temporal_roster_grounding_ignores_off_scope_dated_roster_pages() -> None:

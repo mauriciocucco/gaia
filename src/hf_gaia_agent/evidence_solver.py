@@ -656,6 +656,24 @@ def _solve_metric_row_lookup_from_records(
             select_metric=select_metric,
         )
         if candidate is None:
+            candidate = _solve_metric_row_lookup_from_linear_text(
+                question=question,
+                content=content,
+                tool_name=record.extraction_method,
+                answer_metric=answer_metric,
+                comparison_mode=comparison_mode,
+                select_metric=select_metric,
+            )
+        if candidate is None:
+            candidate = _solve_metric_row_lookup_from_ranked_leaderboard_text(
+                question=question,
+                content=content,
+                tool_name=record.extraction_method,
+                answer_metric=answer_metric,
+                comparison_mode=comparison_mode,
+                select_metric=select_metric,
+            )
+        if candidate is None:
             continue
         if best is None or candidate.score > best.score:
             best = candidate
@@ -914,6 +932,237 @@ def _solve_metric_row_lookup_from_table(
     return best
 
 
+def _solve_metric_row_lookup_from_linear_text(
+    *,
+    question: str,
+    content: str,
+    tool_name: str,
+    answer_metric: str,
+    comparison_mode: str,
+    select_metric: str,
+) -> _CandidateAnswer | None:
+    question_tokens = _tokenize(question)
+    answer_metric_tokens = _metric_tokens(answer_metric)
+    select_metric_tokens = _metric_tokens(select_metric)
+    best: _CandidateAnswer | None = None
+
+    for section_title, headers, rows in _extract_linear_stat_sections(
+        content=content,
+        answer_metric_tokens=answer_metric_tokens,
+        select_metric_tokens=select_metric_tokens,
+    ):
+        headers_with_label = ["Player", *headers]
+        numeric_counts = [
+            sum(_parse_number(row[index]) is not None for row in rows)
+            for index in range(len(headers_with_label))
+        ]
+        answer_column = _pick_metric_column_for_tokens(
+            headers_with_label,
+            numeric_counts,
+            answer_metric_tokens,
+        )
+        select_column = _pick_metric_column_for_tokens(
+            headers_with_label,
+            numeric_counts,
+            select_metric_tokens,
+        )
+        if answer_column is None or select_column is None or answer_column == select_column:
+            continue
+
+        best_row: list[str] | None = None
+        best_selector_value: float | None = None
+        for row in rows:
+            if len(row) <= max(answer_column, select_column):
+                continue
+            selector_value = _parse_number(row[select_column])
+            answer_value = _parse_number(row[answer_column])
+            if selector_value is None or answer_value is None:
+                continue
+            if best_row is None or best_selector_value is None:
+                best_row = row
+                best_selector_value = selector_value
+                continue
+            if comparison_mode == "max" and selector_value > best_selector_value:
+                best_row = row
+                best_selector_value = selector_value
+            elif comparison_mode == "min" and selector_value < best_selector_value:
+                best_row = row
+                best_selector_value = selector_value
+
+        if best_row is None:
+            continue
+
+        answer_value = _parse_number(best_row[answer_column])
+        if answer_value is None:
+            continue
+
+        score = (
+            _tool_priority(tool_name)
+            + 16
+            + 8 * _token_overlap_score(section_title, question_tokens)
+            + 6 * _token_overlap_score(headers_with_label[answer_column], question_tokens | answer_metric_tokens)
+            + 6 * _token_overlap_score(headers_with_label[select_column], question_tokens | select_metric_tokens)
+        )
+        candidate = _CandidateAnswer(answer=_format_number(answer_value), score=score)
+        if best is None or candidate.score > best.score:
+            best = candidate
+
+    return best
+
+
+def _solve_metric_row_lookup_from_ranked_leaderboard_text(
+    *,
+    question: str,
+    content: str,
+    tool_name: str,
+    answer_metric: str,
+    comparison_mode: str,
+    select_metric: str,
+) -> _CandidateAnswer | None:
+    lines = [_clean_label(line) for line in content.splitlines() if _clean_label(line)]
+    question_tokens = _tokenize(question)
+    answer_metric_tokens = _metric_tokens(answer_metric)
+    select_metric_tokens = _metric_tokens(select_metric)
+    best: _CandidateAnswer | None = None
+
+    index = 0
+    while index < len(lines):
+        if lines[index] != "PLAYER":
+            index += 1
+            continue
+
+        header_index = index
+        raw_headers: list[str] = []
+        while header_index < len(lines):
+            line = lines[header_index]
+            if re.fullmatch(r"\d{1,3}", line):
+                break
+            lowered = line.lower()
+            if lowered.startswith("caret-") or lowered in {"standard", "expanded", "statcast", "down", "up"}:
+                header_index += 1
+                continue
+            if len(_normalize_text(line).split()) > 4 and not line.isupper():
+                header_index += 1
+                continue
+            raw_headers.append(line)
+            header_index += 1
+
+        headers: list[str] = []
+        for header in raw_headers:
+            if header in {"PLAYER", "TEAM"} or re.fullmatch(r"[A-Za-z0-9]{1,5}(?:[+-])?", header):
+                if not headers or headers[-1] != header:
+                    headers.append(header)
+
+        numeric_headers = [header for header in headers if header not in {"PLAYER", "TEAM"}]
+        if (
+            len(numeric_headers) < 2
+            or not _headers_cover_metric_tokens(numeric_headers, answer_metric_tokens)
+            or not _headers_cover_metric_tokens(numeric_headers, select_metric_tokens)
+        ):
+            index += 1
+            continue
+
+        numeric_counts = [1] * len(numeric_headers)
+        answer_column = _pick_metric_column_for_tokens(
+            numeric_headers,
+            numeric_counts,
+            answer_metric_tokens,
+        )
+        select_column = _pick_metric_column_for_tokens(
+            numeric_headers,
+            numeric_counts,
+            select_metric_tokens,
+        )
+        if answer_column is None or select_column is None or answer_column == select_column:
+            index += 1
+            continue
+
+        rows: list[list[str]] = []
+        row_index = header_index
+        while row_index < len(lines):
+            if lines[row_index] == "PLAYER" and rows:
+                break
+            if not re.fullmatch(r"\d{1,3}", lines[row_index]):
+                row_index += 1
+                continue
+
+            team_index: int | None = None
+            cursor = row_index + 1
+            while cursor < len(lines):
+                token = lines[cursor]
+                if token == "PLAYER" and rows:
+                    break
+                if re.fullmatch(r"[A-Z]{3}", token):
+                    team_index = cursor
+                    break
+                cursor += 1
+                if cursor - row_index > 12:
+                    break
+
+            if team_index is None:
+                row_index += 1
+                continue
+
+            values: list[str] = []
+            cursor = team_index + 1
+            while cursor < len(lines) and len(values) < len(numeric_headers):
+                token = lines[cursor]
+                if _parse_number(token) is not None:
+                    values.append(token)
+                cursor += 1
+
+            if len(values) < len(numeric_headers):
+                break
+
+            rows.append(values)
+            row_index = cursor
+
+        if not rows:
+            index += 1
+            continue
+
+        best_row: list[str] | None = None
+        best_selector_value: float | None = None
+        for row in rows:
+            selector_value = _parse_number(row[select_column])
+            answer_value = _parse_number(row[answer_column])
+            if selector_value is None or answer_value is None:
+                continue
+            if best_row is None or best_selector_value is None:
+                best_row = row
+                best_selector_value = selector_value
+                continue
+            if comparison_mode == "max" and selector_value > best_selector_value:
+                best_row = row
+                best_selector_value = selector_value
+            elif comparison_mode == "min" and selector_value < best_selector_value:
+                best_row = row
+                best_selector_value = selector_value
+
+        if best_row is None:
+            index = max(index + 1, row_index)
+            continue
+
+        answer_value = _parse_number(best_row[answer_column])
+        if answer_value is None:
+            index = max(index + 1, row_index)
+            continue
+
+        score = (
+            _tool_priority(tool_name)
+            + 14
+            + 6 * _token_overlap_score(numeric_headers[answer_column], question_tokens | answer_metric_tokens)
+            + 6 * _token_overlap_score(numeric_headers[select_column], question_tokens | select_metric_tokens)
+        )
+        candidate = _CandidateAnswer(answer=_format_number(answer_value), score=score)
+        if best is None or candidate.score > best.score:
+            best = candidate
+
+        index = max(index + 1, row_index)
+
+    return best
+
+
 def _iter_named_rows(
     evidence_records: Sequence[EvidenceRecord],
 ) -> list[tuple[int, str, str]]:
@@ -1124,6 +1373,98 @@ def _looks_like_nationality_line(value: str) -> bool:
     if normalized in EXTINCT_COUNTRY_NAMES:
         return True
     return len(normalized.split()) <= 4 and normalized not in {"competition", "winners", "participants"}
+
+
+def _looks_like_abbreviated_person_name(value: str) -> bool:
+    cleaned = _clean_label(value)
+    if not cleaned:
+        return False
+    return bool(re.fullmatch(r"[A-Z]\.\s+[A-Z][A-Za-z'â€™.\-]+(?:\s+[A-Z][A-Za-z'â€™.\-]+){0,2}", cleaned))
+
+
+def _headers_cover_metric_tokens(headers: list[str], metric_tokens: set[str]) -> bool:
+    if not metric_tokens:
+        return False
+    for header in headers:
+        normalized = _normalize_text(header)
+        if normalized in metric_tokens:
+            return True
+        if any(token in normalized.split() for token in metric_tokens):
+            return True
+    return False
+
+
+def _extract_linear_stat_sections(
+    *,
+    content: str,
+    answer_metric_tokens: set[str],
+    select_metric_tokens: set[str],
+) -> list[tuple[str, list[str], list[list[str]]]]:
+    lines = [_clean_label(line) for line in content.splitlines() if _clean_label(line)]
+    sections: list[tuple[str, list[str], list[list[str]]]] = []
+
+    index = 0
+    while index < len(lines):
+        section_title = lines[index]
+        if "stats" not in section_title.lower():
+            index += 1
+            continue
+
+        header_index = index + 1
+        headers: list[str] = []
+        while header_index < len(lines):
+            line = lines[header_index]
+            if "stats" in line.lower() and headers:
+                break
+            if re.fullmatch(r"[A-Z0-9]{1,5}(?:[+-])?", line):
+                headers.append(line)
+                header_index += 1
+                continue
+            if _looks_like_person_name(line):
+                break
+            if len(_normalize_text(line).split()) > 4 and not line.isupper():
+                break
+            headers.append(line)
+            header_index += 1
+            if len(headers) >= 24:
+                break
+
+        if (
+            len(headers) < 2
+            or not _headers_cover_metric_tokens(headers, answer_metric_tokens)
+            or not _headers_cover_metric_tokens(headers, select_metric_tokens)
+        ):
+            index += 1
+            continue
+
+        rows: list[list[str]] = []
+        row_index = header_index
+        while row_index < len(lines):
+            line = lines[row_index]
+            if "stats" in line.lower():
+                break
+            if not _looks_like_person_name(line):
+                if rows:
+                    break
+                row_index += 1
+                continue
+
+            values_start = row_index + 1
+            if values_start < len(lines) and _looks_like_abbreviated_person_name(lines[values_start]):
+                values_start += 1
+            values = lines[values_start : values_start + len(headers)]
+            if len(values) < len(headers):
+                break
+
+            rows.append([line, *values])
+            row_index = values_start + len(headers)
+
+        if len(rows) >= 2:
+            sections.append((section_title, headers, rows))
+
+        index = max(index + 1, row_index)
+
+    return sections
 
 
 def _extract_pipe_tables(content: str) -> list[list[list[str]]]:
