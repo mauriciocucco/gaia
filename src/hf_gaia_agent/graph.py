@@ -165,90 +165,8 @@ COMMON_ENGLISH_HINTS = {
     "between",
     "published",
 }
-OPPOSITE_WORDS = {
-    "left": "right",
-    "right": "left",
-    "up": "down",
-    "down": "up",
-    "in": "out",
-    "out": "in",
-    "open": "closed",
-    "closed": "open",
-    "true": "false",
-    "false": "true",
-    "yes": "no",
-    "no": "yes",
-}
 URL_RE = re.compile(r"https?://\S+", flags=re.IGNORECASE)
 SET_DEFINITION_RE = re.compile(r"set\s+s\s*=\s*\{(?P<body>[^}]+)\}", flags=re.IGNORECASE)
-BOTANICAL_VEGETABLES = {
-    "artichoke",
-    "asparagus",
-    "basil",
-    "broccoli",
-    "brussels sprouts",
-    "cabbage",
-    "carrot",
-    "carrots",
-    "cauliflower",
-    "celery",
-    "cilantro",
-    "garlic",
-    "kale",
-    "lettuce",
-    "mint",
-    "onion",
-    "onions",
-    "parsley",
-    "potato",
-    "potatoes",
-    "radish",
-    "radishes",
-    "rosemary",
-    "sage",
-    "spinach",
-    "sweet potato",
-    "sweet potatoes",
-    "thyme",
-    "turnip",
-    "turnips",
-}
-BOTANICAL_FRUITS = {
-    "acorn",
-    "acorns",
-    "allspice",
-    "apple",
-    "apples",
-    "avocado",
-    "avocados",
-    "bean",
-    "beans",
-    "bell pepper",
-    "bell peppers",
-    "cucumber",
-    "cucumbers",
-    "corn",
-    "eggplant",
-    "eggplants",
-    "green bean",
-    "green beans",
-    "olive",
-    "olives",
-    "peanut",
-    "peanuts",
-    "pepper",
-    "peppers",
-    "plum",
-    "plums",
-    "pumpkin",
-    "pumpkins",
-    "rice",
-    "tomato",
-    "tomatoes",
-    "whole allspice",
-    "whole bean coffee",
-    "zucchini",
-}
 
 
 class AgentState(MessagesState):
@@ -464,6 +382,16 @@ def _build_profile_guidance_block(*, question: str, profile: QuestionProfile) ->
     if profile.name == "article_to_paper":
         hints.append(
             "Find the exact article page, inspect its outgoing links, then read the linked paper or source. Answer only from fetched evidence."
+        )
+    if profile.name == "botanical_classification":
+        hints.append(
+            "This is a botanical classification task. Do not answer from culinary/common usage or from memory."
+        )
+        hints.append(
+            "Search snippets alone are not sufficient. Ground the classification in fetched page text before finalizing."
+        )
+        hints.append(
+            "Use web_search to find relevant sources, then fetch_url or find_text_in_url to verify ambiguous items before filtering and alphabetizing the final list."
         )
     if profile.name == "text_span_lookup":
         hints.append(
@@ -776,6 +704,10 @@ class GaiaGraphAgent:
         if profile.name == "roster_neighbor_lookup":
             guidance.append(
                 "Prefer a dated team roster, season-specific player directory, or season-specific player page over a current player biography or current roster template."
+            )
+        if profile.name == "botanical_classification":
+            guidance.append(
+                "For botanical classification, search first, then read a source page. Do not finalize from common-usage intuition or from search snippets alone."
             )
         return "\n".join(guidance)
 
@@ -1498,6 +1430,14 @@ class GaiaGraphAgent:
             and state.get("iterations", 0) < state.get("max_iterations", 0)
         ):
             return "retry_invalid_answer"
+        if (
+            GaiaGraphAgent._requires_botanical_classification_retry(
+                state,
+                last_content,
+            )
+            and state.get("iterations", 0) < state.get("max_iterations", 0)
+        ):
+            return "retry_invalid_answer"
         return "finalize"
 
     def _route_after_tools(self, state: AgentState) -> str:
@@ -2087,6 +2027,100 @@ class GaiaGraphAgent:
                 return result
         return None
 
+    @staticmethod
+    def _botanical_candidate_items(state: AgentState) -> list[str]:
+        prompt_items = _extract_prompt_list_items(state["question"])
+        if not prompt_items:
+            return []
+
+        haystacks: list[str] = []
+        last_ai = GaiaGraphAgent._last_ai_message(state["messages"])
+        if last_ai is not None:
+            haystacks.append(normalize_submitted_answer(str(last_ai.content or "")).lower())
+        for message in state["messages"]:
+            if not isinstance(message, AIMessage):
+                continue
+            for tool_call in getattr(message, "tool_calls", []) or []:
+                if tool_call.get("name") != "web_search":
+                    continue
+                query = str(tool_call.get("args", {}).get("query", "") or "")
+                if query:
+                    haystacks.append(normalize_submitted_answer(query).lower())
+
+        candidates: list[str] = []
+        for item in prompt_items:
+            token_groups = _botanical_item_token_groups(item)
+            if not token_groups:
+                continue
+            if any(
+                all(
+                    any(variant in haystack for variant in variants)
+                    for variants in token_groups
+                )
+                for haystack in haystacks
+            ):
+                candidates.append(item)
+        return candidates
+
+    def _targeted_botanical_classification_fallback(
+        self,
+        state: AgentState,
+    ) -> dict[str, Any] | None:
+        profile = _question_profile_from_state(state)
+        if profile.name != "botanical_classification":
+            return None
+        web_search_tool = self.tools_by_name.get("web_search")
+        fetch_tool = self.tools_by_name.get("fetch_url")
+        if web_search_tool is None or fetch_tool is None:
+            return None
+
+        items = self._botanical_candidate_items(state)
+        if not items:
+            return None
+
+        vegetables: list[str] = []
+        attempted_records: list[EvidenceRecord] = []
+        for item in items:
+            fruit_total = 0
+            vegetable_total = 0
+            for query in (
+                f"{item} botanical fruit or vegetable",
+                f"{item} botany fruit vegetable",
+            ):
+                try:
+                    search_text = str(
+                        web_search_tool.invoke({"query": query, "max_results": 5})
+                    )
+                except Exception:
+                    continue
+                candidates = parse_result_blocks(search_text, origin_tool="web_search")
+                for candidate in candidates[:2]:
+                    try:
+                        fetched = str(fetch_tool.invoke({"url": candidate.url}))
+                    except Exception:
+                        continue
+                    fetched_records = evidence_records_from_tool_output("fetch_url", fetched)
+                    attempted_records.extend(fetched_records)
+                    scores = _botanical_scores_from_text(item, fetched)
+                    if scores is None:
+                        continue
+                    fruit_score, vegetable_score = scores
+                    fruit_total += fruit_score
+                    vegetable_total += vegetable_score
+            if vegetable_total >= fruit_total + 2 and vegetable_total >= 3:
+                vegetables.append(item)
+
+        if not vegetables:
+            return None
+        ordered = sorted(dict.fromkeys(vegetables), key=lambda value: value.lower())
+        return {
+            "final_answer": ", ".join(ordered),
+            "error": None,
+            "reducer_used": "botanical_classification",
+            "evidence_used": serialize_evidence(attempted_records[-6:]),
+            "fallback_reason": None,
+        }
+
     def _targeted_article_identifier_fallback(
         self,
         state: AgentState,
@@ -2183,6 +2217,22 @@ class GaiaGraphAgent:
         targeted_text_span_result = self._text_span_source_fallback(state)
         if targeted_text_span_result:
             return targeted_text_span_result
+        targeted_botanical_result = self._targeted_botanical_classification_fallback(state)
+        if targeted_botanical_result:
+            return targeted_botanical_result
+        if self._requires_botanical_classification_retry(state, final_answer):
+            fallback_answer = self._fallback_tool_answer(
+                state["messages"], state["question"]
+            )
+            if fallback_answer and not self._requires_botanical_classification_retry(
+                state, fallback_answer
+            ):
+                return {"final_answer": fallback_answer, "error": None, "fallback_reason": None}
+            return {
+                "final_answer": "",
+                "error": error or "Botanical classification answer lacked grounded evidence.",
+                "fallback_reason": fallback_reason or "botanical_classification_evidence_missing",
+            }
         if self._requires_temporal_roster_retry(state, final_answer):
             targeted_roster_result = self._targeted_temporal_roster_fallback(state)
             if targeted_roster_result:
@@ -2281,16 +2331,26 @@ class GaiaGraphAgent:
             state,
             str(getattr(self._last_ai_message(state["messages"]), "content", "") or ""),
         )
-        extra = ""
+        botanical_retry = self._requires_botanical_classification_retry(
+            state,
+            str(getattr(self._last_ai_message(state["messages"]), "content", "") or ""),
+        )
+        extra_parts: list[str] = []
         if temporal_roster_retry:
             profile = _question_profile_from_state(state)
-            extra = (
+            extra_parts.append(
                 f" This question is date-sensitive ({profile.expected_date}). "
                 "Your current evidence looks like a current or undated roster, so do not answer yet. "
                 "Do not treat current player profiles, roster templates, or season stat leaderboards as substitutes for dated roster evidence. "
                 "A season-specific official player directory or season-specific player detail page is acceptable if it explicitly matches the requested season and shows the numbered neighboring players. "
                 "Fetch a roster/archive/oldid/team page or season-specific player directory that is explicitly grounded to the requested date or season."
             )
+        if botanical_retry:
+            extra_parts.append(
+                " This is a botanical classification task. Do not answer from common culinary usage, prior knowledge, or search snippets alone. "
+                "Search for relevant sources, read at least one source page with fetch_url or find_text_in_url, and only then answer from grounded evidence."
+            )
+        extra = "".join(extra_parts)
         reminder = HumanMessage(
             content=(
                 "Your previous reply was invalid because it was not a concrete answer. "
@@ -2447,6 +2507,26 @@ class GaiaGraphAgent:
         if not subject_tokens:
             return True
         return all(token in haystack for token in subject_tokens)
+
+    @staticmethod
+    def _has_non_link_grounded_evidence(state: AgentState) -> bool:
+        return any(
+            record.kind in {"text", "table", "transcript"}
+            for record in GaiaGraphAgent._collect_evidence_records(state["messages"])
+        )
+
+    @staticmethod
+    def _requires_botanical_classification_retry(
+        state: AgentState,
+        answer_text: str,
+    ) -> bool:
+        candidate = normalize_submitted_answer(answer_text)
+        if not candidate or GaiaGraphAgent._is_invalid_final_response(candidate):
+            return False
+        profile = _question_profile_from_state(state)
+        if profile.name != "botanical_classification":
+            return False
+        return not GaiaGraphAgent._has_non_link_grounded_evidence(state)
 
     @staticmethod
     def _has_temporal_roster_grounding_gap(state: AgentState) -> bool:
@@ -2787,26 +2867,10 @@ class GaiaGraphAgent:
         return normalized
 
     @staticmethod
-    def _try_heuristic_answer(question: str) -> tuple[str | None, str | None]:
-        decoded = _maybe_decode_reversed_question(question)
-        if decoded:
-            lowered = decoded.lower()
-            if "opposite of the word" in lowered:
-                match = re.search(r'opposite of the word\s+"?([a-zA-Z-]+)"?', decoded, flags=re.IGNORECASE)
-                if not match:
-                    match = re.search(r"opposite of the word\s+'?([a-zA-Z-]+)'?", decoded, flags=re.IGNORECASE)
-                if match:
-                    word = match.group(1).lower()
-                    opposite = OPPOSITE_WORDS.get(word)
-                    if opposite:
-                        return opposite, "heuristic(reversed_text_opposite_word)"
-
+    def _try_prompt_reducer(question: str) -> tuple[str | None, str | None]:
         non_commutative_subset = _find_non_commutative_subset(question)
         if non_commutative_subset:
-            return ", ".join(non_commutative_subset), "heuristic(non_commutative_subset)"
-        botanical_vegetable_list = _solve_botanical_vegetable_list(question)
-        if botanical_vegetable_list:
-            return botanical_vegetable_list, "heuristic(botanical_vegetable_list)"
+            return ", ".join(non_commutative_subset), "non_commutative_subset"
         return None, None
 
     def solve(
@@ -2815,17 +2879,22 @@ class GaiaGraphAgent:
         *,
         local_file_path: str | Path | None = None,
     ) -> dict[str, Any]:
-        heuristic_answer, heuristic_trace = self._try_heuristic_answer(question.question)
-        if heuristic_answer:
+        prompt_reducer_answer, prompt_reducer_used = self._try_prompt_reducer(
+            question.question
+        )
+        if prompt_reducer_answer:
             return {
                 "task_id": question.task_id,
                 "question": question.question,
-                "submitted_answer": self._canonicalize_final_answer(question.question, heuristic_answer),
+                "submitted_answer": self._canonicalize_final_answer(
+                    question.question,
+                    prompt_reducer_answer,
+                ),
                 "file_name": question.file_name,
-                "tool_trace": [heuristic_trace],
-                "decision_trace": ["heuristic:applied"],
+                "tool_trace": [],
+                "decision_trace": [f"prompt_reducer:{prompt_reducer_used}"],
                 "evidence_used": [],
-                "reducer_used": heuristic_trace.removeprefix("heuristic(").removesuffix(")"),
+                "reducer_used": prompt_reducer_used,
                 "fallback_reason": None,
                 "error": None,
             }
@@ -2972,29 +3041,6 @@ def _find_non_commutative_subset(question: str) -> list[str] | None:
     return sorted(involved)
 
 
-def _solve_botanical_vegetable_list(question: str) -> str | None:
-    lowered = question.lower()
-    if "professor of botany" not in lowered or "vegetable" not in lowered:
-        return None
-    if "comma separated list" not in lowered:
-        return None
-
-    items = _extract_prompt_list_items(question)
-    if not items:
-        return None
-
-    vegetables = [
-        item
-        for item in items
-        if _botanical_item_category(item) == "vegetable"
-    ]
-    if not vegetables:
-        return None
-
-    ordered = sorted(dict.fromkeys(vegetables), key=lambda value: value.lower())
-    return ", ".join(ordered)
-
-
 def _extract_prompt_list_items(question: str) -> list[str]:
     match = re.search(
         r"here's the list i have so far:\s*(?P<body>.+?)(?:\n\s*\n|$)",
@@ -3007,13 +3053,171 @@ def _extract_prompt_list_items(question: str) -> list[str]:
     return [item.strip() for item in body.split(",") if item.strip()]
 
 
-def _botanical_item_category(item: str) -> str | None:
-    normalized = re.sub(r"\s+", " ", item.lower()).strip()
-    simplified = re.sub(r"^(fresh|whole|ripe|raw|dried)\s+", "", normalized).strip()
-    if normalized in BOTANICAL_VEGETABLES or simplified in BOTANICAL_VEGETABLES:
-        return "vegetable"
-    if normalized in BOTANICAL_FRUITS or simplified in BOTANICAL_FRUITS:
+def _normalize_botanical_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.lower()
+    normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
+    return re.sub(r"\s{2,}", " ", normalized).strip()
+
+
+def _botanical_item_token_groups(item: str) -> list[set[str]]:
+    ignored = {"fresh", "whole", "raw", "ripe", "dried"}
+    groups: list[set[str]] = []
+    for token in _normalize_botanical_text(item).split():
+        if token in ignored:
+            continue
+        variants = {token}
+        if token.endswith("ies") and len(token) > 4:
+            variants.add(token[:-3] + "y")
+        if token.endswith("oes") and len(token) > 4:
+            variants.add(token[:-2])
+        if token.endswith("s") and len(token) > 4:
+            variants.add(token[:-1])
+        groups.append(variants)
+    return groups
+
+
+def _botanical_relevant_text(item: str, text: str) -> str:
+    token_groups = _botanical_item_token_groups(item)
+    if not token_groups:
+        return ""
+
+    segments = [
+        segment.strip()
+        for segment in re.split(r"(?:\n+|(?<=[.!?])\s+)", text)
+        if segment.strip()
+    ]
+    relevant_segments: list[str] = []
+    for segment in segments:
+        normalized_segment = _normalize_botanical_text(segment)
+        if all(
+            any(variant in normalized_segment for variant in variants)
+            for variants in token_groups
+        ):
+            relevant_segments.append(segment)
+
+    if relevant_segments:
+        return " ".join(relevant_segments)
+
+    normalized = _normalize_botanical_text(text)
+    if all(
+        any(variant in normalized for variant in variants)
+        for variants in token_groups
+    ):
+        return text
+    return ""
+
+
+def _botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
+    relevant_text = _botanical_relevant_text(item, text)
+    normalized = _normalize_botanical_text(relevant_text)
+    if not normalized:
+        return None
+    if any(
+        phrase in normalized
+        for phrase in (
+            "neither a fruit nor a vegetable",
+            "neither fruit nor vegetable",
+            "not a fruit or vegetable",
+            "neither fruits nor vegetables",
+        )
+    ):
+        return None
+    if (
+        "made from" in normalized
+        and any(token in normalized for token in ("milled", "grinding", "ground", "powder"))
+    ):
+        return None
+
+    fruit_score = 0
+    vegetable_score = 0
+
+    fruit_phrases = (
+        "botanical fruit",
+        "botanically a fruit",
+        "is a fruit",
+        "are fruits",
+        "considered a fruit",
+        "the fruit of",
+        "seed bearing structure",
+        "grain rather than a vegetable",
+        "not a vegetable",
+    )
+    vegetable_phrases = (
+        "botanical vegetable",
+        "botanically a vegetable",
+        "is a vegetable",
+        "are vegetables",
+        "root vegetable",
+        "leaf vegetable",
+        "stem vegetable",
+        "flower vegetable",
+        "flowering head",
+        "edible leaves",
+        "edible leaf",
+        "edible stem",
+        "edible root",
+        "flower buds",
+    )
+    fruit_cues = (
+        "fruit",
+        "berry",
+        "berries",
+        "seed",
+        "seeds",
+        "grain",
+        "grains",
+        "cereal",
+        "kernel",
+        "kernels",
+        "pod",
+        "pods",
+        "caryopsis",
+        "drupe",
+        "pepo",
+        "capsule",
+        "legume",
+    )
+    vegetable_cues = (
+        "vegetable",
+        "vegetables",
+        "leaf",
+        "leaves",
+        "stem",
+        "stalk",
+        "root",
+        "tuber",
+        "bulb",
+        "flower",
+        "flowers",
+        "inflorescence",
+        "herb",
+    )
+
+    fruit_score += sum(3 for phrase in fruit_phrases if phrase in normalized)
+    vegetable_score += sum(3 for phrase in vegetable_phrases if phrase in normalized)
+    fruit_score += sum(1 for cue in fruit_cues if cue in normalized)
+    vegetable_score += sum(1 for cue in vegetable_cues if cue in normalized)
+
+    if "not a vegetable" in normalized:
+        fruit_score += 2
+    if "not a fruit" in normalized:
+        vegetable_score += 2
+
+    return fruit_score, vegetable_score
+
+
+def _classify_botanical_item_from_text(item: str, text: str) -> str | None:
+    scores = _botanical_scores_from_text(item, text)
+    if scores is None:
+        return None
+    fruit_score, vegetable_score = scores
+
+    if fruit_score >= vegetable_score + 2 and fruit_score >= 3:
         return "fruit"
+    if vegetable_score >= fruit_score + 2 and vegetable_score >= 3:
+        return "vegetable"
     return None
 
 

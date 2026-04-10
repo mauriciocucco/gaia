@@ -196,6 +196,17 @@ def profile_question(
             subject_name=subject_name,
             text_filter=text_filter or (subject_name or ""),
         )
+    if _is_botanical_classification_question(lowered):
+        return QuestionProfile(
+            name="botanical_classification",
+            target_urls=generic_urls,
+            expected_domains=_expected_domains(question, default=()),
+            preferred_tools=("web_search", "fetch_url", "find_text_in_url"),
+            expected_date=expected_date,
+            expected_author=expected_author,
+            subject_name=subject_name,
+            text_filter=text_filter or "botanical classification",
+        )
     if _is_entity_role_chain_question(lowered):
         return QuestionProfile(
             name="entity_role_chain",
@@ -689,6 +700,25 @@ def _is_entity_role_chain_question(lowered_question: str) -> bool:
 
 def _is_roster_neighbor_question(lowered_question: str) -> bool:
     return "number before and after" in lowered_question or "before and after" in lowered_question and "number" in lowered_question
+
+
+def _is_botanical_classification_question(lowered_question: str) -> bool:
+    if "vegetable" not in lowered_question:
+        return False
+    botanical_cues = (
+        "professor of botany",
+        "botanical",
+        "botany",
+        "stickler",
+    )
+    listing_cues = (
+        "here's the list i have so far",
+        "comma separated list",
+        "fruits and vegetables",
+    )
+    return any(cue in lowered_question for cue in botanical_cues) and any(
+        cue in lowered_question for cue in listing_cues
+    )
 
 
 def _is_olympics_country_code_question(lowered_question: str) -> bool:

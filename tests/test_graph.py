@@ -152,7 +152,7 @@ class ExplodingModel:
         return self
 
     def invoke(self, _messages):
-        raise AssertionError("Model should not be invoked for heuristic solve.")
+        raise AssertionError("Model should not be invoked for prompt reducer solve.")
 
 
 class FakeModelSingleAnswer:
@@ -166,6 +166,39 @@ class FakeModelSingleAnswer:
     def invoke(self, _messages):
         self.calls += 1
         return AIMessage(content=self.answer)
+
+
+class FakeModelForBotanicalGroundingRetry:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def bind_tools(self, _tools):
+        return self
+
+    def invoke(self, messages):
+        self.calls += 1
+        if self.calls == 1:
+            return AIMessage(
+                content="[ANSWER]Bell pepper, Broccoli, Celery, Corn, Green beans, Lettuce, Sweet potatoes, Zucchini[/ANSWER]"
+            )
+        if self.calls == 2:
+            assert any(
+                "botanical classification task" in str(getattr(msg, "content", "")).lower()
+                for msg in messages
+            )
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-botany-fetch",
+                        "name": "fetch_url",
+                        "args": {"url": "https://example.com/botany"},
+                    }
+                ],
+            )
+        return AIMessage(
+            content="[ANSWER]broccoli, celery, fresh basil, lettuce, sweet potatoes[/ANSWER]"
+        )
 
 
 class RecordingModel:
@@ -914,8 +947,9 @@ def test_graph_marks_missing_attachment_meta_answer_invalid() -> None:
     assert result["error"] == "Required attachment was not available locally."
 
 
-def test_graph_solves_reversed_opposite_prompt_heuristically() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
+def test_graph_reversed_prompt_no_longer_short_circuits_before_graph() -> None:
+    model = FakeModelSingleAnswer("[ANSWER]right[/ANSWER]")
+    agent = GaiaGraphAgent(model=model, max_iterations=3)
     result = agent.solve(
         Question(
             task_id="3",
@@ -925,10 +959,12 @@ def test_graph_solves_reversed_opposite_prompt_heuristically() -> None:
     )
 
     assert result["submitted_answer"] == "right"
-    assert result["tool_trace"] == ["heuristic(reversed_text_opposite_word)"]
+    assert model.calls == 1
+    assert result["tool_trace"] == []
+    assert result["reducer_used"] is None
 
 
-def test_graph_solves_non_commutative_subset_heuristically() -> None:
+def test_graph_solves_non_commutative_subset_with_prompt_reducer() -> None:
     agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=3)
     result = agent.solve(
         Question(
@@ -950,7 +986,9 @@ def test_graph_solves_non_commutative_subset_heuristically() -> None:
     )
 
     assert result["submitted_answer"] == "b, e"
-    assert result["tool_trace"] == ["heuristic(non_commutative_subset)"]
+    assert result["tool_trace"] == []
+    assert result["decision_trace"] == ["prompt_reducer:non_commutative_subset"]
+    assert result["reducer_used"] == "non_commutative_subset"
 
 
 def test_graph_no_longer_short_circuits_benchmark_specific_questions() -> None:
@@ -1019,10 +1057,28 @@ def test_prepare_context_marks_self_contained_classification_questions() -> None
     assert "self-contained" in prompt.lower()
     assert "avoid web tools" in prompt.lower()
     assert "Do not use execute_python_code" in prompt
+    assert "Do not answer from culinary/common usage or from memory." in prompt
 
 
-def test_graph_solves_botanical_vegetable_list_without_model_call() -> None:
-    agent = GaiaGraphAgent(model=ExplodingModel(), max_iterations=1)
+def test_prepare_context_includes_decoded_question_hint() -> None:
+    state = {
+        "task_id": "hint-decoded",
+        "question": '.rewsna eht sa "tfel" drow eht fo etisoppo eht etirw ,ecnetnes siht dnatsrednu uoy fI',
+        "file_name": None,
+        "local_file_path": None,
+        "messages": [],
+    }
+
+    prepared = graph_module._prepare_context(state)  # type: ignore[arg-type]
+    prompt = prepared["messages"][1].content
+
+    assert "Decoded question hint:" in prompt
+    assert 'write the opposite of the word "left" as the answer.' in prompt
+
+
+def test_graph_botanical_prompt_no_longer_short_circuits_before_graph() -> None:
+    model = FakeModelSingleAnswer("[ANSWER]broccoli, celery, fresh basil, lettuce, sweet potatoes[/ANSWER]")
+    agent = GaiaGraphAgent(model=model, max_iterations=1)
 
     result = agent.solve(
         Question(
@@ -1041,11 +1097,133 @@ def test_graph_solves_botanical_vegetable_list_without_model_call() -> None:
         )
     )
 
-    assert (
-        result["submitted_answer"]
-        == "broccoli, celery, fresh basil, lettuce, sweet potatoes"
+    assert result["submitted_answer"] == ""
+    assert model.calls == 1
+    assert result["tool_trace"] == []
+    assert result["reducer_used"] is None
+    assert result["error"] == "Botanical classification answer lacked grounded evidence."
+
+
+def test_graph_retries_botanical_classification_until_it_has_grounding(monkeypatch) -> None:
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return grounded botanical classification text."""
+        assert url == "https://example.com/botany"
+        return (
+            "Title: Botanical food classification\n"
+            "URL: https://example.com/botany\n\n"
+            "Fresh basil, broccoli, celery, lettuce, and sweet potatoes are vegetables in the botanical sense. "
+            "Bell peppers, corn, green beans, peanuts, plums, and zucchini are botanical fruits."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModelForBotanicalGroundingRetry(), max_iterations=3)
+    result = agent.solve(
+        Question(
+            task_id="botany-grounded",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. I need to add different foods to different categories on the grocery list, but if I make a mistake, "
+                "she won't buy anything inserted in the wrong category. Here's the list I have so far:\n\n"
+                "milk, eggs, flour, whole bean coffee, Oreos, sweet potatoes, fresh basil, plums, green beans, rice, corn, bell pepper, "
+                "whole allspice, acorns, broccoli, celery, zucchini, lettuce, peanuts\n\n"
+                "I need to make headings for the fruits and vegetables. Could you please create a list of just the vegetables from my list? "
+                "But remember that my mom is a real stickler, so make sure that no botanical fruits end up on the vegetable list. "
+                "Please alphabetize the list of vegetables, and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
     )
-    assert result["reducer_used"] == "botanical_vegetable_list"
+
+    assert result["submitted_answer"] == "broccoli, celery, fresh basil, lettuce, sweet potatoes"
+    assert result["tool_trace"] == ["fetch_url({'url': 'https://example.com/botany'})"]
+
+
+def test_graph_botanical_fallback_classifies_items_from_fetched_sources(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return one source candidate per botanical query."""
+        assert max_results == 5
+        url_map = {
+            "fresh basil botanical fruit or vegetable": "https://example.com/basil",
+            "broccoli botanical fruit or vegetable": "https://example.com/broccoli",
+            "bell pepper botanical fruit or vegetable": "https://example.com/bell-pepper",
+            "sweet potatoes botanical fruit or vegetable": "https://example.com/sweet-potato",
+        }
+        url = url_map.get(query, "https://example.com/unknown")
+        return f"1. Source\nURL: {url}\nSnippet: botanical classification for {query}"
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return fetched botanical classification text."""
+        payloads = {
+            "https://example.com/basil": (
+                "Title: Basil\nURL: https://example.com/basil\n\n"
+                "Basil is a culinary herb whose edible leaves are used fresh."
+            ),
+            "https://example.com/broccoli": (
+                "Title: Broccoli\nURL: https://example.com/broccoli\n\n"
+                "Broccoli is eaten for its flowering head and stalk."
+            ),
+            "https://example.com/bell-pepper": (
+                "Title: Bell pepper\nURL: https://example.com/bell-pepper\n\n"
+                "Botanically, bell pepper is a fruit because it contains seeds."
+            ),
+            "https://example.com/sweet-potato": (
+                "Title: Sweet potato\nURL: https://example.com/sweet-potato\n\n"
+                "Sweet potato is an edible root vegetable."
+            ),
+        }
+        return payloads[url]
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Bell pepper, Broccoli, Fresh basil, Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-fallback",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "broccoli, fresh basil, sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+
+
+def test_graph_rejects_ungrounded_botanical_classification_when_retry_budget_is_exhausted() -> None:
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer(
+            "[ANSWER]Bell pepper, Broccoli, Celery, Corn, Green beans, Lettuce, Sweet potatoes, Zucchini[/ANSWER]"
+        ),
+        max_iterations=1,
+    )
+
+    result = agent.solve(
+        Question(
+            task_id="botany-ungrounded",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "sweet potatoes, fresh basil, plums, green beans, corn, bell pepper, broccoli, celery, zucchini, lettuce\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == ""
+    assert result["error"] == "Botanical classification answer lacked grounded evidence."
+    assert result["fallback_reason"] == "botanical_classification_evidence_missing"
 
 
 def test_graph_marks_audio_access_meta_answer_invalid() -> None:
@@ -1075,14 +1253,29 @@ def test_graph_marks_audio_access_meta_answer_invalid() -> None:
 
 
 @pytest.mark.parametrize(
-    "question",
+    "case",
     [
-        "What country had the least number of athletes at the 1928 Summer Olympics? If there's a tie for a number of athletes, return the first in alphabetical order. Give the IOC country code as your answer.",
+        (
+            "What country had the least number of athletes at the 1928 Summer Olympics? If there's a tie for a number of athletes, return the first in alphabetical order. Give the IOC country code as your answer.",
+            "blocked",
+            None,
+        ),
         "Who are the pitchers with the number before and after Taishō Tamai's number as of July 2023? Give them to me in the form Pitcher Before, Pitcher After, use their last names only, in Roman characters.",
-        "What is the first name of the only Malko Competition recipient from the 20th Century (after 1977) whose nationality on record is a country that no longer exists?",
+        (
+            "What is the first name of the only Malko Competition recipient from the 20th Century (after 1977) whose nationality on record is a country that no longer exists?",
+            "blocked",
+            None,
+        ),
     ],
 )
-def test_graph_blocks_ungrounded_python_for_lookup_questions(monkeypatch, question: str) -> None:
+def test_graph_blocks_ungrounded_python_for_lookup_questions(monkeypatch, case) -> None:
+    if isinstance(case, tuple):
+        question, expected_answer, expected_error = case
+    else:
+        question = case
+        expected_answer = ""
+        expected_error = "Date-sensitive roster answer lacked temporally grounded evidence."
+
     @tool
     def execute_python_code(code: str) -> str:
         """Tool should not be invoked when python is ungrounded."""
@@ -1093,9 +1286,9 @@ def test_graph_blocks_ungrounded_python_for_lookup_questions(monkeypatch, questi
     agent = GaiaGraphAgent(model=FakeModelWithBlockedPython(), max_iterations=2)
     result = agent.solve(Question(task_id="blocked-python", question=question, file_name=None))
 
-    assert result["submitted_answer"] == "blocked"
+    assert result["submitted_answer"] == expected_answer
     assert any("execute_python_code" in item for item in result["tool_trace"])
-    assert result["error"] is None
+    assert result["error"] == expected_error
 
 
 def test_graph_auto_fetch_uses_ranked_candidate_instead_of_first_raw_url(monkeypatch) -> None:

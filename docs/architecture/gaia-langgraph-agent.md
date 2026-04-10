@@ -8,7 +8,7 @@ Como caso de estudio de LangGraph, este repo es util porque separa bastante bien
 
 1. Orquestacion del grafo en `graph.py`
 2. Perfilado de preguntas y normalizacion de evidencia en `source_pipeline.py`
-3. Extraccion deterministica de respuestas desde tablas/texto en `evidence_solver.py`
+3. Extraccion deterministica desde prompt o evidencia estructurada
 
 ## Arquitectura general
 
@@ -22,10 +22,10 @@ El flujo visible empieza en la CLI de `cli.py`, que:
 
 `solve()` tiene dos caminos:
 
-- Primero intenta resolver por heuristicas puramente Python, antes de entrar al grafo. Esto cubre casos muy autocontenidos, como texto invertido, listas botanicas o tablas que ya vienen completas en el prompt.
-- Si no aplica una heuristica, invoca el `StateGraph` compilado y devuelve un resultado enriquecido con `tool_trace`, `decision_trace`, `evidence_used`, `reducer_used` y `fallback_reason`.
+- Primero intenta un `prompt_reducer` minimo, limitado a respuestas derivables solo del texto del prompt. Hoy ese fast-path cubre tablas/estructuras ya incluidas en la pregunta, como `non_commutative_subset`.
+- Si no aplica ese reducer de prompt, invoca el `StateGraph` compilado y devuelve un resultado enriquecido con `tool_trace`, `decision_trace`, `evidence_used`, `reducer_used` y `fallback_reason`.
 
-Importante: no todo lo "deterministico" de este repo vive en esas heuristicas previas. Tambien hay una segunda capa de logica deterministica post-recoleccion dentro de `finalize`, que intenta rescates orientados a fuentes cuando el modelo no logra cerrar bien una familia de preguntas, pero ya existe suficiente contexto en `ranked_candidates`, `question_profile` o evidencia previa.
+Importante: el repo ya no considera "deterministico" cualquier conocimiento embebido en Python. La decodificacion de texto invertido sigue existiendo, pero como normalizacion/prompt shaping, no como resolvedor. Y la logica deterministica mas fuerte vive despues de recolectar evidencia, dentro de reducers y rescates orientados a fuentes.
 
 La capa de `tools.py` aporta herramientas de lectura y recuperacion: busqueda web, Wikipedia, fetch de paginas, extraccion de tablas, lectura de archivos locales, transcripcion de audio, analisis de YouTube y calculo/ejecucion Python acotada.
 
@@ -52,6 +52,8 @@ Convierte resultados de tools en estructuras mas utiles para razonar:
 - `EvidenceRecord`: normaliza evidencia proveniente de tools
 
 Tambien contiene el scoring de candidatos. Esa parte es importante: en este repo el LLM no elige fuentes "a ciegas"; el sistema reordena y penaliza resultados de baja calidad.
+
+En las versiones mas recientes, `QuestionProfile` tambien se usa para endurecer familias de preguntas donde una respuesta "plausible" puede ser incorrecta aunque suene razonable. Un ejemplo claro es `botanical_classification`: en ese perfil el sistema ya no acepta clasificaciones por intuicion culinaria o memoria del modelo; exige grounding en texto fetchado.
 
 ### `evidence_solver.py`
 
@@ -117,12 +119,13 @@ La idea reusable es esta: en LangGraph no conviene pensar el estado solo como "c
 ## Ciclo completo de una pregunta
 
 1. La CLI obtiene una `Question` y opcionalmente descarga el adjunto.
-2. `GaiaGraphAgent.solve()` intenta primero `_try_heuristic_answer()`.
-3. Si no hay heuristica, inicializa el estado y ejecuta `self.app.invoke(...)`.
+2. `GaiaGraphAgent.solve()` intenta primero `_try_prompt_reducer()`.
+3. Si no aplica ese reducer de prompt, inicializa el estado y ejecuta `self.app.invoke(...)`.
 4. `prepare_context` construye el prompt real para el modelo:
    - prompt de sistema
    - contexto del adjunto si existe
    - hints de investigacion
+   - hints de normalizacion, como texto invertido decodificado
    - `QuestionProfile`
 5. `agent` llama al modelo con tools binded.
 6. Si el modelo pidio tools, `tools` ejecuta, corrige o redirige esas llamadas.
@@ -187,6 +190,7 @@ Patron reusable: en LangGraph, el nodo de tools puede ser un "policy enforcement
 Es un nodo simple pero valioso. Si el modelo responde con meta-comentarios, disculpas o texto no util, el sistema no finaliza enseguida: reinyecta una instruccion precisa para que reintente usando la evidencia ya reunida.
 
 Tambien tiene una variante especial para preguntas de roster sensibles al tiempo, donde se le recuerda al modelo que no use un roster actual o sin grounding temporal como respuesta final.
+Y otra para `botanical_classification`, donde se le exige no responder desde uso comun/cocina ni desde snippets de search: tiene que leer al menos una fuente y cerrar desde evidencia grounded.
 
 Patron reusable: en vez de tratar una respuesta invalida como fallo terminal, insertarla en un loop corto de correccion controlada.
 
@@ -203,6 +207,7 @@ Orden de preferencia, simplificado:
    - `article_to_paper`: busca candidatos externos al publisher original y prueba `find_text_in_url`/`fetch_url` esperando un `award_number`
    - `text_span_lookup`: toma paginas candidatas con buen score, intenta `find_text_in_url` y si falla hace `fetch_url` completo esperando `text_span_attribute`
    - `roster_neighbor_lookup` sensible al tiempo: delega en un registry de resolvers oficiales por ecosistema/fuente
+   - `botanical_classification`: toma los items que el flujo activo puso en juego, busca evidencia por item, lee paginas concretas y vota la clasificacion botanica solo desde pasajes relevantes
 5. si la respuesta del modelo es invalida, intenta fallbacks en cascada:
    - respuesta concreta de tool
    - structured answer desde evidencia
@@ -216,6 +221,7 @@ Otra observacion importante: estos rescates no son todos igual de generales.
 
 - `article_to_paper` y `text_span_lookup` ya usan helpers relativamente reutilizables (`candidate_urls_from_state`, intentos de `find`/`fetch`, validacion por reducer esperado).
 - `roster_neighbor_lookup` ya tiene la interfaz correcta, pero hoy el resolver realmente implementado sigue siendo uno especifico del caso Fighters/NPB. La arquitectura quedo preparada para agregar otros resolvers oficiales sin volver a meter toda la logica en un unico bloque.
+- `botanical_classification` cae en un punto intermedio: no usa un diccionario embebido, pero tampoco intenta resolver toda la lista "a ciegas". Corrige y valida los items que el propio flujo activo ya considero candidatos, usando fetches concretos y scoring por evidencia.
 
 ## Conditional edges y forma real del workflow
 
@@ -292,6 +298,12 @@ Despues de recolectar evidencia, el sistema intenta resolver por codigo. Esto ba
 - fechas
 - filas filtradas
 
+Conviene separar esta capa de otra mas chica y anterior:
+
+- normalizacion/prompt shaping: transforma la entrada para que el modelo lea mejor el problema, por ejemplo mostrando una version decodificada de texto invertido
+- `prompt_reducers`: derivan una respuesta solo desde el prompt cuando la estructura ya esta completa en la pregunta
+- reducers sobre evidencia: operan despues de tools o lectura de adjuntos, cuando ya existen `EvidenceRecord`
+
 ### 4. Guardrails antes de ejecutar tools
 
 El repo no confia ciegamente en la tool call del modelo. Intercepta, corrige, redirige o bloquea. Esta capa vale mucho cuando las tools son costosas o propensas a loops.
@@ -304,15 +316,16 @@ Una extension practica de este patron es: "cerrar" no significa solo leer la ult
 
 ## Decisiones no obvias y tradeoffs
 
-### Heuristicas antes del grafo
+### Prompt reducers antes del grafo
 
 Ventaja:
 
-- evita costo y latencia cuando el prompt ya contiene todo
+- evita costo y latencia cuando el prompt ya contiene una estructura suficiente para derivar la respuesta
 
 Tradeoff:
 
-- obliga a mantener una capa extra de logica puntual
+- obliga a mantener un contrato estricto sobre que significa "derivable del prompt"
+- si se mezclan con conocimiento de dominio embebido, se vuelve borroso que parte del sistema esta grounded y cual no
 
 ### Ranking de fuentes
 
@@ -323,7 +336,7 @@ Ventaja:
 
 Tradeoff:
 
-- requiere heuristicas por dominio/tipo de pregunta
+- requiere scoring y reglas por dominio/tipo de pregunta
 
 ### Grounding temporal en rosters
 
@@ -348,6 +361,8 @@ Tradeoff:
 
 - si se llevan demasiado lejos, pueden convertirse en una segunda capa opaca de negocio ad hoc
 - conviene mantenerlos como patrones explicitamente nombrados y testeados, no como condiciones dispersas dentro de `finalize`
+
+Un buen ejemplo del tradeoff actual es `botanical_classification`: ya no hay heuristica con conocimiento fijo, pero si un fallback que busca evidencia por item y decide desde texto fetchado. Eso mejora grounding, aunque aumenta costo y complejidad respecto de dejar que el modelo "adivine" desde el prompt.
 
 ### Bloqueo de Python no grounded
 

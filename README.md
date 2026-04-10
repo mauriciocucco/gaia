@@ -27,6 +27,7 @@ https://huggingface.co/spaces/MauriSC88/gaia-langgraph-agent/tree/main
 python -m hf_gaia_agent.cli run --dry-run
 python -m hf_gaia_agent.cli run --limit 3
 python -m hf_gaia_agent.cli submit --username <hf_user> --agent-code-url https://huggingface.co/spaces/MauriSC88/gaia-langgraph-agent/tree/main
+python -m hf_gaia_agent.cli graph --format mermaid
 ```
 
 ## Variables de entorno
@@ -45,3 +46,8 @@ python -m hf_gaia_agent.cli submit --username <hf_user> --agent-code-url https:/
 - El backend oficial evalúa con `strip().lower()`.
 - La respuesta enviada no debe incluir wrappers como `[ANSWER]`.
 - El Space existe para exponer el código públicamente; el flujo de resolución y submit puede seguir corriendo en local.
+- El flujo actual distingue entre `prompt_reducers` mínimos y rescates source-aware posteriores. Casos como clasificación botánica ya no se resuelven con conocimiento embebido: requieren evidencia fetchada antes de cerrar.
+
+## Arquitectura
+
+Hay una descripción más detallada del flujo en `docs/architecture/gaia-langgraph-agent.md`.
