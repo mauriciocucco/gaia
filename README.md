@@ -48,6 +48,9 @@ python -m hf_gaia_agent.cli graph --format mermaid
 - El Space existe para exponer el código públicamente; el flujo de resolución y submit puede seguir corriendo en local.
 - El flujo actual distingue entre `prompt_reducers` mínimos y rescates source-aware posteriores. Casos como clasificación botánica ya no se resuelven con conocimiento embebido: requieren evidencia fetchada antes de cerrar.
 
+- `metric_row_lookup` tambien puede resolver desde texto lineal de paginas de stats y desde leaderboards rankeados cuando `extract_tables_from_url` no encuentra HTML util pero `fetch_url` si deja evidencia estructurable.
+- El fallback de `botanical_classification` valida items del prompt con evidencia fetchada por item y descarta paginas de senal debil basadas solo en titulos, metadata o prompts tipo `is X a vegetable?` para reducir falsos positivos.
+
 ## Arquitectura
 
 Hay una descripción más detallada del flujo en `docs/architecture/gaia-langgraph-agent.md`.

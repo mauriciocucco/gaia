@@ -68,6 +68,8 @@ Contiene reducers deterministas que intentan responder sin otra llamada al model
 
 Esta capa muestra un patron util de LangGraph: dejar que el grafo recolecte evidencia, pero resolver con codigo cuando la forma de la evidencia es reconocible.
 
+En particular, `metric_row_lookup` ya no se limita a tablas HTML o markdown. Tambien puede reconstruir filas desde texto lineal de paginas de estadisticas y desde leaderboards rankeados estilo MLB cuando `extract_tables_from_url` falla pero `fetch_url` devuelve texto suficientemente estructurado.
+
 Tambien conviene notar una decision de diseño reciente: algunos reducers se endurecieron para no aceptar falsos positivos "plausibles". Por ejemplo, `award_number` ya no toma cualquier palabra despues de "supported by"; exige un identificador con mezcla de letras y digitos para evitar errores tipo `National`.
 
 ### `tools.py`
@@ -207,7 +209,7 @@ Orden de preferencia, simplificado:
    - `article_to_paper`: busca candidatos externos al publisher original y prueba `find_text_in_url`/`fetch_url` esperando un `award_number`
    - `text_span_lookup`: toma paginas candidatas con buen score, intenta `find_text_in_url` y si falla hace `fetch_url` completo esperando `text_span_attribute`
    - `roster_neighbor_lookup` sensible al tiempo: delega en un registry de resolvers oficiales por ecosistema/fuente
-   - `botanical_classification`: toma los items que el flujo activo puso en juego, busca evidencia por item, lee paginas concretas y vota la clasificacion botanica solo desde pasajes relevantes
+   - `botanical_classification`: toma los items que el flujo activo puso en juego y tambien items plausibles del prompt aunque el modelo los haya omitido, busca evidencia por item, lee paginas concretas y vota la clasificacion botanica solo desde pasajes relevantes
 5. si la respuesta del modelo es invalida, intenta fallbacks en cascada:
    - respuesta concreta de tool
    - structured answer desde evidencia
@@ -221,7 +223,7 @@ Otra observacion importante: estos rescates no son todos igual de generales.
 
 - `article_to_paper` y `text_span_lookup` ya usan helpers relativamente reutilizables (`candidate_urls_from_state`, intentos de `find`/`fetch`, validacion por reducer esperado).
 - `roster_neighbor_lookup` ya tiene la interfaz correcta, pero hoy el resolver realmente implementado sigue siendo uno especifico del caso Fighters/NPB. La arquitectura quedo preparada para agregar otros resolvers oficiales sin volver a meter toda la logica en un unico bloque.
-- `botanical_classification` cae en un punto intermedio: no usa un diccionario embebido, pero tampoco intenta resolver toda la lista "a ciegas". Corrige y valida los items que el propio flujo activo ya considero candidatos, usando fetches concretos y scoring por evidencia.
+- `botanical_classification` cae en un punto intermedio: no usa un diccionario embebido, pero tampoco intenta resolver toda la lista "a ciegas". Corrige y valida los items que el propio flujo activo ya considero candidatos, incorpora items plausibles del prompt aunque el modelo no los haya nombrado y filtra evidencia de senal debil para no confundir metadata o titulos con clasificacion botanica real.
 
 ## Conditional edges y forma real del workflow
 
