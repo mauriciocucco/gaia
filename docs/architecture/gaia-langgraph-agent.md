@@ -25,6 +25,8 @@ El flujo visible empieza en la CLI de `cli.py`, que:
 - Primero intenta resolver por heuristicas puramente Python, antes de entrar al grafo. Esto cubre casos muy autocontenidos, como texto invertido, listas botanicas o tablas que ya vienen completas en el prompt.
 - Si no aplica una heuristica, invoca el `StateGraph` compilado y devuelve un resultado enriquecido con `tool_trace`, `decision_trace`, `evidence_used`, `reducer_used` y `fallback_reason`.
 
+Importante: no todo lo "deterministico" de este repo vive en esas heuristicas previas. Tambien hay una segunda capa de logica deterministica post-recoleccion dentro de `finalize`, que intenta rescates orientados a fuentes cuando el modelo no logra cerrar bien una familia de preguntas, pero ya existe suficiente contexto en `ranked_candidates`, `question_profile` o evidencia previa.
+
 La capa de `tools.py` aporta herramientas de lectura y recuperacion: busqueda web, Wikipedia, fetch de paginas, extraccion de tablas, lectura de archivos locales, transcripcion de audio, analisis de YouTube y calculo/ejecucion Python acotada.
 
 ## Mapa de modulos
@@ -38,6 +40,7 @@ Es el corazon del sistema. Define:
 - el `StateGraph`
 - la politica de ruteo entre nodos
 - los guardrails de busqueda, grounding y finalizacion
+- rescates source-aware reutilizables para algunas familias de preguntas
 - la API publica `solve()`
 
 ### `source_pipeline.py`
@@ -62,6 +65,8 @@ Contiene reducers deterministas que intentan responder sin otra llamada al model
 - deteccion de award numbers
 
 Esta capa muestra un patron util de LangGraph: dejar que el grafo recolecte evidencia, pero resolver con codigo cuando la forma de la evidencia es reconocible.
+
+Tambien conviene notar una decision de diseño reciente: algunos reducers se endurecieron para no aceptar falsos positivos "plausibles". Por ejemplo, `award_number` ya no toma cualquier palabra despues de "supported by"; exige un identificador con mezcla de letras y digitos para evitar errores tipo `National`.
 
 ### `tools.py`
 
@@ -129,6 +134,7 @@ La idea reusable es esta: en LangGraph no conviene pensar el estado solo como "c
    - respuesta del modelo
    - respuesta de una tool
    - respuesta estructurada desde evidencia
+   - rescates source-aware basados en candidatos/evidencia ya recolectada
    - salvage final desde evidencia top-ranked
 
 ## Nodos del grafo
@@ -193,14 +199,23 @@ Orden de preferencia, simplificado:
 1. si ya hay `final_answer` en el estado, la conserva
 2. si falta un adjunto requerido, falla salvo que exista una respuesta concreta desde tool
 3. si hay un reducer estructurado preferido y temporalmente utilizable, lo privilegia
-4. si la respuesta del modelo es invalida, intenta fallbacks en cascada:
+4. si no alcanza con eso, intenta rescates source-aware por familia de pregunta:
+   - `article_to_paper`: busca candidatos externos al publisher original y prueba `find_text_in_url`/`fetch_url` esperando un `award_number`
+   - `text_span_lookup`: toma paginas candidatas con buen score, intenta `find_text_in_url` y si falla hace `fetch_url` completo esperando `text_span_attribute`
+   - `roster_neighbor_lookup` sensible al tiempo: delega en un registry de resolvers oficiales por ecosistema/fuente
+5. si la respuesta del modelo es invalida, intenta fallbacks en cascada:
    - respuesta concreta de tool
    - structured answer desde evidencia
    - salvage LLM usando solo evidencia top-grounded
    - verificacion LLM final usando esa misma evidencia
-5. si nada sirve, deja error y `fallback_reason`
+6. si nada sirve, deja error y `fallback_reason`
 
 Este nodo muestra otra idea fuerte de LangGraph: la finalizacion no tiene por que ser "usar la ultima respuesta del modelo". Puede ser un arbitraje multi-fuente.
+
+Otra observacion importante: estos rescates no son todos igual de generales.
+
+- `article_to_paper` y `text_span_lookup` ya usan helpers relativamente reutilizables (`candidate_urls_from_state`, intentos de `find`/`fetch`, validacion por reducer esperado).
+- `roster_neighbor_lookup` ya tiene la interfaz correcta, pero hoy el resolver realmente implementado sigue siendo uno especifico del caso Fighters/NPB. La arquitectura quedo preparada para agregar otros resolvers oficiales sin volver a meter toda la logica en un unico bloque.
 
 ## Conditional edges y forma real del workflow
 
@@ -265,6 +280,8 @@ Este repo usa pocos nodos y concentra la sofisticacion en funciones puras de Pyt
 
 `decision_trace`, `ranked_candidates` y `search_history_normalized` no son memoria conversacional; son memoria de control. Esto sirve para romper loops y guiar mejor al agente.
 
+En las versiones mas recientes, `ranked_candidates` paso a ser aun mas importante: no solo sirve para guiar al modelo, sino tambien para rescates deterministas posteriores. Por ejemplo, `finalize` puede reutilizar esos candidatos para probar una pagina externa a un article publisher o una pagina candidata de texto exacto, sin depender de una nueva conjetura del modelo.
+
 ### 3. Reducers deterministas despues de las tools
 
 Despues de recolectar evidencia, el sistema intenta resolver por codigo. Esto baja variabilidad y mejora grounding. Es un patron especialmente util cuando la respuesta sale de:
@@ -282,6 +299,8 @@ El repo no confia ciegamente en la tool call del modelo. Intercepta, corrige, re
 ### 5. Finalizacion como arbitraje
 
 La respuesta final puede venir del modelo, de una tool o de evidencia procesada. Esta separacion entre "explorar" y "cerrar" es muy reusable.
+
+Una extension practica de este patron es: "cerrar" no significa solo leer la ultima evidencia, sino poder aplicar un rescue path especifico pero reusable para una familia de preguntas cuando el modelo ya encontro el terreno correcto y solo le falto el ultimo salto.
 
 ## Decisiones no obvias y tradeoffs
 
@@ -315,6 +334,20 @@ Ventaja:
 Tradeoff:
 
 - agrega complejidad especifica de dominio y mas reglas de validacion
+- cuando se necesita llegar a una fuente oficial historica, puede requerir resolvers por ecosistema o sitio, no solo scoring generico de URLs
+
+### Rescates source-aware reutilizables
+
+Ventaja:
+
+- capturan familias de error recurrentes del modelo sin hardcodear directamente una respuesta
+- reutilizan `QuestionProfile`, `ranked_candidates` y reducers existentes
+- permiten cerrar preguntas donde el modelo falla en el "ultimo salto", aunque ya existe evidencia suficiente o casi suficiente
+
+Tradeoff:
+
+- si se llevan demasiado lejos, pueden convertirse en una segunda capa opaca de negocio ad hoc
+- conviene mantenerlos como patrones explicitamente nombrados y testeados, no como condiciones dispersas dentro de `finalize`
 
 ### Bloqueo de Python no grounded
 

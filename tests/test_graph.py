@@ -807,7 +807,7 @@ def test_graph_article_to_paper_auto_retries_links_and_redirects_fetch(monkeypat
     )
 
 
-def test_graph_targeted_article_award_fallback_fetches_northwestern_release(monkeypatch) -> None:
+def test_graph_article_identifier_fallback_fetches_external_candidate(monkeypatch) -> None:
     @tool
     def fetch_url(url: str) -> str:
         """Return the Northwestern for-journalists page with the award number."""
@@ -828,9 +828,59 @@ def test_graph_targeted_article_award_fallback_fetches_northwestern_release(monk
             "Find this paper. Under what NASA award number was the work performed by R. G. Arendt supported by?"
         ),
         "messages": [],
+        "ranked_candidates": [
+            {
+                "title": "Mysterious dashes revealed in Milky Way's center",
+                "url": "https://news.northwestern.edu/stories/2023/06/mysterious-dashes-revealed-in-milky-ways-center/?fj=1",
+                "snippet": "For Journalists release with the linked paper",
+                "origin_tool": "extract_links_from_url",
+                "score": 95,
+                "reasons": ("linked_source", "primary_source_hint"),
+            }
+        ],
     }
 
-    result = agent._targeted_article_award_fallback(state)
+    result = agent._targeted_article_identifier_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "80GSFC21M0002"
+    assert result["reducer_used"] == "award_number"
+
+
+def test_graph_article_identifier_fallback_searches_by_supported_subject(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return a paper page when searching by supported subject."""
+        assert max_results == 5
+        assert "R. G. Arendt" in query
+        return (
+            "1. Published paper\n"
+            "URL: https://iopscience.iop.org/article/10.3847/2041-8213/ac982a/pdf\n"
+            "Snippet: Work by R.G.A. was supported by NASA under award No. 80GSFC21M0002.\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return the fetched paper text with the award number."""
+        assert "iopscience.iop.org" in url
+        return (
+            "Title: Published paper\n"
+            "URL: https://iopscience.iop.org/article/10.3847/2041-8213/ac982a/pdf\n\n"
+            "Work by R.G.A. was supported by NASA under award No. 80GSFC21M0002."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
+    state = {
+        "question": (
+            "This article links to a paper at the bottom. "
+            "Find this paper. Under what NASA award number was the work performed by R. G. Arendt supported by?"
+        ),
+        "messages": [],
+    }
+
+    result = agent._targeted_article_identifier_fallback(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -1609,7 +1659,7 @@ def test_graph_targeted_fighters_roster_fallback_can_start_from_pacificleague_an
     assert result["final_answer"] == "Yoshida, Uehara"
 
 
-def test_graph_targeted_text_span_fallback_solves_ck12_libretexts_lookup(monkeypatch) -> None:
+def test_graph_text_span_source_fallback_solves_from_ranked_candidate(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
     @tool
@@ -1631,9 +1681,19 @@ def test_graph_targeted_text_span_fallback_solves_ck12_libretexts_lookup(monkeyp
             "as compiled 08/21/2023?"
         ),
         "messages": [],
+        "ranked_candidates": [
+            {
+                "title": "1.E Exercises",
+                "url": "https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01:_Chemistry_in_our_Lives/1.E:_Exercises",
+                "snippet": "license:ck12 author@Marisa Alviar-Agnew author@Henry Agnew",
+                "origin_tool": "web_search",
+                "score": 92,
+                "reasons": ("exercise_page", "expected_domain"),
+            }
+        ],
     }
 
-    result = agent._targeted_text_span_fallback(state)
+    result = agent._text_span_source_fallback(state)
 
     assert result is not None
     assert result["final_answer"] == "Louvrier"
@@ -1641,24 +1701,33 @@ def test_graph_targeted_text_span_fallback_solves_ck12_libretexts_lookup(monkeyp
     assert any("Chabot_College" in url for url, _ in calls)
 
 
-def test_graph_targeted_text_span_fallback_uses_live_chabot_mirror_when_canonical_query_fails(
+def test_graph_text_span_source_fallback_fetches_candidate_page_after_find_miss(
     monkeypatch,
 ) -> None:
-    calls: list[tuple[str, str]] = []
+    calls: list[str] = []
 
     @tool
     def find_text_in_url(url: str, query: str, max_matches: int = 8) -> str:
-        """Return no match for the literal query and succeed on the live mirror fallback."""
+        """Return no match for the direct text lookup."""
         del max_matches
-        calls.append((url, query))
-        if "Chabot_College" in url and query == "horse doctor":
-            return (
-                "During Pasteur's time, anthrax was a widespread and disastrous disease for livestock. "
-                "Around 1876, a horse doctor in eastern France named Louvrier, claimed to have invented a cure for anthrax."
-            )
+        calls.append(f"find:{url}:{query}")
+        if "Chabot_College" in url and query == "equine veterinarian":
+            return "No matches found."
         return "No matches found."
 
-    monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url])
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return the full candidate page so the reducer can recover the answer from page text."""
+        calls.append(f"fetch:{url}")
+        assert "Chabot_College" in url
+        return (
+            "Title: 1.E: Exercises - Chemistry LibreTexts\n"
+            "URL: https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01:_Chemistry_in_our_Lives/1.E:_Exercises\n\n"
+            "During Pasteur's time, anthrax was a widespread and disastrous disease for livestock. "
+            "Around 1876, a horse doctor in eastern France named Louvrier, claimed to have invented a cure for anthrax."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url, fetch_url])
 
     agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
@@ -1668,14 +1737,24 @@ def test_graph_targeted_text_span_fallback_uses_live_chabot_mirror_when_canonica
             "as compiled 08/21/2023?"
         ),
         "messages": [],
+        "ranked_candidates": [
+            {
+                "title": "1.E Exercises",
+                "url": "https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01:_Chemistry_in_our_Lives/1.E:_Exercises",
+                "snippet": "license:ck12 author@Marisa Alviar-Agnew author@Henry Agnew",
+                "origin_tool": "web_search",
+                "score": 92,
+                "reasons": ("exercise_page", "expected_domain"),
+            }
+        ],
     }
 
-    result = agent._targeted_text_span_fallback(state)
+    result = agent._text_span_source_fallback(state)
 
     assert result is not None
     assert result["final_answer"] == "Louvrier"
-    assert "equine veterinarian" in {query for _, query in calls}
-    assert any("Chabot_College" in url and query == "horse doctor" for url, query in calls)
+    assert any(call.endswith(":equine veterinarian") for call in calls if call.startswith("find:"))
+    assert any(call.startswith("fetch:") and "Chabot_College" in call for call in calls)
 
 
 def test_temporal_roster_grounding_ignores_off_scope_dated_roster_pages() -> None:

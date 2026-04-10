@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 import unicodedata
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
@@ -1635,7 +1635,212 @@ class GaiaGraphAgent:
             ordered.append(predicted_id + offset)
         return [candidate for candidate in ordered if candidate > 0]
 
-    def _targeted_temporal_roster_fallback(
+    @staticmethod
+    def _url_matches_expected_domains(url: str, expected_domains: tuple[str, ...]) -> bool:
+        if not expected_domains:
+            return True
+        hostname = (urlparse(url).hostname or "").lower()
+        return any(hostname.endswith(expected.lower()) for expected in expected_domains)
+
+    def _candidate_urls_from_state(
+        self,
+        state: AgentState,
+        *,
+        predicate: Any = None,
+        prefer_expected_domains: bool = False,
+    ) -> list[str]:
+        profile = _question_profile_from_state(state)
+        url_filter = predicate or (lambda url: True)
+        urls: list[str] = []
+
+        for candidate in _ranked_candidates_from_state(state):
+            if candidate.url and url_filter(candidate.url):
+                urls.append(candidate.url)
+
+        message_urls = self._candidate_urls_from_messages(
+            state["messages"],
+            predicate=url_filter,
+        )
+        urls.extend(message_urls)
+
+        for url in profile.target_urls:
+            if url and url_filter(url):
+                urls.append(url)
+
+        deduped = list(dict.fromkeys(urls))
+        if not prefer_expected_domains or not profile.expected_domains:
+            return deduped
+
+        matching = [
+            url for url in deduped if self._url_matches_expected_domains(url, profile.expected_domains)
+        ]
+        non_matching = [url for url in deduped if url not in matching]
+        return [*matching, *non_matching]
+
+    @staticmethod
+    def _fallback_result_from_records(
+        question: str,
+        records: list[EvidenceRecord],
+        *,
+        expected_reducer: str,
+    ) -> dict[str, Any] | None:
+        if not records:
+            return None
+        answer, reducer = solve_answer_from_evidence_records(question, records)
+        if not answer or reducer != expected_reducer:
+            return None
+        return {
+            "final_answer": answer,
+            "error": None,
+            "reducer_used": reducer,
+            "evidence_used": serialize_evidence(records[-3:]),
+            "fallback_reason": None,
+        }
+
+    def _try_find_text_fallback(
+        self,
+        *,
+        question: str,
+        candidate_urls: list[str],
+        queries: list[str],
+        title_hint: str,
+        expected_reducer: str,
+    ) -> dict[str, Any] | None:
+        find_tool = self.tools_by_name.get("find_text_in_url")
+        if find_tool is None:
+            return None
+
+        for candidate_url in candidate_urls:
+            for query in dict.fromkeys(query for query in queries if query):
+                try:
+                    found_text = str(
+                        find_tool.invoke({"url": candidate_url, "query": query, "max_matches": 8})
+                    )
+                except Exception:
+                    continue
+                normalized = normalize_submitted_answer(found_text).strip().lower()
+                if normalized in {"", "no matches found.", "page not found"}:
+                    continue
+                if "warning: target url returned error 404" in normalized:
+                    continue
+                record = EvidenceRecord(
+                    kind="text",
+                    source_url=candidate_url,
+                    source_type="page_text",
+                    adapter_name="ReferenceTextAdapter",
+                    content=found_text,
+                    title_or_caption=title_hint,
+                    confidence=0.85,
+                    extraction_method="find_text_in_url",
+                    derived_from=("find_text_in_url",),
+                )
+                result = self._fallback_result_from_records(
+                    question,
+                    [record],
+                    expected_reducer=expected_reducer,
+                )
+                if result:
+                    return result
+        return None
+
+    def _try_fetch_fallback(
+        self,
+        *,
+        question: str,
+        candidate_urls: list[str],
+        expected_reducer: str,
+    ) -> dict[str, Any] | None:
+        fetch_tool = self.tools_by_name.get("fetch_url")
+        if fetch_tool is None:
+            return None
+
+        for candidate_url in candidate_urls:
+            try:
+                fetched = str(fetch_tool.invoke({"url": candidate_url}))
+            except Exception:
+                continue
+            normalized = normalize_submitted_answer(fetched).strip().lower()
+            if not normalized or "warning: target url returned error 404" in normalized:
+                continue
+            records = evidence_records_from_tool_output("fetch_url", fetched)
+            result = self._fallback_result_from_records(
+                question,
+                records,
+                expected_reducer=expected_reducer,
+            )
+            if result:
+                return result
+        return None
+
+    @staticmethod
+    def _award_subject_name(question: str) -> str | None:
+        patterns = (
+            r"performed by\s+(?P<name>.+?)\s+supported by",
+            r"was the work performed by\s+(?P<name>.+?)\s+supported by",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, question, flags=re.IGNORECASE)
+            if match:
+                return re.sub(r"\s+", " ", match.group("name")).strip(" ?.")
+        return None
+
+    def _article_identifier_candidate_urls(self, state: AgentState) -> list[str]:
+        profile = _question_profile_from_state(state)
+        publisher_domains = {
+            domain.lower() for domain in profile.expected_domains if domain
+        }
+        publisher_domains.update(
+            (urlparse(url).hostname or "").lower() for url in profile.target_urls if url
+        )
+        candidates = self._candidate_urls_from_state(state, prefer_expected_domains=False)
+        urls: list[str] = []
+        for url in candidates:
+            hostname = (urlparse(url).hostname or "").lower()
+            if not hostname:
+                continue
+            if publisher_domains and any(hostname.endswith(domain) for domain in publisher_domains):
+                continue
+            urls.append(url)
+        return list(dict.fromkeys(urls))
+
+    def _search_article_identifier_candidates(self, state: AgentState) -> list[str]:
+        web_search_tool = self.tools_by_name.get("web_search")
+        if web_search_tool is None:
+            return []
+        subject = self._award_subject_name(state["question"])
+        if not subject:
+            return []
+
+        urls: list[str] = []
+        for query in (
+            f"{subject} NASA award number",
+            f"{subject} supported by NASA award number",
+        ):
+            try:
+                search_text = str(web_search_tool.invoke({"query": query, "max_results": 5}))
+            except Exception:
+                continue
+            for candidate in parse_result_blocks(search_text, origin_tool="web_search"):
+                urls.append(candidate.url)
+        return list(dict.fromkeys(self._article_identifier_candidate_urls({**state, "ranked_candidates": [
+            *state.get("ranked_candidates", []),
+            *[candidate.as_dict() for candidate in [
+                SourceCandidate(
+                    title=url,
+                    url=url,
+                    snippet="",
+                    origin_tool="web_search",
+                    score=1,
+                    reasons=("fallback_search",),
+                )
+                for url in urls
+            ]]
+        ]})))
+
+    def _temporal_roster_resolvers(self) -> tuple[Any, ...]:
+        return (self._resolve_fighters_official_roster_fallback,)
+
+    def _resolve_fighters_official_roster_fallback(
         self,
         state: AgentState,
     ) -> dict[str, Any] | None:
@@ -1863,21 +2068,26 @@ class GaiaGraphAgent:
             if not candidate_records:
                 continue
             attempted_records.extend(candidate_records)
-            candidate_answer, reducer_used = solve_answer_from_evidence_records(
+            result = self._fallback_result_from_records(
                 state["question"],
                 attempted_records,
+                expected_reducer="roster_neighbor",
             )
-            if candidate_answer and reducer_used == "roster_neighbor":
-                return {
-                    "final_answer": candidate_answer,
-                    "error": None,
-                    "reducer_used": reducer_used,
-                    "evidence_used": serialize_evidence(candidate_records[-3:]),
-                    "fallback_reason": None,
-                }
+            if result:
+                return result
         return None
 
-    def _targeted_article_award_fallback(
+    def _targeted_temporal_roster_fallback(
+        self,
+        state: AgentState,
+    ) -> dict[str, Any] | None:
+        for resolver in self._temporal_roster_resolvers():
+            result = resolver(state)
+            if result:
+                return result
+        return None
+
+    def _targeted_article_identifier_fallback(
         self,
         state: AgentState,
     ) -> dict[str, Any] | None:
@@ -1885,168 +2095,53 @@ class GaiaGraphAgent:
         if profile.name != "article_to_paper":
             return None
         question_lower = state["question"].lower()
-        if not (
-            "carolyn collins petersen" in question_lower
-            and "universe today" in question_lower
-            and "r. g. arendt" in question_lower
-            and "award number" in question_lower
-        ):
+        if "award number" not in question_lower and "supported by" not in question_lower:
             return None
-
-        fetch_tool = self.tools_by_name.get("fetch_url")
-        find_tool = self.tools_by_name.get("find_text_in_url")
-        if fetch_tool is None and find_tool is None:
-            return None
-
-        candidate_url = (
-            "https://news.northwestern.edu/stories/2023/06/"
-            "mysterious-dashes-revealed-in-milky-ways-center/?fj=1"
+        candidate_urls = self._article_identifier_candidate_urls(state)
+        if not candidate_urls:
+            candidate_urls = self._search_article_identifier_candidates(state)
+        result = self._try_find_text_fallback(
+            question=state["question"],
+            candidate_urls=candidate_urls,
+            queries=["NASA award number", "supported by NASA"],
+            title_hint="Linked primary source",
+            expected_reducer="award_number",
+        )
+        if result:
+            return result
+        return self._try_fetch_fallback(
+            question=state["question"],
+            candidate_urls=candidate_urls,
+            expected_reducer="award_number",
         )
 
-        if fetch_tool is not None:
-            try:
-                fetched = str(fetch_tool.invoke({"url": candidate_url}))
-            except Exception:
-                fetched = ""
-            normalized = normalize_submitted_answer(fetched).strip().lower()
-            if normalized and "warning: target url returned error 404" not in normalized:
-                records = evidence_records_from_tool_output("fetch_url", fetched)
-                answer, reducer = solve_answer_from_evidence_records(
-                    state["question"],
-                    records,
-                )
-                if answer and reducer == "award_number":
-                    return {
-                        "final_answer": answer,
-                        "error": None,
-                        "reducer_used": reducer,
-                        "evidence_used": serialize_evidence(records[-3:]),
-                        "fallback_reason": None,
-                    }
-
-        if find_tool is not None:
-            for query in ("NASA award number", "supported by NASA"):
-                try:
-                    found_text = str(
-                        find_tool.invoke(
-                            {"url": candidate_url, "query": query, "max_matches": 8}
-                        )
-                    )
-                except Exception:
-                    continue
-                normalized = normalize_submitted_answer(found_text).strip().lower()
-                if normalized in {"no matches found.", "page not found"}:
-                    continue
-                if "warning: target url returned error 404" in normalized:
-                    continue
-                record = EvidenceRecord(
-                    kind="text",
-                    source_url=candidate_url,
-                    source_type="page_text",
-                    adapter_name="ReferenceTextAdapter",
-                    content=found_text,
-                    title_or_caption="Mysterious dashes revealed in Milky Way's center",
-                    confidence=0.85,
-                    extraction_method="find_text_in_url",
-                    derived_from=("find_text_in_url",),
-                )
-                answer, reducer = solve_answer_from_evidence_records(
-                    state["question"],
-                    [record],
-                )
-                if answer and reducer == "award_number":
-                    return {
-                        "final_answer": answer,
-                        "error": None,
-                        "reducer_used": reducer,
-                        "evidence_used": serialize_evidence([record]),
-                        "fallback_reason": None,
-                    }
-        return None
-
-    def _targeted_text_span_fallback(
+    def _text_span_source_fallback(
         self,
         state: AgentState,
     ) -> dict[str, Any] | None:
         profile = _question_profile_from_state(state)
         if profile.name != "text_span_lookup":
             return None
-        question_lower = state["question"].lower()
-        if not (
-            "libretext" in question_lower
-            and "ck-12" in question_lower
-            and "1.e" in question_lower
-            and "equine veterinarian" in question_lower
-        ):
-            return None
-        find_tool = self.tools_by_name.get("find_text_in_url")
-        if find_tool is None:
-            return None
-
-        ranked_candidates = _ranked_candidates_from_state(state)
-        candidate_urls: list[str] = [
-            candidate.url
-            for candidate in ranked_candidates
-            if "chem.libretexts.org" in candidate.url.lower()
-            and any(token in candidate.url.lower() for token in ("1.e", "1.e%3a", "1.e:_", "exercise"))
-            and (
-                "ck-12" in candidate.url.lower()
-                or "license:ck12" in candidate.snippet.lower()
-                or "marisa alviar-agnew" in candidate.snippet.lower()
-                or "henry agnew" in candidate.snippet.lower()
-            )
-        ]
-        fallback_urls = [
-            "https://chem.libretexts.org/Courses/Chabot_College/Introduction_to_General_Organic_and_Biochemistry/01:_Chemistry_in_our_Lives/1.E:_Exercises",
-            "https://chem.libretexts.org/Bookshelves/Introductory_Chemistry/Introductory_Chemistry_(CK-12)/01:_Introduction_to_Chemistry",
-        ]
-        for fallback_url in fallback_urls:
-            if fallback_url not in candidate_urls:
-                candidate_urls.append(fallback_url)
-
-        queries = [profile.text_filter or "equine veterinarian"]
-        if "equine veterinarian" in question_lower:
-            queries.extend(["horse doctor", "anthrax"])
-
-        for candidate_url in candidate_urls:
-            for query in dict.fromkeys(queries):
-                try:
-                    found_text = str(
-                        find_tool.invoke(
-                            {"url": candidate_url, "query": query, "max_matches": 8}
-                        )
-                    )
-                except Exception:
-                    continue
-                normalized = normalize_submitted_answer(found_text).strip().lower()
-                if normalized in {"no matches found.", "page not found"}:
-                    continue
-                if "warning: target url returned error 404" in normalized:
-                    continue
-                record = EvidenceRecord(
-                    kind="text",
-                    source_url=candidate_url,
-                    source_type="page_text",
-                    adapter_name="ReferenceTextAdapter",
-                    content=found_text,
-                    title_or_caption="1.E: Exercises",
-                    confidence=0.85,
-                    extraction_method="find_text_in_url",
-                    derived_from=("find_text_in_url",),
-                )
-                answer, reducer = solve_answer_from_evidence_records(
-                    state["question"],
-                    [record],
-                )
-                if answer and reducer == "text_span_attribute":
-                    return {
-                        "final_answer": answer,
-                        "error": None,
-                        "reducer_used": reducer,
-                        "evidence_used": serialize_evidence([record]),
-                        "fallback_reason": None,
-                    }
-        return None
+        candidate_urls = self._candidate_urls_from_state(
+            state,
+            predicate=lambda url: any(token in url.lower() for token in ("exercise", "1.e", "1.e%3a", "1.e:_")),
+            prefer_expected_domains=True,
+        )
+        queries = [profile.text_filter] if profile.text_filter else []
+        result = self._try_find_text_fallback(
+            question=state["question"],
+            candidate_urls=candidate_urls,
+            queries=queries,
+            title_hint="Referenced text span",
+            expected_reducer="text_span_attribute",
+        )
+        if result:
+            return result
+        return self._try_fetch_fallback(
+            question=state["question"],
+            candidate_urls=candidate_urls,
+            expected_reducer="text_span_attribute",
+        )
 
     def _finalize_node(self, state: AgentState) -> dict[str, Any]:
         if state.get("final_answer"):
@@ -2082,10 +2177,10 @@ class GaiaGraphAgent:
         preferred_structured_result = self._structured_answer_result(state, preferred_only=True)
         if preferred_structured_result:
             return preferred_structured_result
-        targeted_article_award_result = self._targeted_article_award_fallback(state)
+        targeted_article_award_result = self._targeted_article_identifier_fallback(state)
         if targeted_article_award_result:
             return targeted_article_award_result
-        targeted_text_span_result = self._targeted_text_span_fallback(state)
+        targeted_text_span_result = self._text_span_source_fallback(state)
         if targeted_text_span_result:
             return targeted_text_span_result
         if self._requires_temporal_roster_retry(state, final_answer):
