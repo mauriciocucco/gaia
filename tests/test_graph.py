@@ -2174,6 +2174,102 @@ def test_graph_entity_role_chain_fallback_overrides_ungrounded_final_answer(
     )
 
 
+def test_graph_entity_role_chain_fallback_searches_past_weak_raymond_candidates(
+    monkeypatch,
+) -> None:
+    search_queries: list[str] = []
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return strong two-hop candidates only after targeted fallback searches."""
+        assert max_results == 5
+        search_queries.append(query)
+        return (
+            "1. BartÅ‚omiej Kasprzykowski\n"
+            "URL: https://en.wikipedia.org/wiki/Bart%C5%82omiej_Kasprzykowski\n"
+            "Snippet: Polish actor who played Roman in Wszyscy kochajÄ… Romana.\n\n"
+            "2. Magda M. cast list\n"
+            "URL: https://en.wikipedia.org/wiki/Magda_M.\n"
+            "Snippet: cast and characters from Magda M.\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return fetched pages with enough evidence to resolve the role chain."""
+        if url == "https://en.wikipedia.org/wiki/Bart%C5%82omiej_Kasprzykowski":
+            return (
+                "Title: BartÅ‚omiej Kasprzykowski\n"
+                "URL: https://en.wikipedia.org/wiki/Bart%C5%82omiej_Kasprzykowski\n\n"
+                "BartÅ‚omiej Kasprzykowski starred as Roman in Wszyscy kochajÄ… Romana, "
+                "the Polish-language version of Everybody Loves Raymond."
+            )
+        if url == "https://en.wikipedia.org/wiki/Magda_M.":
+            return (
+                "Title: Magda M.\n"
+                "URL: https://en.wikipedia.org/wiki/Magda_M.\n\n"
+                "Cast\n"
+                "Wojciech PÅ‚aska - BartÅ‚omiej Kasprzykowski\n"
+            )
+        raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModelForEntityRoleChainFallback(), max_iterations=1)
+    state = {
+        "question": (
+            "Who did the actor who played Ray in the Polish-language version of Everybody Loves Raymond play in Magda M.? "
+            "Give only the first name."
+        ),
+        "messages": [],
+        "tool_trace": [],
+        "decision_trace": [],
+        "ranked_candidates": [
+            {
+                "title": "Everybody Loves Raymond",
+                "url": "https://en.wikipedia.org/wiki/Everybody_Loves_Raymond",
+                "snippet": "American sitcom",
+                "origin_tool": "web_search",
+                "score": 90,
+                "reasons": ("expected_domain",),
+            },
+            {
+                "title": "Magda M.",
+                "url": "https://en.wikipedia.org/wiki/Magda_M.",
+                "snippet": "Polish drama series",
+                "origin_tool": "web_search",
+                "score": 89,
+                "reasons": ("expected_domain",),
+            }
+        ],
+        "question_profile": {
+            "name": "entity_role_chain",
+            "target_urls": (),
+            "expected_domains": ("wikipedia.org",),
+            "preferred_tools": ("web_search", "fetch_url", "find_text_in_url"),
+            "expected_date": None,
+            "expected_author": None,
+            "subject_name": None,
+            "text_filter": "cast character",
+        },
+    }
+
+    result = agent._entity_role_chain_source_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "Wojciech"
+    assert result["reducer_used"] == "entity_role_chain"
+    assert any("Magda M." in query for query in search_queries)
+    assert any("Bartlomiej Kasprzykowski" in query or "Wszyscy kochaja Romana" in query for query in search_queries)
+    assert any(
+        item.startswith("fetch_url(") and "Bart%C5%82omiej_Kasprzykowski" in item
+        for item in result["tool_trace"]
+    )
+    assert any(
+        item.startswith("fetch_url(") and "Magda_M." in item
+        for item in result["tool_trace"]
+    )
+
+
 def test_temporal_roster_grounding_ignores_off_scope_dated_roster_pages() -> None:
     state = {
         "question": (

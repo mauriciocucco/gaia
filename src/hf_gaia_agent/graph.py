@@ -2239,6 +2239,17 @@ class GaiaGraphAgent:
             return None
 
         tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
+        role_chain_tokens = ("magda", "romana", "kasprzykowski", "wszyscy")
+        actor_side_tokens = ("romana", "kasprzykowski", "wszyscy")
+
+        def _has_role_chain_coverage(urls: list[str]) -> bool:
+            has_actor_side = any(
+                any(token in unquote(url).lower() for token in actor_side_tokens)
+                for url in urls
+            )
+            has_magda_side = any("magda" in unquote(url).lower() for url in urls)
+            return has_actor_side and has_magda_side
+
         likely_urls = self._candidate_urls_from_state(
             {
                 **state,
@@ -2246,13 +2257,15 @@ class GaiaGraphAgent:
             },
             predicate=lambda url: any(
                 token in unquote(url).lower()
-                for token in ("magda", "raymond", "romana", "kasprzykowski", "wszyscy")
+                for token in role_chain_tokens
             ),
             prefer_expected_domains=True,
         )
-        if not likely_urls:
+        if not _has_role_chain_coverage(likely_urls):
             for query in (
                 "actor who played Ray in Polish Everybody Loves Raymond",
+                "Wszyscy kochaja Romana Ray actor",
+                "Bartlomiej Kasprzykowski Magda M. character",
                 "actor who played Ray in Polish Everybody Loves Raymond Magda M. character",
                 "Magda M. cast character",
             ):
@@ -2271,7 +2284,7 @@ class GaiaGraphAgent:
                 },
                 predicate=lambda url: any(
                     token in unquote(url).lower()
-                    for token in ("magda", "raymond", "romana", "kasprzykowski", "wszyscy")
+                    for token in role_chain_tokens
                 ),
                 prefer_expected_domains=True,
             )
