@@ -52,6 +52,39 @@ def test_solve_answer_from_evidence_records_ignores_non_identifier_award_support
     assert reducer is None
 
 
+def test_solve_answer_from_evidence_records_prefers_subject_matched_award_number() -> None:
+    question = "Under what NASA award number was the work performed by R. G. Arendt supported by?"
+    records = [
+        EvidenceRecord(
+            kind="links",
+            source_url="https://ntrs.nasa.gov/api/citations/20260001362/downloads/chorus2024.csv",
+            source_type="url_list",
+            adapter_name="GenericWebAdapter",
+            content="... award No. 80NSSC19K1106; Parker Solar Probe contract SV4-84017",
+            title_or_caption="chorus2024.csv - NASA",
+            confidence=0.45,
+            extraction_method="web_search",
+            derived_from=("web_search",),
+        ),
+        EvidenceRecord(
+            kind="links",
+            source_url="https://iopscience.iop.org/article/10.3847/2041-8213/ac982a/pdf",
+            source_type="url_list",
+            adapter_name="GenericWebAdapter",
+            content="Work by R.G.A. was supported by NASA under award No. 80GSFC21M0002.",
+            title_or_caption="Published paper pdf",
+            confidence=0.45,
+            extraction_method="web_search",
+            derived_from=("web_search",),
+        ),
+    ]
+
+    answer, reducer = solve_answer_from_evidence_records(question, records)
+
+    assert answer == "80GSFC21M0002"
+    assert reducer == "award_number"
+
+
 def test_solve_answer_from_evidence_records_filters_temporal_rows() -> None:
     question = (
         "What is the first name of the only Malko Competition recipient from the 20th Century (after 1977) "

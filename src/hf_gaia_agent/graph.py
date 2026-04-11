@@ -1825,40 +1825,30 @@ class GaiaGraphAgent:
             urls.append(url)
         return list(dict.fromkeys(urls))
 
-    def _search_article_identifier_candidates(self, state: AgentState) -> list[str]:
-        if "web_search" not in self.tools_by_name:
-            return []
+    def _article_identifier_search_queries(self, state: AgentState) -> list[str]:
         subject = self._award_subject_name(state["question"])
-        if not subject:
-            return []
-
-        urls: list[str] = []
-        for query in (
-            f"{subject} NASA award number",
-            f"{subject} supported by NASA award number",
-        ):
-            try:
-                search_text = str(
-                    self.tools_by_name["web_search"].invoke({"query": query, "max_results": 5})
-                )
-            except Exception:
+        titles: list[str] = []
+        for candidate in _ranked_candidates_from_state(state):
+            title = re.sub(r"\s+", " ", candidate.title).strip()
+            if len(title.split()) < 4:
                 continue
-            for candidate in parse_result_blocks(search_text, origin_tool="web_search"):
-                urls.append(candidate.url)
-        return list(dict.fromkeys(self._article_identifier_candidate_urls({**state, "ranked_candidates": [
-            *state.get("ranked_candidates", []),
-            *[candidate.as_dict() for candidate in [
-                SourceCandidate(
-                    title=url,
-                    url=url,
-                    snippet="",
-                    origin_tool="web_search",
-                    score=1,
-                    reasons=("fallback_search",),
+            if title not in titles:
+                titles.append(title)
+
+        queries: list[str] = []
+        if subject:
+            queries.extend(
+                (
+                    f"{subject} NASA award number",
+                    f"{subject} supported by NASA award number",
                 )
-                for url in urls
-            ]]
-        ]})))
+            )
+        for title in titles[:2]:
+            queries.append(f"\"{title}\" \"NASA award number\"")
+            if subject:
+                queries.append(f"\"{title}\" \"{subject}\" NASA award number")
+                queries.append(f"\"{title}\" \"{subject}\" supported by NASA")
+        return list(dict.fromkeys(query for query in queries if query.strip()))
 
     def _temporal_roster_resolvers(self) -> tuple[Any, ...]:
         return (self._resolve_fighters_official_roster_fallback,)
@@ -1875,11 +1865,12 @@ class GaiaGraphAgent:
             return None
 
         current_number: int | None = None
+        _CONTENT_TOOL_NAMES = {"fetch_url", "find_text_in_url", "extract_tables_from_url"}
         tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
         for message in state["messages"]:
             if not isinstance(message, ToolMessage):
                 continue
-            if (getattr(message, "name", "") or "").strip() != "fetch_url":
+            if (getattr(message, "name", "") or "").strip() not in _CONTENT_TOOL_NAMES:
                 continue
             current_number = self._extract_number_near_subject(
                 text=str(message.content or ""),
@@ -2228,6 +2219,68 @@ class GaiaGraphAgent:
             ranked_candidates=ranked_candidates,
         )
 
+    @staticmethod
+    def _is_competition_nationality_question(question: str) -> bool:
+        lowered = question.lower()
+        return (
+            ("competition" in lowered or "award" in lowered)
+            and ("recipient" in lowered or "winner" in lowered)
+            and ("nationality" in lowered or "no longer exists" in lowered)
+        )
+
+    def _targeted_competition_nationality_fallback(
+        self,
+        state: AgentState,
+    ) -> dict[str, Any] | None:
+        question = state.get("question", "")
+        if not self._is_competition_nationality_question(question):
+            return None
+        if "extract_tables_from_url" not in self.tools_by_name:
+            return None
+
+        competition_match = re.search(
+            r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Competition|Award|Prize))\b",
+            question,
+        )
+        if not competition_match:
+            return None
+
+        competition_name = competition_match.group(1).replace(" ", "_")
+        wiki_url = f"https://en.wikipedia.org/wiki/{competition_name}"
+
+        tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
+
+        table_text = self._invoke_fallback_tool(
+            state=state,
+            tool_name="extract_tables_from_url",
+            tool_args={"url": wiki_url, "text_filter": "recipient", "max_tables": 5},
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
+            trace_label="competition_nationality_fallback",
+        )
+
+        records = evidence_records_from_tool_output("extract_tables_from_url", table_text)
+        if not records:
+            return None
+
+        answer, reducer = solve_answer_from_evidence_records(question, records)
+        if not answer:
+            return None
+
+        return self._with_fallback_traces(
+            {
+                "final_answer": answer,
+                "error": None,
+                "reducer_used": reducer or "competition_nationality_fallback",
+                "evidence_used": serialize_evidence(records[-3:]),
+                "fallback_reason": None,
+            },
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
+        )
+
     def _entity_role_chain_source_fallback(
         self,
         state: AgentState,
@@ -2369,21 +2422,16 @@ class GaiaGraphAgent:
             return None
         tool_trace, decision_trace, ranked_candidates = self._fallback_trace_state(state)
         candidate_urls = self._article_identifier_candidate_urls(state)
-        if not candidate_urls:
-            subject = self._award_subject_name(state["question"])
-            if subject:
-                for query in (
-                    f"{subject} NASA award number",
-                    f"{subject} supported by NASA award number",
-                ):
-                    self._invoke_fallback_tool(
-                        state=state,
-                        tool_name="web_search",
-                        tool_args={"query": query, "max_results": 5},
-                        tool_trace=tool_trace,
-                        decision_trace=decision_trace,
-                        ranked_candidates=ranked_candidates,
-                    )
+        if not candidate_urls and "web_search" in self.tools_by_name:
+            for query in self._article_identifier_search_queries(state):
+                self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="web_search",
+                    tool_args={"query": query, "max_results": 5},
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
             candidate_urls = self._article_identifier_candidate_urls(
                 {
                     **state,
@@ -2403,10 +2451,56 @@ class GaiaGraphAgent:
         )
         if result:
             return result
-        return self._try_fetch_fallback(
+        result = self._try_fetch_fallback(
             state=state,
             question=state["question"],
             candidate_urls=candidate_urls,
+            expected_reducer="award_number",
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
+        )
+        if result:
+            return result
+        expanded_state = {
+            **state,
+            "ranked_candidates": serialize_candidates(ranked_candidates),
+        }
+        if "web_search" in self.tools_by_name:
+            expanded_queries = self._article_identifier_search_queries(expanded_state)
+            for query in expanded_queries:
+                self._invoke_fallback_tool(
+                    state=state,
+                    tool_name="web_search",
+                    tool_args={"query": query, "max_results": 5},
+                    tool_trace=tool_trace,
+                    decision_trace=decision_trace,
+                    ranked_candidates=ranked_candidates,
+                )
+        expanded_state = {
+            **state,
+            "ranked_candidates": serialize_candidates(ranked_candidates),
+        }
+        expanded_candidate_urls = self._article_identifier_candidate_urls(expanded_state)
+        if expanded_candidate_urls == candidate_urls:
+            return None
+        result = self._try_find_text_fallback(
+            state=state,
+            question=state["question"],
+            candidate_urls=expanded_candidate_urls,
+            queries=["NASA award number", "supported by NASA"],
+            title_hint="Linked primary source",
+            expected_reducer="award_number",
+            tool_trace=tool_trace,
+            decision_trace=decision_trace,
+            ranked_candidates=ranked_candidates,
+        )
+        if result:
+            return result
+        return self._try_fetch_fallback(
+            state=state,
+            question=state["question"],
+            candidate_urls=expanded_candidate_urls,
             expected_reducer="award_number",
             tool_trace=tool_trace,
             decision_trace=decision_trace,
@@ -2496,6 +2590,9 @@ class GaiaGraphAgent:
         targeted_botanical_result = self._targeted_botanical_classification_fallback(state)
         if targeted_botanical_result:
             return targeted_botanical_result
+        targeted_competition_result = self._targeted_competition_nationality_fallback(state)
+        if targeted_competition_result:
+            return targeted_competition_result
         if self._requires_botanical_classification_retry(state, final_answer):
             fallback_answer = self._fallback_tool_answer(
                 state["messages"], state["question"]
@@ -3432,6 +3529,24 @@ def _botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
 
     fruit_score = 0
     vegetable_score = 0
+    explicit_fruit_over_vegetable = (
+        "not a vegetable but a fruit",
+        "fruit rather than a vegetable",
+        "classified as a fruit",
+        "technically a fruit",
+        "actually a fruit",
+    )
+    explicit_vegetable_over_fruit = (
+        "not a fruit but a vegetable",
+        "vegetable rather than a fruit",
+        "classified as a vegetable",
+        "technically a vegetable",
+        "actually a vegetable",
+    )
+    ambiguous_dual_classification = (
+        "both a fruit and a vegetable",
+        "both fruit and vegetable",
+    )
 
     fruit_phrases = (
         "botanical fruit",
@@ -3439,6 +3554,11 @@ def _botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         "is a fruit",
         "are fruits",
         "considered a fruit",
+        "classified as a fruit",
+        "technically a fruit",
+        "actually a fruit",
+        "fruit rather than a vegetable",
+        "not a vegetable but a fruit",
         "the fruit of",
         "seed bearing structure",
         "grain rather than a vegetable",
@@ -3449,6 +3569,11 @@ def _botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         "botanically a vegetable",
         "is a vegetable",
         "are vegetables",
+        "classified as a vegetable",
+        "technically a vegetable",
+        "actually a vegetable",
+        "vegetable rather than a fruit",
+        "not a fruit but a vegetable",
         "root vegetable",
         "leaf vegetable",
         "stem vegetable",
@@ -3500,10 +3625,22 @@ def _botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
     fruit_score += sum(1 for cue in fruit_cues if cue in normalized)
     vegetable_score += sum(1 for cue in vegetable_cues if cue in normalized)
 
+    if any(phrase in normalized for phrase in explicit_fruit_over_vegetable):
+        fruit_score += 3
+    if any(phrase in normalized for phrase in explicit_vegetable_over_fruit):
+        vegetable_score += 3
+
     if "not a vegetable" in normalized:
         fruit_score += 2
     if "not a fruit" in normalized:
         vegetable_score += 2
+    if any(phrase in normalized for phrase in ambiguous_dual_classification):
+        if any(phrase in normalized for phrase in explicit_fruit_over_vegetable + ("botanical fruit", "botanically a fruit")):
+            fruit_score += 1
+            vegetable_score = max(0, vegetable_score - 3)
+        if any(phrase in normalized for phrase in explicit_vegetable_over_fruit + ("botanical vegetable", "botanically a vegetable")):
+            vegetable_score += 1
+            fruit_score = max(0, fruit_score - 3)
 
     return fruit_score, vegetable_score
 

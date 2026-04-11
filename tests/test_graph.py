@@ -938,6 +938,82 @@ def test_graph_article_identifier_fallback_searches_by_supported_subject(monkeyp
     assert result["reducer_used"] == "award_number"
 
 
+def test_graph_article_identifier_fallback_searches_by_exact_paper_title_when_primary_source_is_blocked(
+    monkeypatch,
+) -> None:
+    search_queries: list[str] = []
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return an external metadata page when searching by the exact linked paper title."""
+        assert max_results == 5
+        search_queries.append(query)
+        if "Population of the Galactic Center Filaments" in query and "R. G. Arendt" in query:
+            return (
+                "1. Northwestern Scholars publication\n"
+                "URL: https://arch.library.northwestern.edu/concern/publications/gx41mm28v\n"
+                "Snippet: Work by R.G.A. was supported by NASA under award No. 80GSFC21M0002.\n"
+            )
+        return "No results found."
+
+    @tool
+    def find_text_in_url(url: str, query: str, max_matches: int = 1) -> str:
+        """Fail direct text extraction for the blocked paper page."""
+        assert max_matches == 1
+        assert query in {"NASA award number", "supported by NASA"}
+        return "No matches found."
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return captcha text for the paper, and grounded funding text for the external metadata page."""
+        if "iopscience.iop.org" in url:
+            return (
+                "Title: Radware Bot Manager Captcha\n"
+                "URL: https://validate.perfdrive.com/example\n\n"
+                "Access blocked by captcha."
+            )
+        assert "arch.library.northwestern.edu" in url
+        return (
+            "Title: Northwestern Scholars publication\n"
+            "URL: https://arch.library.northwestern.edu/concern/publications/gx41mm28v\n\n"
+            "Work by R.G.A. was supported by NASA under award No. 80GSFC21M0002."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, find_text_in_url, fetch_url])
+
+    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
+    state = {
+        "question": (
+            "This article links to a paper at the bottom. "
+            "Find this paper. Under what NASA award number was the work performed by R. G. Arendt supported by?"
+        ),
+        "messages": [],
+        "ranked_candidates": [
+            {
+                "title": (
+                    "The Population of the Galactic Center Filaments: Position Angle Distribution "
+                    "Reveals a Degree-scale Collimated Outflow from Sgr A* along the Galactic Plane"
+                ),
+                "url": "https://iopscience.iop.org/article/10.3847/2041-8213/acd54b",
+                "snippet": "Published paper in The Astrophysical Journal Letters",
+                "origin_tool": "extract_links_from_url",
+                "score": 95,
+                "reasons": ("linked_source", "primary_source_hint"),
+            }
+        ],
+    }
+
+    result = agent._targeted_article_identifier_fallback(state)
+
+    assert result is not None
+    assert result["final_answer"] == "80GSFC21M0002"
+    assert result["reducer_used"] == "award_number"
+    assert any(
+        "Population of the Galactic Center Filaments" in query and "R. G. Arendt" in query
+        for query in search_queries
+    )
+
+
 def test_graph_expands_city_abbreviations_when_question_forbids_abbreviations() -> None:
     agent = GaiaGraphAgent(model=FakeModelSingleAnswer("[ANSWER]St. Petersburg[/ANSWER]"), max_iterations=1)
     result = agent.solve(
@@ -1340,6 +1416,70 @@ def test_graph_botanical_fallback_ignores_low_signal_fruit_metadata_pages(monkey
                 "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
                 "to categorizing things. Here's the list I have so far:\n\n"
                 "broccoli, plums, sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "broccoli, sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+
+
+def test_graph_botanical_fallback_ignores_ambiguous_culinary_zucchini_page(monkeypatch) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return one source candidate per botanical query."""
+        assert max_results == 5
+        url_map = {
+            "broccoli botanical fruit or vegetable": "https://example.com/broccoli",
+            "broccoli botany fruit vegetable": "https://example.com/broccoli",
+            "sweet potatoes botanical fruit or vegetable": "https://example.com/sweet-potato",
+            "sweet potatoes botany fruit vegetable": "https://example.com/sweet-potato",
+            "zucchini botanical fruit or vegetable": "https://example.com/zucchini-ambiguous",
+            "zucchini botany fruit vegetable": "https://example.com/zucchini-ambiguous",
+        }
+        url = url_map.get(query, "https://example.com/unknown")
+        return f"1. Source\nURL: {url}\nSnippet: botanical classification for {query}"
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return fetched botanical classification text."""
+        payloads = {
+            "https://example.com/broccoli": (
+                "Title: Broccoli\nURL: https://example.com/broccoli\n\n"
+                "Broccoli is eaten for its flowering head and stalk."
+            ),
+            "https://example.com/sweet-potato": (
+                "Title: Sweet potato\nURL: https://example.com/sweet-potato\n\n"
+                "Sweet potato is an edible root vegetable."
+            ),
+            "https://example.com/zucchini-ambiguous": (
+                "Title: Zucchini: fruit or vegetable?\n"
+                "URL: https://example.com/zucchini-ambiguous\n\n"
+                "Did you know that zucchini is not a vegetable but a fruit? "
+                "Vegetables can be roots, tubers, leaves, stems, flowers, or even fruits such as tomatoes or zucchini. "
+                "So here is the answer: zucchini is both a fruit and a vegetable."
+            ),
+        }
+        return payloads.get(
+            url,
+            f"Title: Unknown\nURL: {url}\n\nThis page does not contain a relevant botanical classification.",
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Broccoli, Sweet potatoes, Zucchini[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-fallback-ambiguous-zucchini",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "broccoli, sweet potatoes, zucchini\n\n"
                 "Please alphabetize the vegetables and place each item in a comma separated list."
             ),
             file_name=None,
