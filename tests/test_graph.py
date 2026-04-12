@@ -1571,6 +1571,62 @@ def test_graph_botanical_fallback_skips_social_noise_when_strong_source_is_prese
     )
 
 
+def test_graph_botanical_fallback_recognizes_explicit_vegetable_title_metadata(
+    monkeypatch,
+) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return basil sources with explicit vegetable labeling in the page title."""
+        assert max_results == 5
+        url_map = {
+            "fresh basil botanical fruit or vegetable": "https://example.com/basil-umass",
+            "fresh basil botany fruit vegetable": "https://example.com/basil-umass",
+            "broccoli botanical fruit or vegetable": "https://example.com/broccoli",
+            "broccoli botany fruit vegetable": "https://example.com/broccoli",
+        }
+        url = url_map.get(query, "https://example.com/unknown")
+        return f"1. Source\nURL: {url}\nSnippet: botanical classification for {query}"
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return source text that labels basil as a vegetable in title metadata."""
+        payloads = {
+            "https://example.com/basil-umass": (
+                "Kind: page_text\n"
+                "URL: https://example.com/basil-umass\n\n"
+                "Title: Basil : Vegetable : Center for Agriculture, Food, and the Environment\n\n"
+                "# Basil : Vegetable : Center for Agriculture, Food, and the Environment"
+            ),
+            "https://example.com/broccoli": (
+                "Title: Broccoli\nURL: https://example.com/broccoli\n\n"
+                "Broccoli is eaten for its flowering head and stalk."
+            ),
+        }
+        return payloads[url]
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Broccoli, Fresh basil[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-basil-title-metadata",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "fresh basil, broccoli\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "broccoli, fresh basil"
+    assert result["reducer_used"] == "botanical_classification"
+
+
 def test_graph_botanical_fallback_ignores_ambiguous_culinary_zucchini_page(monkeypatch) -> None:
     @tool
     def web_search(query: str, max_results: int = 5) -> str:

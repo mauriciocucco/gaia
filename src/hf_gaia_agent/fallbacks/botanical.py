@@ -300,6 +300,11 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
 
     fruit_score = 0
     vegetable_score = 0
+    title_text = ""
+    title_match = re.search(r"(?im)^title:\s*(?P<title>.+)$", text)
+    if title_match:
+        title_text = title_match.group("title").strip()
+    normalized_title = normalize_botanical_text(title_text)
     explicit_fruit_over_vegetable = (
         "not a vegetable but a fruit",
         "fruit rather than a vegetable",
@@ -357,6 +362,17 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         fruit_score += 2
     if "not a fruit" in normalized:
         vegetable_score += 2
+    if normalized_title:
+        token_groups = _botanical_item_token_groups(item)
+        title_mentions_item = bool(token_groups) and all(
+            any(variant in normalized_title for variant in variants)
+            for variants in token_groups
+        )
+        if title_mentions_item:
+            if "vegetable" in normalized_title and "fruit" not in normalized_title:
+                vegetable_score += 3
+            if "fruit" in normalized_title and "vegetable" not in normalized_title:
+                fruit_score += 3
     if any(phrase in normalized for phrase in ambiguous_dual_classification):
         if any(phrase in normalized for phrase in explicit_fruit_over_vegetable + ("botanical fruit", "botanically a fruit")):
             fruit_score += 1
