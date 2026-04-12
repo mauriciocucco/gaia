@@ -5,7 +5,9 @@ from uuid import uuid4
 import hf_gaia_agent.cli as cli_module
 import hf_gaia_agent.graph as graph_module
 from hf_gaia_agent.api_client import Question
-from hf_gaia_agent.cli import build_parser, graph_command, solve_questions
+from hf_gaia_agent.cli import build_parser, graph_command, debug_command
+from hf_gaia_agent.hooks import BaseAgentHook
+from hf_gaia_agent.runner import solve_question_by_id, solve_questions
 from hf_gaia_agent.graph import GaiaGraphAgent
 
 
@@ -33,6 +35,47 @@ class FakeAgent:
         }
 
 
+class FakeAgentWithHook:
+    def __init__(self, hook: BaseAgentHook) -> None:
+        self._hook = hook
+
+    def solve(
+        self,
+        question: Question,
+        *,
+        local_file_path: str | Path | None = None,
+    ) -> dict[str, object]:
+        del local_file_path
+        self._hook.on_solve_start(question.task_id, question.question)
+        result = {
+            "task_id": question.task_id,
+            "question": question.question,
+            "submitted_answer": "ok",
+            "file_name": question.file_name,
+            "tool_trace": [],
+            "decision_trace": [],
+            "evidence_used": [],
+            "reducer_used": None,
+            "fallback_reason": None,
+            "error": None,
+        }
+        self._hook.on_solve_end(question.task_id, result)
+        return result
+
+
+class RecordingHook(BaseAgentHook):
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    def on_solve_start(self, task_id: str, question: str) -> None:
+        del question
+        self.events.append(("start", task_id))
+
+    def on_solve_end(self, task_id: str, result: dict[str, object]) -> None:
+        del result
+        self.events.append(("end", task_id))
+
+
 def test_solve_questions_preserves_attachment_error_when_agent_also_errors() -> None:
     question = Question(
         task_id="attach-1",
@@ -46,6 +89,36 @@ def test_solve_questions_preserves_attachment_error_when_agent_also_errors() -> 
     assert results[0]["attachment_path"] is None
     assert results[0]["attachment_error"] == "No file path associated with task_id attach-1."
     assert results[0]["error"] == "Required attachment was not available locally."
+
+
+def test_solve_question_by_id_preserves_attachment_error_without_printing() -> None:
+    question = Question(
+        task_id="attach-2",
+        question="Review the attached board image.",
+        file_name="board.png",
+    )
+
+    results = solve_question_by_id(FakeClient(question), FakeAgent(), "attach")
+
+    assert len(results) == 1
+    assert results[0]["attachment_path"] is None
+    assert results[0]["attachment_error"] == "No file path associated with task_id attach-2."
+    assert results[0]["error"] == "Required attachment was not available locally."
+
+
+def test_runner_does_not_duplicate_agent_lifecycle_hooks() -> None:
+    question = Question(task_id="hook-1", question="What is 2+2?")
+    hook = RecordingHook()
+
+    results = solve_question_by_id(
+        FakeClient(question),
+        FakeAgentWithHook(hook),
+        "hook",
+        hook=hook,
+    )
+
+    assert len(results) == 1
+    assert hook.events == [("start", "hook-1"), ("end", "hook-1")]
 
 
 def test_build_parser_accepts_graph_subcommand_output_after_subcommand() -> None:
@@ -114,3 +187,12 @@ def test_graph_introspection_ascii_contains_expected_edges() -> None:
     assert "--> agent" in rendered
     assert "-?-> tools" in rendered
     assert "-?-> finalize" in rendered
+
+
+def test_build_parser_accepts_debug_question_subcommand() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["debug-question", "abc123", "7"])
+
+    assert args.command == "debug-question"
+    assert args.targets == ["abc123", "7"]
+    assert args.func is debug_command

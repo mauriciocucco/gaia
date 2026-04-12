@@ -1,17 +1,12 @@
 import json
 from pathlib import Path
-from uuid import uuid4
 
 import httpx
 import pytest
 
-from hf_gaia_agent.api_client import AnswerPayload, ScoringAPIClient
+from hf_gaia_agent.api_client import AnswerPayload, Question, ScoringAPIClient
 
-
-def _case_dir(name: str) -> Path:
-    root = Path(".test-artifacts") / f"{name}-{uuid4().hex}"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+from conftest import make_case_dir as _case_dir
 
 
 def test_list_questions_parses_schema() -> None:
@@ -38,6 +33,7 @@ def test_list_questions_parses_schema() -> None:
     assert len(questions) == 1
     assert questions[0].task_id == "1"
     assert questions[0].question == "What is 2+2?"
+    assert questions[0].level == "1"
 
 
 def test_download_file_writes_response_to_disk() -> None:
@@ -130,3 +126,57 @@ def test_list_questions_propagates_timeout() -> None:
     )
     with pytest.raises(httpx.ReadTimeout):
         client.list_questions()
+
+
+def test_retry_recovers_from_transient_503(monkeypatch) -> None:
+    """_RetryTransport retries on 503 then returns the good response."""
+    monkeypatch.setattr("time.sleep", lambda _: None)  # skip real delays
+
+    from hf_gaia_agent.api_client import _RetryTransport
+
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            return httpx.Response(503)
+        return httpx.Response(200, json=[])
+
+    inner = httpx.MockTransport(handler)
+    transport = _RetryTransport(inner, retries=3)
+    client = ScoringAPIClient(
+        base_url="https://example.test",
+        transport=transport,
+        download_dir=_case_dir("retry-503"),
+    )
+    questions = client.list_questions()
+    assert questions == []
+    assert call_count == 3
+
+
+def test_retry_gives_up_after_max_retries(monkeypatch) -> None:
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    from hf_gaia_agent.api_client import _RetryTransport
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    inner = httpx.MockTransport(handler)
+    transport = _RetryTransport(inner, retries=2)
+    client = ScoringAPIClient(
+        base_url="https://example.test",
+        transport=transport,
+        download_dir=_case_dir("retry-fail"),
+    )
+    response = client._client.get("/questions")
+    assert response.status_code == 503
+
+
+def test_question_from_api_handles_missing_optional_fields() -> None:
+    raw = {"task_id": "42", "question": "Hello?"}
+    q = Question.from_api(raw)
+    assert q.task_id == "42"
+    assert q.level is None
+    assert q.file_name is None

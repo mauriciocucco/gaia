@@ -1,3 +1,18 @@
+# Editable install of the package (includes all core dependencies from pyproject.toml)
 -e .
+
+# HF Space / demo entrypoint
 gradio>=5.49.1,<6.0.0
+
+# Already in pyproject.toml but listed here for HF Space visibility
 youtube-transcript-api>=0.6.3,<1.0.0
+
+# --------------------------------------------------------------------------
+# System dependencies (not installable via pip):
+#   - ffmpeg   : required for video frame extraction (media tools)
+#   - yt-dlp   : required for YouTube video download (media tools)
+#
+# On Debian/Ubuntu:
+#   sudo apt-get install -y ffmpeg
+#   pip install yt-dlp
+# --------------------------------------------------------------------------

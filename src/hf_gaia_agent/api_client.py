@@ -11,12 +11,26 @@ from urllib.parse import quote
 import httpx
 
 
+# ---------------------------------------------------------------------------
+# DTOs
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class Question:
     task_id: str
     question: str
-    Level: str | None = None
+    level: str | None = None
     file_name: str | None = None
+
+    @classmethod
+    def from_api(cls, raw: dict[str, object]) -> Question:
+        """Build from an API JSON dict, normalising the ``Level`` key."""
+        return cls(
+            task_id=str(raw["task_id"]),
+            question=str(raw["question"]),
+            level=str(raw["Level"]) if raw.get("Level") is not None else None,
+            file_name=str(raw["file_name"]) if raw.get("file_name") is not None else None,
+        )
 
 
 @dataclass(slots=True)
@@ -35,6 +49,54 @@ class ScoreResponse:
     timestamp: str
 
 
+# ---------------------------------------------------------------------------
+# Retry transport
+# ---------------------------------------------------------------------------
+
+_DEFAULT_RETRIES = 3
+_RETRY_STATUS_CODES = frozenset({502, 503, 504, 429})
+
+
+class _RetryTransport(httpx.BaseTransport):
+    """Wraps another transport adding simple retry/back-off for transient errors."""
+
+    def __init__(
+        self,
+        wrapped: httpx.BaseTransport,
+        *,
+        retries: int = _DEFAULT_RETRIES,
+    ) -> None:
+        self._wrapped = wrapped
+        self._retries = retries
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        import time
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self._retries + 1):
+            try:
+                response = self._wrapped.handle_request(request)
+                if response.status_code not in _RETRY_STATUS_CODES or attempt == self._retries:
+                    return response
+                # transient server error — back off and retry
+            except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+                last_exc = exc
+                if attempt == self._retries:
+                    raise
+
+            delay = min(2 ** (attempt - 1), 8)  # 1s, 2s, 4s … capped at 8s
+            time.sleep(delay)
+
+        # Shouldn't be reachable, but satisfy the type-checker.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("retry loop exhausted without a response")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
 class ScoringAPIClient:
     """Thin sync client around the course API."""
 
@@ -45,6 +107,7 @@ class ScoringAPIClient:
         timeout: float = 60.0,
         download_dir: str | Path | None = None,
         transport: httpx.BaseTransport | None = None,
+        retries: int = _DEFAULT_RETRIES,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -52,11 +115,16 @@ class ScoringAPIClient:
             download_dir or os.getenv("GAIA_DOWNLOAD_DIR", ".cache/gaia")
         )
         self.download_dir.mkdir(parents=True, exist_ok=True)
+
+        effective_transport = transport or httpx.HTTPTransport()
+        if retries > 0 and not isinstance(transport, httpx.MockTransport):
+            effective_transport = _RetryTransport(effective_transport, retries=retries)
+
         self._client = httpx.Client(
             base_url=self.base_url,
             timeout=self.timeout,
             follow_redirects=True,
-            transport=transport,
+            transport=effective_transport,
         )
 
     def close(self) -> None:
@@ -76,7 +144,7 @@ class ScoringAPIClient:
         response = self._client.get("/questions")
         response.raise_for_status()
         payload = response.json()
-        return [Question(**item) for item in payload]
+        return [Question.from_api(item) for item in payload]
 
     def download_file(self, task_id: str, file_name: str | None = None) -> Path:
         response: httpx.Response | None = None

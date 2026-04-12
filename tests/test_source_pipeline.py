@@ -40,6 +40,34 @@ def test_profile_question_extracts_month_year_expected_date() -> None:
     assert profile.expected_date == "as of July 2023"
 
 
+def test_profile_question_prioritizes_attachment_required_before_specialized_families() -> None:
+    profile = profile_question(
+        "What is the surname of the equine veterinarian mentioned in the attached chapter notes?",
+        file_name="chapter.pdf",
+        local_file_path=None,
+    )
+
+    assert profile.name == "attachment_required"
+    assert profile.preferred_tools == ("read_local_file",)
+
+
+def test_profile_question_prioritizes_youtube_before_direct_url_fallback() -> None:
+    profile = profile_question(
+        "What is said in this video https://www.youtube.com/watch?v=L1vXCYZAYYM and this page https://example.com/context?"
+    )
+
+    assert profile.name == "transcript_or_video"
+    assert profile.target_urls == ("https://www.youtube.com/watch?v=L1vXCYZAYYM",)
+    assert profile.expected_domains == ("youtube.com", "youtu.be")
+
+
+def test_profile_question_falls_back_to_direct_url_via_registry() -> None:
+    profile = profile_question("Summarize the claims on https://example.com/report")
+
+    assert profile.name == "direct_url"
+    assert profile.target_urls == ("https://example.com/report",)
+
+
 def test_score_candidates_prefers_expected_domain_author_and_date() -> None:
     raw = (
         "1. There Are Hundreds of Mysterious Filaments at the Center of the Milky Way\n"

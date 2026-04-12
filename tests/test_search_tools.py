@@ -3,6 +3,8 @@ from __future__ import annotations
 import pytest
 
 import hf_gaia_agent.tools as tools
+import hf_gaia_agent.tools.search as search_mod
+import hf_gaia_agent.tools.web as web_mod
 
 
 def test_search_brave_html_parses_results(monkeypatch) -> None:
@@ -90,9 +92,9 @@ def test_web_search_falls_back_when_primary_provider_fails(monkeypatch) -> None:
     def unused_bing(query: str, *, max_results: int) -> list[dict[str, str]]:
         raise AssertionError("bing should not be called once enough results were found")
 
-    monkeypatch.setattr(tools, "_search_brave_html", fail_brave)
-    monkeypatch.setattr(tools, "_search_duckduckgo", ok_ddg)
-    monkeypatch.setattr(tools, "_search_bing_rss", unused_bing)
+    monkeypatch.setattr(search_mod, "_search_brave_html", fail_brave)
+    monkeypatch.setattr(search_mod, "_search_duckduckgo", ok_ddg)
+    monkeypatch.setattr(search_mod, "_search_bing_rss", unused_bing)
 
     result = tools.web_search.invoke({"query": "fallback query", "max_results": 3})
 
@@ -109,9 +111,9 @@ def test_web_search_raises_when_all_providers_fail(monkeypatch) -> None:
 
         return _inner
 
-    monkeypatch.setattr(tools, "_search_brave_html", fail("brave failed"))
-    monkeypatch.setattr(tools, "_search_duckduckgo", fail("ddg failed"))
-    monkeypatch.setattr(tools, "_search_bing_rss", fail("bing failed"))
+    monkeypatch.setattr(search_mod, "_search_brave_html", fail("brave failed"))
+    monkeypatch.setattr(search_mod, "_search_duckduckgo", fail("ddg failed"))
+    monkeypatch.setattr(search_mod, "_search_bing_rss", fail("bing failed"))
 
     with pytest.raises(RuntimeError, match="All search providers failed"):
         tools.web_search.invoke({"query": "broken query", "max_results": 2})
@@ -229,7 +231,7 @@ def test_count_wikipedia_studio_albums_falls_back_to_rendered_tables(monkeypatch
 
     monkeypatch.setattr(tools.httpx, "Client", lambda **_kwargs: FakeClient())
     monkeypatch.setattr(
-        tools,
+        web_mod,
         "extract_tables_from_url",
         lambda url, text_filter="", max_tables=5, max_rows_per_table=15: (
             "Table 1\n"
@@ -333,7 +335,7 @@ def test_extract_links_from_url_filters_and_resolves_relative_urls(monkeypatch) 
 
 def test_find_text_in_url_returns_matching_lines(monkeypatch) -> None:
     monkeypatch.setattr(
-        tools,
+        web_mod,
         "_fetch_url_text",
         lambda url: "Title: Example\nalpha line\nbeta keyword match\nfinal line",
     )
@@ -347,7 +349,7 @@ def test_find_text_in_url_returns_matching_lines(monkeypatch) -> None:
 
 def test_find_text_in_url_uses_token_overlap_when_exact_phrase_is_absent(monkeypatch) -> None:
     monkeypatch.setattr(
-        tools,
+        web_mod,
         "_fetch_url_text",
         lambda url: (
             "Participating nations\n"

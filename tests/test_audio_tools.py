@@ -1,16 +1,12 @@
 from pathlib import Path
-from uuid import uuid4
 
 import httpx
 
 import hf_gaia_agent.tools as tools_module
+import hf_gaia_agent.tools.document as document_mod
 from hf_gaia_agent.tools import _transcribe_audio, read_file_content
 
-
-def _case_dir(name: str) -> Path:
-    root = Path(".test-artifacts") / f"{name}-{uuid4().hex}"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+from conftest import make_case_dir as _case_dir
 
 
 def test_read_file_content_transcribes_mp3(monkeypatch) -> None:
@@ -18,7 +14,7 @@ def test_read_file_content_transcribes_mp3(monkeypatch) -> None:
     audio_file = case_dir / "clip.mp3"
     audio_file.write_bytes(b"fake-mp3")
 
-    monkeypatch.setattr(tools_module, "_transcribe_audio", lambda path: f"transcript for {path.name}")
+    monkeypatch.setattr(document_mod, "_transcribe_audio", lambda path: f"transcript for {path.name}")
 
     result = read_file_content(str(audio_file))
 

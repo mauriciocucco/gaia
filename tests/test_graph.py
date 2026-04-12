@@ -7,7 +7,21 @@ import pytest
 import hf_gaia_agent.graph as graph_module
 
 from hf_gaia_agent.api_client import Question
+from hf_gaia_agent.fallbacks.article_to_paper import ArticleToPaperFallback
+from hf_gaia_agent.fallbacks.role_chain import RoleChainFallback
+from hf_gaia_agent.fallbacks.roster import RosterFallback
+from hf_gaia_agent.fallbacks.text_span import TextSpanFallback
 from hf_gaia_agent.graph import GaiaGraphAgent
+from hf_gaia_agent.graph.evidence_support import (
+    grounded_temporal_roster_answer,
+    has_temporal_roster_grounding_gap,
+    has_temporally_grounded_roster_evidence,
+    requires_temporal_roster_retry,
+)
+
+
+def _tools_by_name() -> dict[str, object]:
+    return {tool_.name: tool_ for tool_ in graph_module.build_tools()}
 
 
 class FakeModel:
@@ -871,7 +885,6 @@ def test_graph_article_identifier_fallback_fetches_external_candidate(monkeypatc
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url])
 
-    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
         "question": (
             "On June 6, 2023, an article by Carolyn Collins Petersen was published in Universe Today. "
@@ -891,7 +904,7 @@ def test_graph_article_identifier_fallback_fetches_external_candidate(monkeypatc
         ],
     }
 
-    result = agent._targeted_article_identifier_fallback(state)
+    result = ArticleToPaperFallback(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -922,7 +935,6 @@ def test_graph_article_identifier_fallback_searches_by_supported_subject(monkeyp
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
 
-    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
         "question": (
             "This article links to a paper at the bottom. "
@@ -931,7 +943,7 @@ def test_graph_article_identifier_fallback_searches_by_supported_subject(monkeyp
         "messages": [],
     }
 
-    result = agent._targeted_article_identifier_fallback(state)
+    result = ArticleToPaperFallback(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -981,7 +993,6 @@ def test_graph_article_identifier_fallback_searches_by_exact_paper_title_when_pr
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, find_text_in_url, fetch_url])
 
-    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
         "question": (
             "This article links to a paper at the bottom. "
@@ -1003,7 +1014,7 @@ def test_graph_article_identifier_fallback_searches_by_exact_paper_title_when_pr
         ],
     }
 
-    result = agent._targeted_article_identifier_fallback(state)
+    result = ArticleToPaperFallback(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -1929,8 +1940,8 @@ def test_temporal_roster_retry_ignores_player_profile_with_year_and_season() -> 
         ],
     }
 
-    assert GaiaGraphAgent._has_temporal_roster_grounding_gap(state) is True
-    assert GaiaGraphAgent._requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
+    assert has_temporal_roster_grounding_gap(state) is True
+    assert requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
 
 
 def test_temporal_roster_retry_requires_positive_grounded_roster_evidence() -> None:
@@ -1965,8 +1976,8 @@ def test_temporal_roster_retry_requires_positive_grounded_roster_evidence() -> N
         ],
     }
 
-    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is False
-    assert GaiaGraphAgent._requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
+    assert has_temporally_grounded_roster_evidence(state) is False
+    assert requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
 
 
 def test_graph_targeted_fighters_roster_fallback_solves_from_projected_season_page(monkeypatch) -> None:
@@ -2025,7 +2036,6 @@ def test_graph_targeted_fighters_roster_fallback_solves_from_projected_season_pa
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url, extract_links_from_url])
 
-    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
         "question": (
             "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
@@ -2047,7 +2057,7 @@ def test_graph_targeted_fighters_roster_fallback_solves_from_projected_season_pa
         ],
     }
 
-    result = agent._targeted_temporal_roster_fallback(state)
+    result = RosterFallback(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "Yoshida, Uehara"
@@ -2107,7 +2117,6 @@ def test_graph_targeted_fighters_roster_fallback_can_start_from_pacificleague_an
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url, extract_links_from_url])
 
-    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
         "question": (
             "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023? "
@@ -2136,7 +2145,7 @@ def test_graph_targeted_fighters_roster_fallback_can_start_from_pacificleague_an
         ],
     }
 
-    result = agent._targeted_temporal_roster_fallback(state)
+    result = RosterFallback(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "Yoshida, Uehara"
@@ -2156,7 +2165,6 @@ def test_graph_text_span_source_fallback_solves_from_ranked_candidate(monkeypatc
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url])
 
-    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
         "question": (
             "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
@@ -2176,7 +2184,7 @@ def test_graph_text_span_source_fallback_solves_from_ranked_candidate(monkeypatc
         ],
     }
 
-    result = agent._text_span_source_fallback(state)
+    result = TextSpanFallback(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "Louvrier"
@@ -2212,7 +2220,6 @@ def test_graph_text_span_source_fallback_fetches_candidate_page_after_find_miss(
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [find_text_in_url, fetch_url])
 
-    agent = GaiaGraphAgent(model=FakeModel(), max_iterations=1)
     state = {
         "question": (
             "What is the surname of the equine veterinarian mentioned in 1.E Exercises from the chemistry materials "
@@ -2232,7 +2239,7 @@ def test_graph_text_span_source_fallback_fetches_candidate_page_after_find_miss(
         ],
     }
 
-    result = agent._text_span_source_fallback(state)
+    result = TextSpanFallback(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "Louvrier"
@@ -2354,7 +2361,6 @@ def test_graph_entity_role_chain_fallback_searches_past_weak_raymond_candidates(
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
 
-    agent = GaiaGraphAgent(model=FakeModelForEntityRoleChainFallback(), max_iterations=1)
     state = {
         "question": (
             "Who did the actor who played Ray in the Polish-language version of Everybody Loves Raymond play in Magda M.? "
@@ -2393,7 +2399,10 @@ def test_graph_entity_role_chain_fallback_searches_past_weak_raymond_candidates(
         },
     }
 
-    result = agent._entity_role_chain_source_fallback(state)
+    result = RoleChainFallback(
+        _tools_by_name(),
+        FakeModelForEntityRoleChainFallback(),
+    ).run(state)
 
     assert result is not None
     assert result["final_answer"] == "Wojciech"
@@ -2433,7 +2442,7 @@ def test_temporal_roster_grounding_ignores_off_scope_dated_roster_pages() -> Non
         ],
     }
 
-    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is False
+    assert has_temporally_grounded_roster_evidence(state) is False
 
 
 def test_temporal_roster_grounding_accepts_year_specific_player_directory_with_neighbors() -> None:
@@ -2461,7 +2470,7 @@ def test_temporal_roster_grounding_accepts_year_specific_player_directory_with_n
         ],
     }
 
-    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is True
+    assert has_temporally_grounded_roster_evidence(state) is True
 
 
 def test_temporal_roster_grounding_treats_generic_wikipedia_team_roster_as_current_only() -> None:
@@ -2484,7 +2493,7 @@ def test_temporal_roster_grounding_treats_generic_wikipedia_team_roster_as_curre
         ],
     }
 
-    assert GaiaGraphAgent._has_temporally_grounded_roster_evidence(state) is False
+    assert has_temporally_grounded_roster_evidence(state) is False
 
 
 def test_temporal_roster_retry_requires_answer_grounded_in_temporal_records() -> None:
@@ -2509,8 +2518,8 @@ def test_temporal_roster_retry_requires_answer_grounded_in_temporal_records() ->
         ],
     }
 
-    assert GaiaGraphAgent._grounded_temporal_roster_answer(state) is None
-    assert GaiaGraphAgent._requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
+    assert grounded_temporal_roster_answer(state) is None
+    assert requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
 
 
 def test_agent_node_truncates_tool_messages_for_model_context() -> None:

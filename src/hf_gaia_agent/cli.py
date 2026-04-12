@@ -9,8 +9,10 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .api_client import AnswerPayload, Question, ScoringAPIClient
+from .api_client import AnswerPayload, ScoringAPIClient
 from .graph import GaiaGraphAgent
+from .hooks import VerboseHook
+from .runner import solve_question_by_id, solve_questions, write_results
 
 
 def _load_dotenv(path: Path) -> None:
@@ -41,51 +43,6 @@ def load_runtime_env() -> None:
 
 def _default_cache_file() -> Path:
     return Path(".cache/gaia/last_run_answers.json")
-
-
-def _resolve_attachment(client: ScoringAPIClient, question: Question) -> Path | None:
-    if not question.file_name:
-        return None
-    return client.download_file(question.task_id, question.file_name)
-
-
-def solve_questions(
-    client: ScoringAPIClient,
-    agent: GaiaGraphAgent,
-    *,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
-    questions = client.list_questions()
-    if limit is not None:
-        questions = questions[:limit]
-
-    results: list[dict[str, Any]] = []
-    print(f"Starting evaluation of {len(questions)} questions...")
-    for index, question in enumerate(questions, start=1):
-        print(f"[{index}/{len(questions)}] Solving task: {question.task_id}...")
-        attachment_path = None
-        attachment_error = None
-        try:
-            attachment_path = _resolve_attachment(client, question)
-        except Exception as exc:
-            attachment_error = str(exc)
-
-        result = agent.solve(question, local_file_path=attachment_path)
-        if attachment_error and not result.get("error"):
-            result["error"] = f"Attachment download failed: {attachment_error}"
-        result["attachment_path"] = str(attachment_path) if attachment_path else None
-        result["attachment_error"] = attachment_error
-        result["index"] = index
-        results.append(result)
-    return results
-
-
-def write_results(results: list[dict[str, Any]], destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(
-        json.dumps(results, ensure_ascii=True, indent=2),
-        encoding="utf-8",
-    )
 
 
 def _print_results(results: list[dict[str, Any]]) -> None:
@@ -137,6 +94,28 @@ def graph_command(args: argparse.Namespace) -> int:
     rendered = agent.render_graph(format=args.format)
     _write_text_output(rendered, args.output)
     return 0
+
+
+def debug_command(args: argparse.Namespace) -> int:
+    hook = VerboseHook()
+    agent = GaiaGraphAgent(max_iterations=args.max_iterations, hooks=[hook])
+
+    all_results: list[dict[str, Any]] = []
+    with ScoringAPIClient(base_url=args.api_url) as client:
+        for target in args.targets:
+            results = solve_question_by_id(client, agent, target)
+            if not results:
+                print(f"No questions matched: {target}")
+                continue
+            all_results.extend(results)
+
+    for result in all_results:
+        idx = result.get("index", "?")
+        out = Path(f".cache/gaia/debug_Q{idx}.json")
+        write_results([result], out)
+        print(f"Saved to {out}")
+
+    return 0 if all_results else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -191,6 +170,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional destination file for the rendered graph.",
     )
     graph_parser.set_defaults(func=graph_command)
+
+    debug_parser = subparsers.add_parser(
+        "debug-question",
+        help="Solve specific questions with verbose tool tracing.",
+    )
+    debug_parser.add_argument(
+        "targets",
+        nargs="+",
+        help="Task-ID prefixes or 1-based question indices to debug.",
+    )
+    debug_parser.set_defaults(func=debug_command)
+
     return parser
 
 

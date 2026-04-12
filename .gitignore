@@ -1,5 +1,8 @@
+# Virtual environments
 .venv/
 .uv-cache/
+
+# Runtime caches and temp
 .cache/
 .tmp/
 .tmp_pytest/
@@ -12,4 +15,21 @@ pytest-cache-files-*/
 testtmpbase/
 __pycache__/
 *.py[cod]
+
+# Secrets
 .env
+
+# Build / distribution
+dist/
+build/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

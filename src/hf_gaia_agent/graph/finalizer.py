@@ -1,0 +1,156 @@
+"""Final answer orchestration for the graph workflow."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from ..normalize import normalize_submitted_answer
+from ..source_pipeline import serialize_evidence
+from .answer_policy import (
+    attachment_required_but_missing,
+    is_invalid_final_response,
+    is_missing_attachment_non_answer,
+    looks_like_placeholder_answer,
+)
+from .contracts import FinalizationServices
+from .state import AgentState
+
+
+class WorkflowFinalizer:
+    """Collects the final-answer decision tree outside the workflow shell."""
+
+    def __init__(self, services: FinalizationServices):
+        self._services = services
+
+    def finalize(self, state: AgentState) -> dict[str, Any]:
+        if state.get("final_answer"):
+            return {
+                "final_answer": state.get("final_answer"),
+                "error": state.get("error"),
+                "reducer_used": state.get("reducer_used"),
+                "evidence_used": state.get("evidence_used", []),
+                "fallback_reason": state.get("fallback_reason"),
+            }
+
+        last_ai = self._services.last_ai_message(state["messages"])
+        raw_answer = last_ai.content if last_ai else ""
+        final_answer = normalize_submitted_answer(str(raw_answer))
+        error = state.get("error")
+        reducer_used = state.get("reducer_used")
+        evidence_used = list(state.get("evidence_used") or [])
+        fallback_reason = state.get("fallback_reason")
+
+        if attachment_required_but_missing(
+            question=state["question"],
+            file_name=state.get("file_name"),
+            local_file_path=state.get("local_file_path"),
+        ):
+            fallback_tool_answer = self._services.fallback_tool_answer(
+                state["messages"],
+                state["question"],
+            )
+            if fallback_tool_answer:
+                return {
+                    "final_answer": fallback_tool_answer,
+                    "error": None,
+                    "fallback_reason": None,
+                }
+            return {
+                "final_answer": "",
+                "error": error or "Required attachment was not available locally.",
+                "fallback_reason": fallback_reason or "attachment_missing",
+            }
+
+        preferred_structured_result = self._services.structured_answer_result(
+            state,
+            preferred_only=True,
+        )
+        if preferred_structured_result:
+            return preferred_structured_result
+
+        resolver_result = self._services.run_fallback_resolvers(state)
+        if resolver_result:
+            return resolver_result
+
+        for rule in self._services.finalization_rules:
+            if not rule.applies(state, final_answer):
+                continue
+            result = rule.finalize(
+                state,
+                final_answer,
+                services=self._services,
+                error=error,
+                fallback_reason=fallback_reason,
+            )
+            if result:
+                return result
+
+        if (
+            is_invalid_final_response(final_answer)
+            or is_missing_attachment_non_answer(
+                final_answer,
+                file_name=state.get("file_name"),
+                local_file_path=state.get("local_file_path"),
+            )
+            or looks_like_placeholder_answer(state["question"], final_answer)
+        ):
+            recovered = self._recover_from_evidence(state)
+            if recovered:
+                return recovered
+            final_answer = ""
+            error = error or "Model produced an invalid non-answer."
+            fallback_reason = fallback_reason or "invalid_model_non_answer"
+
+        if not final_answer:
+            recovered = self._recover_from_evidence(state)
+            if recovered:
+                return recovered
+            error = error or "Model did not produce a final answer."
+            fallback_reason = fallback_reason or "missing_final_answer"
+
+        return {
+            "final_answer": final_answer,
+            "error": error,
+            "reducer_used": reducer_used,
+            "evidence_used": evidence_used,
+            "fallback_reason": fallback_reason,
+        }
+
+    def _recover_from_evidence(self, state: AgentState) -> dict[str, Any] | None:
+        fallback_tool_answer = self._services.fallback_tool_answer(
+            state["messages"],
+            state["question"],
+        )
+        if fallback_tool_answer:
+            return {
+                "final_answer": fallback_tool_answer,
+                "error": None,
+                "fallback_reason": None,
+            }
+
+        structured_result = self._services.structured_answer_result(state)
+        if structured_result:
+            return structured_result
+
+        salvaged_answer = self._services.salvage_answer_from_evidence(state)
+        if salvaged_answer:
+            return {
+                "final_answer": salvaged_answer,
+                "error": None,
+                "evidence_used": serialize_evidence(
+                    self._services.top_grounded_evidence_records(state)
+                ),
+                "fallback_reason": None,
+            }
+
+        verified_answer = self._services.verify_answer_from_evidence(state)
+        if verified_answer:
+            return {
+                "final_answer": verified_answer,
+                "error": None,
+                "evidence_used": serialize_evidence(
+                    self._services.top_grounded_evidence_records(state)
+                ),
+                "fallback_reason": None,
+            }
+        return None
