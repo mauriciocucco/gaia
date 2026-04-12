@@ -1025,6 +1025,77 @@ def test_graph_article_identifier_fallback_searches_by_exact_paper_title_when_pr
     )
 
 
+def test_graph_article_identifier_fallback_prefers_new_external_candidate_after_blocked_fetch(
+    monkeypatch,
+) -> None:
+    fetched_urls: list[str] = []
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return an external metadata page after the primary paper is blocked."""
+        assert max_results == 5
+        return (
+            "1. Northwestern Scholars publication\n"
+            "URL: https://arch.library.northwestern.edu/concern/publications/gx41mm28v\n"
+            "Snippet: Work by R.G.A. was supported by NASA under award No. 80GSFC21M0002.\n"
+        )
+
+    @tool
+    def find_text_in_url(url: str, query: str, max_matches: int = 1) -> str:
+        """Force the fallback to escalate from targeted text lookup to fetch."""
+        assert max_matches == 1
+        return "No matches found."
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Allow the blocked paper only once, then require the fresh external candidate."""
+        fetched_urls.append(url)
+        if url == "https://iopscience.iop.org/article/10.3847/2041-8213/acd54b":
+            if fetched_urls.count(url) > 1:
+                raise AssertionError("Blocked primary paper should not be refetched once a fresh candidate exists.")
+            return (
+                "Title: Radware Bot Manager Captcha\n"
+                "URL: https://validate.perfdrive.com/example\n\n"
+                "Access blocked by captcha."
+            )
+        assert url == "https://arch.library.northwestern.edu/concern/publications/gx41mm28v"
+        return (
+            "Title: Northwestern Scholars publication\n"
+            "URL: https://arch.library.northwestern.edu/concern/publications/gx41mm28v\n\n"
+            "Work by R.G.A. was supported by NASA under award No. 80GSFC21M0002."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, find_text_in_url, fetch_url])
+
+    state = {
+        "question": (
+            "This article links to a paper at the bottom. "
+            "Find this paper. Under what NASA award number was the work performed by R. G. Arendt supported by?"
+        ),
+        "messages": [],
+        "ranked_candidates": [
+            {
+                "title": (
+                    "The Population of the Galactic Center Filaments: Position Angle Distribution "
+                    "Reveals a Degree-scale Collimated Outflow from Sgr A* along the Galactic Plane"
+                ),
+                "url": "https://iopscience.iop.org/article/10.3847/2041-8213/acd54b",
+                "snippet": "Published paper in The Astrophysical Journal Letters",
+                "origin_tool": "extract_links_from_url",
+                "score": 95,
+                "reasons": ("linked_source", "primary_source_hint"),
+            }
+        ],
+    }
+
+    result = ArticleToPaperFallback(_tools_by_name()).run(state)
+
+    assert result is not None
+    assert result["final_answer"] == "80GSFC21M0002"
+    assert fetched_urls.count("https://iopscience.iop.org/article/10.3847/2041-8213/acd54b") == 1
+    assert "https://arch.library.northwestern.edu/concern/publications/gx41mm28v" in fetched_urls
+
+
 def test_graph_expands_city_abbreviations_when_question_forbids_abbreviations() -> None:
     agent = GaiaGraphAgent(model=FakeModelSingleAnswer("[ANSWER]St. Petersburg[/ANSWER]"), max_iterations=1)
     result = agent.solve(
@@ -1435,6 +1506,69 @@ def test_graph_botanical_fallback_ignores_low_signal_fruit_metadata_pages(monkey
 
     assert result["submitted_answer"] == "broccoli, sweet potatoes"
     assert result["reducer_used"] == "botanical_classification"
+
+
+def test_graph_botanical_fallback_skips_social_noise_when_strong_source_is_present(
+    monkeypatch,
+) -> None:
+    fetched_urls: list[str] = []
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return mixed-quality results for the same botanical query."""
+        assert max_results == 5
+        assert query == "sweet potatoes botanical fruit or vegetable"
+        return (
+            "1. Quora thread\n"
+            "URL: https://www.quora.com/Are-sweet-potatoes-fruits-or-vegetables\n"
+            "Snippet: Discussion about sweet potatoes.\n\n"
+            "2. Sweet potato - Wikipedia\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato\n"
+            "Snippet: Sweet potato is an edible root vegetable.\n\n"
+            "3. TikTok clip\n"
+            "URL: https://www.tiktok.com/@botany/video/123\n"
+            "Snippet: Short video about sweet potatoes.\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Only the strong source should be fetched."""
+        fetched_urls.append(url)
+        assert "quora.com" not in url
+        assert "tiktok.com" not in url
+        assert url == "https://en.wikipedia.org/wiki/Sweet_potato"
+        return (
+            "Title: Sweet potato\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato\n\n"
+            "Sweet potato is an edible root vegetable."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-strong-source-over-noise",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == "sweet potatoes"
+    assert fetched_urls == ["https://en.wikipedia.org/wiki/Sweet_potato"]
+    assert not any(
+        "quora.com" in item or "tiktok.com" in item
+        for item in result["tool_trace"]
+        if item.startswith("fetch_url(")
+    )
 
 
 def test_graph_botanical_fallback_ignores_ambiguous_culinary_zucchini_page(monkeypatch) -> None:

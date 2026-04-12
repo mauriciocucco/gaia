@@ -8,6 +8,7 @@ from ..graph.state import AgentState
 from ..graph.routing import question_profile_from_state
 from .base import FallbackResolver
 from .utils import (
+    FallbackAttemptBudget,
     candidate_urls_from_state,
     fallback_trace_state,
     try_fetch_fallback,
@@ -29,6 +30,7 @@ class TextSpanFallback:
         if profile.name != "text_span_lookup":
             return None
         context = fallback_trace_state(tools_by_name=self._tools_by_name, state=state)
+        budget = FallbackAttemptBudget(remaining_fetches=4)
         candidate_urls = candidate_urls_from_state(
             state,
             context.ranked_candidates,
@@ -45,6 +47,8 @@ class TextSpanFallback:
             queries=queries,
             title_hint="Referenced text span",
             expected_reducer="text_span_attribute",
+            budget=budget,
+            max_candidate_urls=2,
         )
         if result:
             return result
@@ -52,4 +56,6 @@ class TextSpanFallback:
             context=context,
             candidate_urls=candidate_urls,
             expected_reducer="text_span_attribute",
+            budget=budget,
+            max_candidate_urls=2,
         )

@@ -38,6 +38,7 @@ CANDIDATE_SCORES = {
     "paper_mention": 12,
     "linked_source": 125,
     "primary_source_hint": 28,
+    "funding_hint": 24,
     "article_loop_penalty": -40,
     # text_span_lookup
     "exercise_page": 28,
@@ -284,6 +285,18 @@ def _score_article_to_paper(
         ):
             score += _sc("article_loop_penalty")
             reasons.append("article_loop_penalty")
+    if any(
+        token in context.haystack.lower()
+        for token in (
+            "award number",
+            "award no.",
+            "supported by nasa",
+            "funded by nasa",
+            "grant number",
+        )
+    ):
+        score += _sc("funding_hint")
+        reasons.append("funding_hint")
     return score, reasons
 
 

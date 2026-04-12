@@ -20,9 +20,12 @@ from ..graph.answer_policy import is_invalid_final_response
 from ..graph.routing import question_profile_from_state
 from .base import FallbackResolver
 from .utils import (
+    FallbackAttemptBudget,
     candidate_urls_from_state,
     fallback_trace_state,
+    fetch_candidate_urls,
     invoke_fallback_tool,
+    try_search_fallback,
     with_fallback_traces,
 )
 
@@ -45,6 +48,7 @@ class RoleChainFallback:
             return None
 
         context = fallback_trace_state(tools_by_name=self._tools_by_name, state=state)
+        budget = FallbackAttemptBudget(remaining_searches=2, remaining_fetches=4)
         role_chain_tokens = ("magda", "romana", "kasprzykowski", "wszyscy")
         actor_side_tokens = ("romana", "kasprzykowski", "wszyscy")
 
@@ -69,18 +73,27 @@ class RoleChainFallback:
             prefer_expected_domains=True,
         )
         if not _has_role_chain_coverage(likely_urls):
-            for query in (
-                "actor who played Ray in Polish Everybody Loves Raymond",
-                "Wszyscy kochaja Romana Ray actor",
-                "Bartlomiej Kasprzykowski Magda M. character",
-                "actor who played Ray in Polish Everybody Loves Raymond Magda M. character",
-                "Magda M. cast character",
-            ):
-                invoke_fallback_tool(
+            for query in self._search_queries():
+                try_search_fallback(
                     context=context,
-                    tool_name="web_search",
-                    tool_args={"query": query, "max_results": 5},
+                    query=query,
+                    max_results=5,
+                    budget=budget,
                 )
+                likely_urls = candidate_urls_from_state(
+                    {
+                        **state,
+                        "ranked_candidates": serialize_candidates(context.ranked_candidates),
+                    },
+                    context.ranked_candidates,
+                    predicate=lambda url: any(
+                        token in unquote(url).lower()
+                        for token in role_chain_tokens
+                    ),
+                    prefer_expected_domains=True,
+                )
+                if _has_role_chain_coverage(likely_urls):
+                    break
             likely_urls = candidate_urls_from_state(
                 {
                     **state,
@@ -97,7 +110,13 @@ class RoleChainFallback:
             return None
 
         attempted_records: list[EvidenceRecord] = []
-        for candidate_url in likely_urls[:4]:
+        for candidate_url in fetch_candidate_urls(
+            context=context,
+            candidate_urls=likely_urls,
+            max_urls=4,
+        ):
+            if not budget.consume_fetch():
+                break
             fetched = invoke_fallback_tool(
                 context=context,
                 tool_name="fetch_url",
@@ -155,6 +174,14 @@ class RoleChainFallback:
                 "fallback_reason": None,
             },
             context=context,
+        )
+
+    @staticmethod
+    def _search_queries() -> tuple[str, ...]:
+        return (
+            "actor who played Ray in Polish Everybody Loves Raymond Wszyscy kochaja Romana Magda M. character",
+            "Wszyscy kochaja Romana Ray actor",
+            "Bartlomiej Kasprzykowski Magda M. character",
         )
 
 

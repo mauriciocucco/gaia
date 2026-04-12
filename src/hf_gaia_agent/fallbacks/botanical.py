@@ -6,14 +6,12 @@ import re
 import unicodedata
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 from ..normalize import normalize_submitted_answer
 from ..source_pipeline import (
     EvidenceRecord,
-    SourceCandidate,
     evidence_records_from_tool_output,
-    parse_result_blocks,
     serialize_evidence,
 )
 from ..graph.state import AgentState
@@ -24,8 +22,12 @@ from ..graph.routing import (
 )
 from .base import FallbackResolver
 from .utils import (
+    FallbackAttemptBudget,
     fallback_trace_state,
+    fetch_candidate_urls,
     invoke_fallback_tool,
+    ranked_candidates_from_result_text,
+    try_search_fallback,
     with_fallback_traces,
 )
 
@@ -57,28 +59,63 @@ class BotanicalFallback:
             return None
 
         vegetables: list[str] = []
-        attempted_records: list[EvidenceRecord] = []
+        supporting_records: list[EvidenceRecord] = []
         for item in items:
             fruit_total = 0
             vegetable_total = 0
+            item_supporting_records: list[EvidenceRecord] = []
+            for record in _botanical_existing_records(state):
+                scores = botanical_scores_from_text(item, record.content)
+                if scores is None:
+                    continue
+                fruit_score, vegetable_score = scores
+                if max(fruit_score, vegetable_score) < 2:
+                    continue
+                fruit_total += fruit_score
+                vegetable_total += vegetable_score
+                item_supporting_records.append(record)
+            if _botanical_is_vegetable(fruit_total, vegetable_total):
+                vegetables.append(item)
+                supporting_records.extend(item_supporting_records[-2:])
+                continue
+            if _botanical_is_decisive(fruit_total, vegetable_total):
+                supporting_records.extend(item_supporting_records[-2:])
+                continue
+
+            item_budget = FallbackAttemptBudget(remaining_searches=2, remaining_fetches=2)
             for query in (
                 f"{item} botanical fruit or vegetable",
                 f"{item} botany fruit vegetable",
             ):
-                search_text = invoke_fallback_tool(
+                search_text = try_search_fallback(
                     context=context,
-                    tool_name="web_search",
-                    tool_args={"query": query, "max_results": 5},
+                    query=query,
+                    max_results=5,
+                    budget=item_budget,
                 )
-                candidates = parse_result_blocks(search_text, origin_tool="web_search")
-                for candidate in candidates[:2]:
+                if not search_text:
+                    continue
+                candidate_urls = [
+                    candidate.url
+                    for candidate in ranked_candidates_from_result_text(
+                        context=context,
+                        result_text=search_text,
+                        origin_tool="web_search",
+                    )
+                ]
+                for candidate_url in fetch_candidate_urls(
+                    context=context,
+                    candidate_urls=candidate_urls,
+                    max_urls=2,
+                ):
+                    if not item_budget.consume_fetch():
+                        break
                     fetched = invoke_fallback_tool(
                         context=context,
                         tool_name="fetch_url",
-                        tool_args={"url": candidate.url},
+                        tool_args={"url": candidate_url},
                     )
                     fetched_records = evidence_records_from_tool_output("fetch_url", fetched)
-                    attempted_records.extend(fetched_records)
                     scores = botanical_scores_from_text(item, fetched)
                     if scores is None:
                         continue
@@ -87,8 +124,13 @@ class BotanicalFallback:
                         continue
                     fruit_total += fruit_score
                     vegetable_total += vegetable_score
-            if vegetable_total >= fruit_total + 2 and vegetable_total >= 3:
+                    item_supporting_records.extend(fetched_records)
+                if _botanical_is_decisive(fruit_total, vegetable_total):
+                    break
+            if _botanical_is_vegetable(fruit_total, vegetable_total):
                 vegetables.append(item)
+            if item_supporting_records:
+                supporting_records.extend(item_supporting_records[-2:])
 
         if not vegetables:
             return None
@@ -98,11 +140,39 @@ class BotanicalFallback:
                 "final_answer": ", ".join(ordered),
                 "error": None,
                 "reducer_used": "botanical_classification",
-                "evidence_used": serialize_evidence(attempted_records[-6:]),
+                "evidence_used": serialize_evidence(supporting_records[-6:]),
                 "fallback_reason": None,
             },
             context=context,
         )
+
+
+def _botanical_existing_records(state: AgentState) -> list[EvidenceRecord]:
+    supporting_records: list[EvidenceRecord] = []
+    seen_urls: set[str] = set()
+    for message in state["messages"]:
+        if not isinstance(message, ToolMessage):
+            continue
+        tool_name = (getattr(message, "name", "") or "").strip()
+        if tool_name not in {"fetch_url", "find_text_in_url"}:
+            continue
+        for record in evidence_records_from_tool_output(tool_name, str(message.content or "")):
+            if record.source_url and record.source_url in seen_urls:
+                continue
+            supporting_records.append(record)
+            if record.source_url:
+                seen_urls.add(record.source_url)
+    return supporting_records
+
+
+def _botanical_is_vegetable(fruit_total: int, vegetable_total: int) -> bool:
+    return vegetable_total >= fruit_total + 2 and vegetable_total >= 3
+
+
+def _botanical_is_decisive(fruit_total: int, vegetable_total: int) -> bool:
+    return _botanical_is_vegetable(fruit_total, vegetable_total) or (
+        fruit_total >= vegetable_total + 2 and fruit_total >= 3
+    )
 
 
 def _botanical_candidate_items(state: AgentState) -> list[str]:

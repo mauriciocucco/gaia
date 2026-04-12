@@ -14,11 +14,13 @@ from ..graph.state import AgentState
 from ..graph.routing import question_profile_from_state
 from .base import FallbackResolver
 from .utils import (
+    FallbackAttemptBudget,
     candidate_urls_from_state,
     fallback_trace_state,
-    invoke_fallback_tool,
+    try_search_fallback,
     try_fetch_fallback,
     try_find_text_fallback,
+    unfetched_first_candidate_urls,
 )
 
 
@@ -37,15 +39,23 @@ class ArticleToPaperFallback:
     def run(self, state: AgentState) -> dict[str, Any] | None:
         profile = question_profile_from_state(state)
         context = fallback_trace_state(tools_by_name=self._tools_by_name, state=state)
-        candidate_urls = self._identifier_candidate_urls(state, context.ranked_candidates)
+        budget = FallbackAttemptBudget(remaining_searches=3, remaining_fetches=6)
+        candidate_urls = unfetched_first_candidate_urls(
+            self._identifier_candidate_urls(state, context.ranked_candidates),
+            fetched_urls=context.fetched_urls,
+        )
         if not candidate_urls and "web_search" in self._tools_by_name:
             for query in self._search_queries(state, context.ranked_candidates):
-                invoke_fallback_tool(
+                try_search_fallback(
                     context=context,
-                    tool_name="web_search",
-                    tool_args={"query": query, "max_results": 5},
+                    query=query,
+                    max_results=5,
+                    budget=budget,
                 )
-            candidate_urls = self._identifier_candidate_urls(state, context.ranked_candidates)
+            candidate_urls = unfetched_first_candidate_urls(
+                self._identifier_candidate_urls(state, context.ranked_candidates),
+                fetched_urls=context.fetched_urls,
+            )
 
         result = try_find_text_fallback(
             context=context,
@@ -53,6 +63,9 @@ class ArticleToPaperFallback:
             queries=["NASA award number", "supported by NASA"],
             title_hint="Linked primary source",
             expected_reducer="award_number",
+            budget=budget,
+            max_candidate_urls=1,
+            max_matches=1,
         )
         if result:
             return result
@@ -61,6 +74,8 @@ class ArticleToPaperFallback:
             context=context,
             candidate_urls=candidate_urls,
             expected_reducer="award_number",
+            budget=budget,
+            max_candidate_urls=1,
         )
         if result:
             return result
@@ -69,13 +84,17 @@ class ArticleToPaperFallback:
         if "web_search" in self._tools_by_name:
             expanded_queries = self._search_queries(state, context.ranked_candidates)
             for query in expanded_queries:
-                invoke_fallback_tool(
+                try_search_fallback(
                     context=context,
-                    tool_name="web_search",
-                    tool_args={"query": query, "max_results": 5},
+                    query=query,
+                    max_results=5,
+                    budget=budget,
                 )
 
-        expanded_urls = self._identifier_candidate_urls(state, context.ranked_candidates)
+        expanded_urls = unfetched_first_candidate_urls(
+            self._identifier_candidate_urls(state, context.ranked_candidates),
+            fetched_urls=context.fetched_urls,
+        )
         if expanded_urls == candidate_urls:
             return None
 
@@ -85,6 +104,9 @@ class ArticleToPaperFallback:
             queries=["NASA award number", "supported by NASA"],
             title_hint="Linked primary source",
             expected_reducer="award_number",
+            budget=budget,
+            max_candidate_urls=1,
+            max_matches=1,
         )
         if result:
             return result
@@ -92,6 +114,8 @@ class ArticleToPaperFallback:
             context=context,
             candidate_urls=expanded_urls,
             expected_reducer="award_number",
+            budget=budget,
+            max_candidate_urls=1,
         )
 
     def _identifier_candidate_urls(
@@ -134,6 +158,12 @@ class ArticleToPaperFallback:
                 titles.append(title)
 
         queries: list[str] = []
+        for title in titles[:2]:
+            if subject:
+                queries.append(f'"{title}" "{subject}" NASA award number')
+            queries.append(f'"{title}" "NASA award number"')
+            if subject:
+                queries.append(f'"{title}" "{subject}" supported by NASA')
         if subject:
             queries.extend(
                 (
@@ -141,11 +171,6 @@ class ArticleToPaperFallback:
                     f"{subject} supported by NASA award number",
                 )
             )
-        for title in titles[:2]:
-            queries.append(f'"{title}" "NASA award number"')
-            if subject:
-                queries.append(f'"{title}" "{subject}" NASA award number')
-                queries.append(f'"{title}" "{subject}" supported by NASA')
         return list(dict.fromkeys(query for query in queries if query.strip()))
 
 
