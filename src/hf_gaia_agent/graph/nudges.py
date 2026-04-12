@@ -2,27 +2,63 @@
 
 from __future__ import annotations
 
+import re
+
 from langchain_core.messages import ToolMessage
 
-from .candidate_support import ranked_candidates_from_state
+from .candidate_support import bucket_ranked_candidates, ranked_candidates_from_state
 from .routing import question_is_metric_row_lookup, question_profile_from_state
 from .state import AgentState, URL_RE
+
+
+_SEARCH_TOOL_NAMES = {"web_search", "search_wikipedia"}
+_FETCH_TOOL_NAMES = {
+    "fetch_url",
+    "find_text_in_url",
+    "extract_tables_from_url",
+    "extract_links_from_url",
+}
+_STRATEGY_SHIFT_GUIDANCE = (
+    "Change strategy now: use search_wikipedia with 1-3 named entities, "
+    "use fetch_wikipedia_page if the title is clear, fetch a likely official URL directly, "
+    "or answer from the best evidence already collected. Do not call web_search again with the same idea."
+)
+
+
+def _last_tool_name(state: AgentState) -> str | None:
+    for message in reversed(state["messages"]):
+        if isinstance(message, ToolMessage):
+            return (getattr(message, "name", "") or "").strip()
+    return None
+
+
+def _fetched_urls_from_state(state: AgentState) -> set[str]:
+    fetched_urls: set[str] = set()
+    for entry in state.get("tool_trace") or []:
+        if not any(entry.startswith(f"{tool_name}(") for tool_name in _FETCH_TOOL_NAMES):
+            continue
+        url_match = re.search(r"'url':\s*'([^']+)'", entry)
+        if url_match:
+            fetched_urls.add(url_match.group(1))
+    return fetched_urls
 
 
 def build_ranked_candidate_nudge(state: AgentState) -> str | None:
     ranked_candidates = ranked_candidates_from_state(state)
     if not ranked_candidates:
         return None
-    last_tool_name = None
-    for message in reversed(state["messages"]):
-        if isinstance(message, ToolMessage):
-            last_tool_name = (getattr(message, "name", "") or "").strip()
-            break
+    last_tool_name = _last_tool_name(state)
     if last_tool_name not in {"web_search", "search_wikipedia", "extract_links_from_url"}:
+        return None
+    buckets = bucket_ranked_candidates(
+        ranked_candidates,
+        fetched_urls=_fetched_urls_from_state(state),
+    )
+    if not buckets.useful_unfetched:
         return None
     profile = question_profile_from_state(state)
     lines: list[str] = []
-    for candidate in ranked_candidates[:3]:
+    for candidate in buckets.useful_unfetched[:3]:
         reasons = []
         for reason in candidate.reasons[:3]:
             if reason == "expected_domain":
@@ -67,29 +103,91 @@ def build_ranked_candidate_nudge(state: AgentState) -> str | None:
     return "\n".join(guidance)
 
 
+def build_stuck_search_nudge(state: AgentState) -> str | None:
+    if _last_tool_name(state) not in _SEARCH_TOOL_NAMES:
+        return None
+
+    search_history = [item for item in state.get("search_history_normalized") or [] if item]
+    if not search_history:
+        return None
+
+    latest_signature = search_history[-1]
+    latest_count = sum(signature == latest_signature for signature in search_history)
+    buckets = bucket_ranked_candidates(
+        ranked_candidates_from_state(state),
+        fetched_urls=_fetched_urls_from_state(state),
+    )
+
+    if latest_count < 3 and not (
+        latest_count >= 2 and not buckets.useful_unfetched
+    ):
+        return None
+
+    signature_hint = latest_signature.replace(" ", ", ")
+    guidance = [
+        "SEARCH LOOP DETECTED.",
+        (
+            "The same normalized search has already repeated without producing new useful evidence. "
+            f"Repeated search signature: {signature_hint or latest_signature}."
+        ),
+    ]
+    if buckets.useful_unfetched:
+        candidate_lines = "\n".join(
+            f"  - {candidate.url}" for candidate in buckets.useful_unfetched[:3]
+        )
+        guidance.append(
+            "Do not repeat this query. Read one of these unfetched candidates first:"
+        )
+        guidance.append(candidate_lines)
+        guidance.append(
+            "Use fetch_url, find_text_in_url, or extract_tables_from_url on one of them before any new search."
+        )
+        return "\n".join(guidance)
+
+    if buckets.exhausted_useful:
+        guidance.append(
+            "The useful ranked candidates are already exhausted, so rereading them will not help."
+        )
+    elif buckets.low_quality_unfetched:
+        guidance.append(
+            "The remaining ranked candidates are low-quality or off-topic, so fetching them is not a productive next step."
+        )
+    guidance.append(_STRATEGY_SHIFT_GUIDANCE)
+    return "\n".join(guidance)
+
+
 def build_search_nudge(state: AgentState) -> str | None:
-    search_tool_names = {"web_search", "search_wikipedia"}
     decision_trace = state.get("decision_trace") or []
     recent = decision_trace[-2:]
     if len(recent) < 2 or not all(
-        entry.removeprefix("tool:") in search_tool_names for entry in recent
+        entry.removeprefix("tool:") in _SEARCH_TOOL_NAMES for entry in recent
     ):
         return None
-    ranked_candidates = ranked_candidates_from_state(state)
-    if ranked_candidates:
-        url_list = "\n".join(f"  - {candidate.url}" for candidate in ranked_candidates[:5])
+    buckets = bucket_ranked_candidates(
+        ranked_candidates_from_state(state),
+        fetched_urls=_fetched_urls_from_state(state),
+    )
+    if buckets.useful_unfetched:
+        url_list = "\n".join(
+            f"  - {candidate.url}" for candidate in buckets.useful_unfetched[:5]
+        )
         return (
             f"STOP SEARCHING. You have done {len(recent)} consecutive searches without reading any page. "
             "You MUST now use fetch_url, find_text_in_url, or extract_tables_from_url on one of these URLs "
             f"from your ranked search candidates:\n{url_list}\n"
             "Pick the most relevant one and READ it. Do NOT call web_search or search_wikipedia again."
         )
+    if buckets.exhausted_useful or buckets.low_quality_unfetched:
+        return (
+            "STOP SEARCHING. The ranked candidates are already exhausted or low-quality. "
+            f"{_STRATEGY_SHIFT_GUIDANCE}"
+        )
     urls: list[str] = []
     for message in reversed(state["messages"]):
         if not isinstance(message, ToolMessage):
             continue
         tool_name = (getattr(message, "name", "") or "").strip()
-        if tool_name not in search_tool_names:
+        if tool_name not in _SEARCH_TOOL_NAMES:
             break
         found = URL_RE.findall(str(message.content))
         urls.extend(found)

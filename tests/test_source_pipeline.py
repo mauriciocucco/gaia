@@ -136,6 +136,29 @@ def test_score_candidates_penalizes_expected_domain_miss() -> None:
     assert "expected_domain_miss" in scored[1].reasons
 
 
+def test_score_candidates_filters_offtopic_commercial_noise() -> None:
+    question = (
+        "On June 6, 2023, an article by Carolyn Collins Petersen was published in Universe Today. "
+        "Find that article."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Downtown restaurant menu\n"
+        "URL: https://noise.example.com/menu\n"
+        "Snippet: Restaurant menu, delivery, order online, book now\n\n"
+        "2. There Are Hundreds of Mysterious Filaments at the Center of the Milky Way\n"
+        "URL: https://www.universetoday.com/articles/there-are-hundreds-of-mysterious-filaments-at-the-center-of-the-milky-way\n"
+        "Snippet: Carolyn Collins Petersen June 6, 2023 Universe Today article\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert [candidate.url for candidate in scored] == [
+        "https://www.universetoday.com/articles/there-are-hundreds-of-mysterious-filaments-at-the-center-of-the-milky-way"
+    ]
+
+
 def test_evidence_records_from_table_output_splits_tables() -> None:
     content = (
         "Table 1\n"

@@ -21,6 +21,7 @@ CANDIDATE_SCORES = {
     # General penalties
     "low_signal_domain": -120,
     "discussion_source_penalty": -55,
+    "commercial_noise_penalty": -140,
     # Domain matching
     "expected_domain": 90,
     "expected_domain_miss": -35,
@@ -131,6 +132,8 @@ def score_candidates(
             reasons,
             context=context,
         )
+        if _should_drop_candidate(score=score, reasons=reasons, context=context):
+            continue
 
         scored.append(
             SourceCandidate(
@@ -188,6 +191,9 @@ def _apply_general_rules(
     ):
         score += _sc("preferred_source")
         reasons.append("preferred_source")
+    if _looks_like_offtopic_commercial_noise(context):
+        score += _sc("commercial_noise_penalty")
+        reasons.append("commercial_noise_penalty")
     return score, reasons
 
 
@@ -440,6 +446,52 @@ def _is_low_signal_domain(domain: str) -> bool:
     )
 
 
+def _has_strong_relevance_signal(context: CandidateScoringContext) -> bool:
+    overlap = len(context.haystack_tokens & context.question_tokens)
+    if overlap >= 2:
+        return True
+    if context.domain and context.profile.expected_domains and any(
+        context.domain.endswith(expected) for expected in context.profile.expected_domains
+    ):
+        return True
+    if (
+        context.candidate.origin_tool == "search_wikipedia"
+        and context.profile.name == "wikipedia_lookup"
+    ):
+        return True
+    if context.author_tokens and context.author_tokens <= context.haystack_tokens:
+        return True
+    if context.expected_date_tokens and context.expected_date_tokens <= context.haystack_tokens:
+        return True
+    return bool(context.expected_year_tokens and context.expected_year_tokens <= context.haystack_tokens)
+
+
+def _looks_like_offtopic_commercial_noise(context: CandidateScoringContext) -> bool:
+    if _has_strong_relevance_signal(context):
+        return False
+    overlap = len(context.haystack_tokens & context.question_tokens)
+    if overlap > 1:
+        return False
+    lowered = context.haystack.lower()
+    return any(
+        fragment in lowered
+        for fragment in (
+            "restaurant",
+            " menu",
+            "menu ",
+            "lottery",
+            "pharmacy",
+            "book now",
+            "delivery",
+            "order online",
+            "takeout",
+            "reservation",
+            "reservations",
+            "open now",
+        )
+    )
+
+
 def _is_discussion_source(*, domain: str, url: str, haystack: str) -> bool:
     lowered = f"{domain}\n{url}\n{haystack}".lower()
     return any(
@@ -454,6 +506,19 @@ def _is_discussion_source(*, domain: str, url: str, haystack: str) -> bool:
             "stackexchange.com",
         )
     )
+
+
+def _should_drop_candidate(
+    *,
+    score: int,
+    reasons: list[str],
+    context: CandidateScoringContext,
+) -> bool:
+    if "commercial_noise_penalty" not in reasons:
+        return False
+    if _has_strong_relevance_signal(context):
+        return False
+    return score < 0
 
 
 def _is_off_scope_roster_source(*, url: str, haystack: str) -> bool:

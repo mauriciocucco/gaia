@@ -19,6 +19,7 @@ SEARCH STRATEGY (CRITICAL — follow this workflow):
 4. NEVER do more than 2 consecutive search calls without fetching a page in between.
 - Search results are only short snippets — they often lack the detail you need. You MUST read the actual page.
 - If a search returns no useful results, reformulate the query with different/fewer keywords, don't repeat.
+- If web_search returns clearly off-topic commercial results or generic noise, do not keep broad-web searching with the same query. Prefer search_wikipedia or fetch_wikipedia_page for named entities, or fetch a likely official source directly.
 - For Wikipedia subjects, prefer search_wikipedia and fetch_wikipedia_page. However, fetch_wikipedia_page omits tables and lists! When you need structured data (rosters, statistics, award lists, participant counts), use extract_tables_from_url on the Wikipedia URL instead.
 - If a webpage links to a primary source (paper, report, original document), use extract_links_from_url to find that link, then fetch_url to read it.
 - Once a tool returns a relevant table, passage, or data, STOP searching and compute the answer.

@@ -19,6 +19,7 @@ from ..source_pipeline import (
     score_candidates,
     serialize_candidates,
 )
+from .candidate_support import RankedCandidateBuckets, bucket_ranked_candidates
 from .contracts import CandidateRankingServices, ToolExecutionServices
 from .routing import question_is_metric_row_lookup, question_profile_from_state
 from .state import AgentState
@@ -216,15 +217,17 @@ class ToolPolicyEngine:
                 context.previous_search_signatures,
             )
         ):
+            candidate_buckets = bucket_ranked_candidates(
+                context.ranked_candidates,
+                fetched_urls=context.fetched_urls,
+            )
             self._append_trace(context, tool_name, raw_tool_args)
             context.consecutive_searches += 1
             context.tool_messages.append(
                 ToolMessage(
-                    content=(
-                        f"DUPLICATE QUERY: '{query}' is too similar to a previous search "
-                        "and you already have ranked source candidates. Do not keep "
-                        "searching. Read one of the ranked candidates with fetch_url, "
-                        "find_text_in_url, or extract_tables_from_url."
+                    content=self._duplicate_query_message(
+                        query=query,
+                        candidate_buckets=candidate_buckets,
                     ),
                     tool_call_id=tool_call_id,
                     name=tool_name,
@@ -497,6 +500,58 @@ class ToolPolicyEngine:
         context.ranked_candidates = self._services.merge_ranked_candidates(
             context.ranked_candidates,
             scored_candidates,
+        )
+
+    @staticmethod
+    def _duplicate_query_message(
+        *,
+        query: str,
+        candidate_buckets: RankedCandidateBuckets,
+    ) -> str:
+        if candidate_buckets.useful_unfetched:
+            candidate_lines = "\n".join(
+                f"- {candidate.title or candidate.url}\n  URL: {candidate.url}"
+                for candidate in candidate_buckets.useful_unfetched[:3]
+            )
+            return (
+                f"DUPLICATE QUERY: '{query}' is too similar to a previous search. "
+                "Do not repeat this search. You already have unread ranked candidates. "
+                "Read one of these now with fetch_url, find_text_in_url, or extract_tables_from_url:\n"
+                f"{candidate_lines}"
+            )
+        if candidate_buckets.exhausted_useful and candidate_buckets.low_quality_unfetched:
+            return (
+                f"DUPLICATE QUERY: '{query}' is too similar to a previous search.\n"
+                "ALL GOOD CANDIDATES EXHAUSTED: the useful ranked candidates were already read, "
+                "and the remaining unfetched candidates are low-quality or off-topic. "
+                "Do not reread the same results and do not fetch the low-quality ones. "
+                "Change strategy completely: use search_wikipedia with 1-3 named entities, "
+                "use fetch_wikipedia_page if the title is clear, fetch a likely official URL directly, "
+                "or answer from the evidence already collected."
+            )
+        if candidate_buckets.exhausted_useful:
+            return (
+                f"DUPLICATE QUERY: '{query}' is too similar to a previous search.\n"
+                "ALL CANDIDATES EXHAUSTED: this search strategy is spent. "
+                "Do not reread the same URLs and do not repeat this search. "
+                "Change strategy completely: use search_wikipedia with 1-3 named entities, "
+                "use fetch_wikipedia_page if the title is clear, fetch a likely official URL directly, "
+                "or answer from the evidence already collected."
+            )
+        if candidate_buckets.low_quality_unfetched:
+            return (
+                f"DUPLICATE QUERY: '{query}' is too similar to a previous search.\n"
+                "LOW-QUALITY CANDIDATES: the remaining ranked candidates are low-quality or off-topic. "
+                "Do not fetch them and do not repeat this search. "
+                "Change strategy completely: use search_wikipedia with 1-3 named entities, "
+                "use fetch_wikipedia_page if the title is clear, fetch a likely official URL directly, "
+                "or answer from the evidence already collected."
+            )
+        return (
+            f"DUPLICATE QUERY: '{query}' is too similar to a previous search. "
+            "Do not repeat it. Change strategy instead: use search_wikipedia with 1-3 named entities, "
+            "use fetch_wikipedia_page if the title is clear, fetch a likely official URL directly, "
+            "or answer from the evidence already collected."
         )
 
     def _append_trace(

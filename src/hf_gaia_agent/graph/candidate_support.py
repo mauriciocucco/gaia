@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from typing import Any
 from urllib.parse import unquote
@@ -12,6 +13,37 @@ from ..normalize import normalize_submitted_answer
 from ..source_pipeline import QuestionProfile, SourceCandidate
 from .routing import question_supports_direct_python
 from .state import AgentState, URL_RE
+
+
+@dataclass(frozen=True)
+class RankedCandidateBuckets:
+    useful_unfetched: tuple[SourceCandidate, ...]
+    exhausted_useful: tuple[SourceCandidate, ...]
+    low_quality_unfetched: tuple[SourceCandidate, ...]
+
+
+_STRONG_CANDIDATE_REASONS = {
+    "expected_domain",
+    "preferred_source",
+    "linked_source",
+    "primary_source_hint",
+    "article_path",
+    "paper_mention",
+    "exercise_page",
+    "reference_text_match",
+    "canonical_textbook_path",
+    "expected_date",
+    "expected_date_partial",
+    "expected_year",
+    "expected_author",
+    "role_chain_hint",
+    "target_series_hint",
+    "tableish_title",
+    "stats_page_hint",
+    "roster_page_hint",
+    "dated_roster_hint",
+    "official_yearbook_hint",
+}
 
 
 def ranked_candidates_from_state(state: AgentState) -> list[SourceCandidate]:
@@ -87,6 +119,71 @@ def execute_python_allowed(state: AgentState) -> tuple[bool, str | None]:
     if any(record.kind in {"table", "text", "transcript"} for record in records):
         return True, "fetched_evidence"
     return False, None
+
+
+def candidate_token_overlap(candidate: SourceCandidate) -> int:
+    for reason in candidate.reasons:
+        if not reason.startswith("token_overlap:"):
+            continue
+        try:
+            return int(reason.split(":", 1)[1])
+        except ValueError:
+            return 0
+    return 0
+
+
+def candidate_has_strong_signal(candidate: SourceCandidate) -> bool:
+    reasons = set(candidate.reasons)
+    if reasons & _STRONG_CANDIDATE_REASONS:
+        return True
+    if candidate.origin_tool == "search_wikipedia":
+        return True
+    overlap = candidate_token_overlap(candidate)
+    if overlap >= 2 and candidate.score >= 0:
+        return True
+    return candidate.score >= 35
+
+
+def is_low_quality_ranked_candidate(candidate: SourceCandidate) -> bool:
+    if is_obviously_bad_candidate_url(candidate.url):
+        return True
+    strong_signal = candidate_has_strong_signal(candidate)
+    reasons = set(candidate.reasons)
+    if "commercial_noise_penalty" in reasons and not strong_signal:
+        return True
+    if (
+        {"discussion_source_penalty", "low_signal_domain"} & reasons
+        and candidate.score < 20
+        and not strong_signal
+    ):
+        return True
+    return candidate.score < 0 and not strong_signal
+
+
+def bucket_ranked_candidates(
+    ranked_candidates: list[SourceCandidate],
+    *,
+    fetched_urls: set[str],
+) -> RankedCandidateBuckets:
+    useful_unfetched: list[SourceCandidate] = []
+    exhausted_useful: list[SourceCandidate] = []
+    low_quality_unfetched: list[SourceCandidate] = []
+
+    for candidate in ranked_candidates:
+        if candidate.url in fetched_urls:
+            if not is_low_quality_ranked_candidate(candidate):
+                exhausted_useful.append(candidate)
+            continue
+        if is_low_quality_ranked_candidate(candidate):
+            low_quality_unfetched.append(candidate)
+            continue
+        useful_unfetched.append(candidate)
+
+    return RankedCandidateBuckets(
+        useful_unfetched=tuple(useful_unfetched),
+        exhausted_useful=tuple(exhausted_useful),
+        low_quality_unfetched=tuple(low_quality_unfetched),
+    )
 
 
 def is_obviously_bad_candidate_url(url: str) -> bool:
@@ -228,6 +325,18 @@ def pick_better_fetch_candidate(
     ranked_candidates: list[SourceCandidate],
     fetched_urls: set[str],
 ) -> SourceCandidate | None:
+    requested_candidate = next(
+        (candidate for candidate in ranked_candidates if candidate.url == requested_url),
+        None,
+    )
+    if requested_candidate is not None and is_low_quality_ranked_candidate(requested_candidate):
+        for candidate in ranked_candidates:
+            if candidate.url in fetched_urls or candidate.url == requested_url:
+                continue
+            if is_low_quality_ranked_candidate(candidate):
+                continue
+            return candidate
+
     if not requested_url or not is_obviously_bad_candidate_url(requested_url):
         return preferred_ranked_fetch_candidate(
             requested_url=requested_url,
@@ -249,10 +358,12 @@ def pick_better_fetch_candidate(
 def pick_best_unfetched_candidate(
     state: AgentState, *, fetched_urls: set[str]
 ) -> SourceCandidate | None:
-    for candidate in ranked_candidates_from_state(state):
-        if candidate.url in fetched_urls or is_obviously_bad_candidate_url(candidate.url):
-            continue
-        return candidate
+    buckets = bucket_ranked_candidates(
+        ranked_candidates_from_state(state),
+        fetched_urls=fetched_urls,
+    )
+    if buckets.useful_unfetched:
+        return buckets.useful_unfetched[0]
 
     candidates: list[str] = []
     for message in reversed(state["messages"]):

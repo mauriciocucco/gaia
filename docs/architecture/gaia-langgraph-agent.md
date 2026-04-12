@@ -42,17 +42,22 @@ La separación entre ejecución y presentación está en `runner.py`, mientras q
 
 Antes era un único `graph.py` monolítico (todo en un solo archivo enorme). Ahora está partido en módulos con responsabilidades claras:
 
-| Módulo             | Responsabilidad                                                                           |
-| ------------------ | ----------------------------------------------------------------------------------------- |
-| `workflow.py`      | `GaiaGraphAgent`, compilación del `StateGraph`, nodos principales, `solve()`              |
-| `state.py`         | `AgentState` — el estado compartido entre nodos, con campos de control y auditoría        |
-| `contracts.py`     | Protocolos chicos para evidencia, ranking, ejecucion de tools y finalizacion              |
-| `services.py`      | Implementacion concreta que compone esas interfaces sin exponer un service locator unico  |
-| `tool_policy.py`   | Coordinador del nodo `tools`; aplica politicas, followups y actualizacion de candidatos   |
-| `finalizer.py`     | Arbitraje final de respuesta apoyado en servicios de evidencia y fallbacks                |
-| `prompts.py`       | System prompt, ajuste del prompt (_prompt shaping_), pistas de investigación              |
-| `routing.py`       | Conexiones condicionales (_conditional edges_), política de tools, guardias de búsqueda   |
-| `answer_policy.py` | Validación de respuestas, canonicalización, detección de placeholders (respuestas vacías) |
+| Módulo                  | Responsabilidad                                                                                                             |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `workflow.py`           | `GaiaGraphAgent`, compilación del `StateGraph`, nodos principales, `solve()`                                                |
+| `state.py`              | `AgentState` — el estado compartido entre nodos, con campos de control y auditoría                                          |
+| `contracts.py`          | Protocolos chicos para evidencia, ranking, ejecucion de tools y finalizacion                                                |
+| `services.py`           | Implementacion concreta que compone esas interfaces sin exponer un service locator unico                                    |
+| `tool_policy.py`        | Coordinador del nodo `tools`; aplica politicas, followups y actualizacion de candidatos                                     |
+| `finalizer.py`          | Arbitraje final de respuesta apoyado en servicios de evidencia y fallbacks                                                  |
+| `prompts.py`            | System prompt, ajuste del prompt (_prompt shaping_), pistas de investigación                                                |
+| `routing.py`            | Conexiones condicionales (_conditional edges_), política de tools, guardias de búsqueda                                     |
+| `candidate_support.py`  | Clasifica candidatos en cubos de calidad (`RankedCandidateBuckets`): útiles no leídos, útiles ya agotados y de baja calidad |
+| `evidence_support.py`   | Helpers de _grounding_ y detección de respuestas estructuradas en el estado                                                 |
+| `nudges.py`             | Sugerencias inyectadas al prompt: candidatos no leídos, búsqueda atascada (_stuck search_), saturación de búsquedas         |
+| `finalization_rules.py` | Reglas benchmark-specific de finalización (cuándo forzar reducer, cuándo aceptar tool)                                      |
+| `retry_rules.py`        | Reglas de reintento de respuesta inválida                                                                                   |
+| `answer_policy.py`      | Validación de respuestas, canonicalización, detección de placeholders (respuestas vacías)                                   |
 
 `workflow.py` ya no concentra wrappers de transición para ranking, evidencia o tools. La orquestacion del grafo queda ahi, mientras que `tool_policy.py` y `finalizer.py` consumen protocolos chicos definidos en `contracts.py`.
 
@@ -103,16 +108,16 @@ Antes era un único `evidence_solver.py` monolítico. Ahora cada familia de extr
 
 Convierte los resultados de las tools en estructuras útiles para razonar:
 
-| Módulo                     | Responsabilidad                                                                            |
-| -------------------------- | ------------------------------------------------------------------------------------------ |
-| `question_classifier.py`   | `QuestionProfile`: tipo de pregunta, dominio esperado, pistas para buscar                  |
-| `candidate_ranker.py`      | `score_candidates`: asigna una puntuación (_score_) a cada URL según su calidad percibida  |
-| `evidence_normalizer.py`   | `EvidenceRecord`: normaliza la evidencia producida por las tools en un formato único       |
-| `source_labels.py`         | Etiquetas del tipo de fuente (Wikipedia, estadísticas, libro de texto, etc.)               |
-| `_models.py`               | Objetos de datos (_DTOs_): `QuestionProfile`, `SourceCandidate`, `EvidenceRecord`          |
-| `_question_classifiers.py` | Registro ordenado de clasificadores: conecta detectores y extractores en un pipeline único |
-| `_question_detectors.py`   | Funciones booleanas que detectan el tipo de pregunta                                       |
-| `_question_extractors.py`  | Extracción de fechas, nombres y entidades del enunciado de la pregunta                     |
+| Módulo                     | Responsabilidad                                                                                                                                                                                                                            |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `question_classifier.py`   | `QuestionProfile`: tipo de pregunta, dominio esperado, pistas para buscar                                                                                                                                                                  |
+| `candidate_ranker.py`      | `score_candidates`: asigna puntuación a cada URL según su relevancia percibida; descarta candidatos con ruido comercial irrelevante (_commercial noise_: restaurantes, farmacias, reservas, etc.) que no tienen señal fuerte de relevancia |
+| `evidence_normalizer.py`   | `EvidenceRecord`: normaliza la evidencia producida por las tools en un formato único                                                                                                                                                       |
+| `source_labels.py`         | Etiquetas del tipo de fuente (Wikipedia, estadísticas, libro de texto, etc.)                                                                                                                                                               |
+| `_models.py`               | Objetos de datos (_DTOs_): `QuestionProfile`, `SourceCandidate`, `EvidenceRecord`                                                                                                                                                          |
+| `_question_classifiers.py` | Registro ordenado de clasificadores: conecta detectores y extractores en un pipeline único                                                                                                                                                 |
+| `_question_detectors.py`   | Funciones booleanas que detectan el tipo de pregunta                                                                                                                                                                                       |
+| `_question_extractors.py`  | Extracción de fechas, nombres y entidades del enunciado de la pregunta                                                                                                                                                                     |
 
 > **¿Qué es un DTO?** _Data Transfer Object_: una clase simple que solo agrupa datos relacionados, sin lógica de negocio. Es el equivalente a un struct en C o un record en Java. Aquí se usan para pasar información entre módulos con un formato bien definido.
 
@@ -228,7 +233,7 @@ Responsabilidades:
 
 - toma `messages`
 - trunca outputs de tools demasiado largos para proteger la ventana de contexto del modelo
-- agrega _nudges_ (pequeñas sugerencias inyectadas en el prompt) si detecta que ya hay buenas fuentes clasificadas o demasiadas búsquedas seguidas
+- agrega _nudges_ si detecta que ya hay buenas fuentes candidatas no leídas, demasiadas búsquedas consecutivas del mismo tipo, o una **búsqueda atascada** (_stuck search_): el mismo término de búsqueda se repitió sin producir evidencia útil nueva. En ese último caso, el nudge describe el estado de los cubos: si hay candidatos útiles sin leer, los lista y pide hacer fetch antes de buscar otra vez; si ya se agotaron, avisa que cambiar de estrategia es la única salida
 - fuerza `tool_choice="none"` (el modelo no puede llamar más tools) al llegar al límite de iteraciones
 
 Conceptualmente, este nodo representa el _planner/reader_: el que decide qué buscar y qué leer, pero **no** el dueño absoluto de la verdad.
@@ -239,7 +244,7 @@ Es el nodo más interesante desde el punto de vista de diseño de producto. La p
 
 No se limita a ejecutar las llamadas a tools que pide el modelo; también las **gobierna**:
 
-- detecta búsquedas consecutivas excesivas y reemplaza una búsqueda por `fetch_url` sobre el mejor candidato no leído todavía
+- detecta búsquedas consecutivas excesivas y reemplaza una búsqueda por `fetch_url` sobre el mejor candidato no leído **de calidad suficiente**: usa `RankedCandidateBuckets` para separar los candidatos en tres cubos — útiles no leídos (`useful_unfetched`), útiles ya agotados (`exhausted_useful`) y baja calidad sin leer (`low_quality_unfetched`) — y solo hace fetch del primero; si no hay ninguno de calidad, no fuerza el reemplazo
 - detecta consultas casi duplicadas y bloquea loops de búsqueda
 - redirige fetches hacia URLs mejor clasificadas (_higher-ranked URLs_)
 - inyecta un filtro de texto (`text_filter`) derivado del `QuestionProfile`

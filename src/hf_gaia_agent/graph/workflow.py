@@ -22,7 +22,11 @@ from .answer_policy import (
 )
 from .evidence_support import last_ai_message
 from .finalizer import WorkflowFinalizer
-from .nudges import build_ranked_candidate_nudge, build_search_nudge
+from .nudges import (
+    build_ranked_candidate_nudge,
+    build_search_nudge,
+    build_stuck_search_nudge,
+)
 from .prompts import MODEL_TOOL_MESSAGE_MAX_CHARS, SYSTEM_PROMPT
 from .retry_rules import build_retry_guidance, should_retry_answer
 from .routing import (
@@ -287,11 +291,13 @@ class GaiaGraphAgent:
                 else self.model.invoke(msgs)
             )
         else:
+            stuck_search_nudge = build_stuck_search_nudge(state)
             nudges = [
                 nudge
                 for nudge in (
                     build_ranked_candidate_nudge(state),
-                    build_search_nudge(state),
+                    stuck_search_nudge,
+                    None if stuck_search_nudge else build_search_nudge(state),
                 )
                 if nudge
             ]
