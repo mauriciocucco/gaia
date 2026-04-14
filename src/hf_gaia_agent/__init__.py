@@ -6,7 +6,6 @@ __all__ = [
     "cli",
     "core",
     "evidence_solver",
-    "fallbacks",
     "graph",
     "hooks",
     "normalize",

@@ -54,14 +54,6 @@ class _FakeFinalizationServices:
         del state, limit
         return []
 
-    def run_fallback_resolvers(self, state):
-        del state
-        return None
-
-    def run_named_fallback(self, resolver_name, state):
-        del resolver_name, state
-        return None
-
 
 class _FakeToolPolicyServices:
     def __init__(self) -> None:

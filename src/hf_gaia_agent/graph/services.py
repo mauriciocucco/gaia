@@ -256,15 +256,6 @@ class GraphWorkflowServices:
             return recovery.run(state)
         return None
 
-    # Legacy compatibility surface.
-    def run_fallback_resolvers(self, state: AgentState) -> dict[str, Any] | None:
-        return self.run_resolution_pipeline(state)
-
-    def run_named_fallback(
-        self, resolver_name: str, state: AgentState
-    ) -> dict[str, Any] | None:
-        return self.run_targeted_resolution(resolver_name, state)
-
     def ranked_candidates_from_state(self, state: AgentState) -> list[SourceCandidate]:
         return ranked_candidates_from_state(state)
 

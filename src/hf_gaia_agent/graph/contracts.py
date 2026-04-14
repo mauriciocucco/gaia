@@ -48,12 +48,6 @@ class FinalizationServices(EvidenceServices, Protocol):
         self, resolution_name: str, state: AgentState
     ) -> dict[str, Any] | None: ...
 
-    # Legacy compatibility names.
-    def run_fallback_resolvers(self, state: AgentState) -> dict[str, Any] | None: ...
-    def run_named_fallback(
-        self, resolver_name: str, state: AgentState
-    ) -> dict[str, Any] | None: ...
-
 
 @runtime_checkable
 class CandidateRankingServices(Protocol):

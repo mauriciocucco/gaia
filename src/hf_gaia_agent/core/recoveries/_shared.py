@@ -1,9 +1,8 @@
 """Shared recovery utilities used by core recoveries, skills, and adapters.
 
 This module is the canonical home for reusable recovery execution helpers.
-Legacy ``hf_gaia_agent.fallbacks.utils`` re-exports these symbols for backward
-compatibility, but new code should import from this module (or the thin
-compatibility aliases in ``hf_gaia_agent.core.recoveries.utils``).
+New code should import from this module or from the thin aliases in
+``hf_gaia_agent.core.recoveries.utils``.
 """
 
 from __future__ import annotations

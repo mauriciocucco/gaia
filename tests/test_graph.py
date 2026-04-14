@@ -6,11 +6,11 @@ from langchain_core.tools import tool
 import pytest
 import hf_gaia_agent.graph as graph_module
 
+from hf_gaia_agent.adapters import build_source_adapters
 from hf_gaia_agent.api_client import Question
-from hf_gaia_agent.fallbacks.article_to_paper import ArticleToPaperFallback
-from hf_gaia_agent.fallbacks.role_chain import RoleChainFallback
-from hf_gaia_agent.fallbacks.roster import RosterFallback
-from hf_gaia_agent.fallbacks.text_span import TextSpanFallback
+from hf_gaia_agent.core.recoveries import build_core_recoveries
+from hf_gaia_agent.core.recoveries.article_to_paper import ArticleToPaperRecovery
+from hf_gaia_agent.core.recoveries.text_span import TextSpanRecovery
 from hf_gaia_agent.graph import GaiaGraphAgent
 from hf_gaia_agent.graph.evidence_support import (
     grounded_temporal_roster_answer,
@@ -18,10 +18,32 @@ from hf_gaia_agent.graph.evidence_support import (
     has_temporally_grounded_roster_evidence,
     requires_temporal_roster_retry,
 )
+from hf_gaia_agent.graph.services import GraphWorkflowServices
+from hf_gaia_agent.hooks import BaseAgentHook
+from hf_gaia_agent.skills import build_skills
+from hf_gaia_agent.skills.gaia.role_chain_gaia import RoleChainGaiaSkill
 
 
 def _tools_by_name() -> dict[str, object]:
     return {tool_.name: tool_ for tool_ in graph_module.build_tools()}
+
+
+class _UnusedAnswerModel:
+    def invoke(self, _messages):
+        raise AssertionError("This test path should not invoke the answer model.")
+
+
+def _workflow_services(answer_model: object | None = None) -> GraphWorkflowServices:
+    model = answer_model or _UnusedAnswerModel()
+    tools_by_name = _tools_by_name()
+    return GraphWorkflowServices(
+        answer_model=model,
+        tools_by_name=tools_by_name,
+        core_recoveries=build_core_recoveries(tools_by_name, model),
+        skills=build_skills(tools_by_name, model),
+        source_adapters=build_source_adapters(tools_by_name),
+        hook=BaseAgentHook(),
+    )
 
 
 class FakeModel:
@@ -904,7 +926,7 @@ def test_graph_article_identifier_fallback_fetches_external_candidate(monkeypatc
         ],
     }
 
-    result = ArticleToPaperFallback(_tools_by_name()).run(state)
+    result = ArticleToPaperRecovery(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -943,7 +965,7 @@ def test_graph_article_identifier_fallback_searches_by_supported_subject(monkeyp
         "messages": [],
     }
 
-    result = ArticleToPaperFallback(_tools_by_name()).run(state)
+    result = ArticleToPaperRecovery(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -1014,7 +1036,7 @@ def test_graph_article_identifier_fallback_searches_by_exact_paper_title_when_pr
         ],
     }
 
-    result = ArticleToPaperFallback(_tools_by_name()).run(state)
+    result = ArticleToPaperRecovery(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -1088,7 +1110,7 @@ def test_graph_article_identifier_fallback_prefers_new_external_candidate_after_
         ],
     }
 
-    result = ArticleToPaperFallback(_tools_by_name()).run(state)
+    result = ArticleToPaperRecovery(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "80GSFC21M0002"
@@ -2248,7 +2270,7 @@ def test_graph_targeted_fighters_roster_fallback_solves_from_projected_season_pa
         ],
     }
 
-    result = RosterFallback(_tools_by_name()).run(state)
+    result = _workflow_services().run_targeted_resolution("roster", state)
 
     assert result is not None
     assert result["final_answer"] == "Yoshida, Uehara"
@@ -2336,7 +2358,7 @@ def test_graph_targeted_fighters_roster_fallback_can_start_from_pacificleague_an
         ],
     }
 
-    result = RosterFallback(_tools_by_name()).run(state)
+    result = _workflow_services().run_targeted_resolution("roster", state)
 
     assert result is not None
     assert result["final_answer"] == "Yoshida, Uehara"
@@ -2375,7 +2397,7 @@ def test_graph_text_span_source_fallback_solves_from_ranked_candidate(monkeypatc
         ],
     }
 
-    result = TextSpanFallback(_tools_by_name()).run(state)
+    result = TextSpanRecovery(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "Louvrier"
@@ -2430,7 +2452,7 @@ def test_graph_text_span_source_fallback_fetches_candidate_page_after_find_miss(
         ],
     }
 
-    result = TextSpanFallback(_tools_by_name()).run(state)
+    result = TextSpanRecovery(_tools_by_name()).run(state)
 
     assert result is not None
     assert result["final_answer"] == "Louvrier"
@@ -2590,7 +2612,7 @@ def test_graph_entity_role_chain_fallback_searches_past_weak_raymond_candidates(
         },
     }
 
-    result = RoleChainFallback(
+    result = RoleChainGaiaSkill(
         _tools_by_name(),
         FakeModelForEntityRoleChainFallback(),
     ).run(state)

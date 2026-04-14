@@ -177,7 +177,6 @@ class GaiaGraphAgent:
         max_iterations: int | None = None,
         hooks: list[AgentHook] | None = None,
         include_benchmark_extensions: bool | None = None,
-        include_benchmark_fallbacks: bool | None = None,
     ):
         import hf_gaia_agent.graph as _graph_ns
 
@@ -188,14 +187,9 @@ class GaiaGraphAgent:
         self.max_iterations = max_iterations or int(
             os.getenv("GAIA_MAX_ITERATIONS", "15")
         )
-        benchmark_fallbacks_enabled = include_benchmark_extensions
-        if benchmark_fallbacks_enabled is None:
-            benchmark_fallbacks_enabled = include_benchmark_fallbacks
-        if benchmark_fallbacks_enabled is None:
-            benchmark_fallbacks_enabled = (
-                os.getenv("GAIA_ENABLE_BENCHMARK_FALLBACKS", "1").strip().lower()
-                not in {"0", "false", "no"}
-            )
+        benchmark_extensions_enabled = (
+            True if include_benchmark_extensions is None else include_benchmark_extensions
+        )
         self.core_recoveries: list[RecoveryStrategy] = build_core_recoveries(
             self.tools_by_name,
             self.answer_model,
@@ -203,7 +197,7 @@ class GaiaGraphAgent:
         self.skills: list[Skill] = build_skills(
             self.tools_by_name,
             self.answer_model,
-            include_benchmark_specific=benchmark_fallbacks_enabled,
+            include_benchmark_specific=benchmark_extensions_enabled,
         )
         self.source_adapters = build_source_adapters(self.tools_by_name)
         self._hook: AgentHook = (
