@@ -68,7 +68,7 @@ class TemporalRosterFinalizationRule:
         fallback_reason: str | None,
     ) -> dict[str, Any] | None:
         del answer_text
-        targeted_roster_result = services.run_named_fallback("roster", state)
+        targeted_roster_result = services.run_targeted_resolution("roster", state)
         if targeted_roster_result:
             return targeted_roster_result
         fallback_answer = services.fallback_tool_answer(state["messages"], state["question"])

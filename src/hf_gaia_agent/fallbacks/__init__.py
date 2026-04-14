@@ -1,4 +1,12 @@
-"""Fallback resolver registry."""
+"""Legacy compatibility registry for historical fallback imports.
+
+The canonical architecture now routes through:
+- ``hf_gaia_agent.core.recoveries`` for reusable recoveries
+- ``hf_gaia_agent.skills`` for domain/benchmark-specific capabilities
+- ``hf_gaia_agent.adapters`` for source-specific grounding
+
+This module remains available so older imports and tests keep working.
+"""
 
 from __future__ import annotations
 
@@ -57,7 +65,5 @@ def build_fallback_resolvers(
 ) -> list[FallbackResolver]:
     resolvers = build_core_fallback_resolvers(tools_by_name, answer_model)
     if include_benchmark_specific:
-        resolvers.extend(
-            build_benchmark_fallback_resolvers(tools_by_name, answer_model)
-        )
+        resolvers.extend(build_benchmark_fallback_resolvers(tools_by_name, answer_model))
     return resolvers

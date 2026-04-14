@@ -235,26 +235,35 @@ class GraphWorkflowServices:
             }
         return None
 
-    def run_fallback_resolvers(self, state: AgentState) -> dict[str, Any] | None:
+    def run_resolution_pipeline(self, state: AgentState) -> dict[str, Any] | None:
         return self.run_core_recoveries(state) or self.run_skills(state)
+
+    def run_targeted_resolution(
+        self, resolution_name: str, state: AgentState
+    ) -> dict[str, Any] | None:
+        if resolution_name == "roster":
+            return self.run_adapters("temporal_ordered_list", state)
+        if resolution_name == "competition":
+            return self.run_skill("competition_gaia", state)
+        if resolution_name == "role_chain":
+            return self.run_skill("role_chain_gaia", state)
+        if resolution_name == "botanical":
+            return self.run_skill("botanical_gaia", state)
+        profile = question_profile_from_state(state)
+        for recovery in self._core_recoveries:
+            if recovery.name != resolution_name or not recovery.applies(state, profile):
+                continue
+            return recovery.run(state)
+        return None
+
+    # Legacy compatibility surface.
+    def run_fallback_resolvers(self, state: AgentState) -> dict[str, Any] | None:
+        return self.run_resolution_pipeline(state)
 
     def run_named_fallback(
         self, resolver_name: str, state: AgentState
     ) -> dict[str, Any] | None:
-        if resolver_name == "roster":
-            return self.run_adapters("temporal_ordered_list", state)
-        if resolver_name == "competition":
-            return self.run_skill("competition_gaia", state)
-        if resolver_name == "role_chain":
-            return self.run_skill("role_chain_gaia", state)
-        if resolver_name == "botanical":
-            return self.run_skill("botanical_gaia", state)
-        profile = question_profile_from_state(state)
-        for recovery in self._core_recoveries:
-            if recovery.name != resolver_name or not recovery.applies(state, profile):
-                continue
-            return recovery.run(state)
-        return None
+        return self.run_targeted_resolution(resolver_name, state)
 
     def ranked_candidates_from_state(self, state: AgentState) -> list[SourceCandidate]:
         return ranked_candidates_from_state(state)

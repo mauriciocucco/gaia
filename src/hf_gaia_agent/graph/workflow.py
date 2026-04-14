@@ -176,6 +176,7 @@ class GaiaGraphAgent:
         model: Any | None = None,
         max_iterations: int | None = None,
         hooks: list[AgentHook] | None = None,
+        include_benchmark_extensions: bool | None = None,
         include_benchmark_fallbacks: bool | None = None,
     ):
         import hf_gaia_agent.graph as _graph_ns
@@ -187,7 +188,9 @@ class GaiaGraphAgent:
         self.max_iterations = max_iterations or int(
             os.getenv("GAIA_MAX_ITERATIONS", "15")
         )
-        benchmark_fallbacks_enabled = include_benchmark_fallbacks
+        benchmark_fallbacks_enabled = include_benchmark_extensions
+        if benchmark_fallbacks_enabled is None:
+            benchmark_fallbacks_enabled = include_benchmark_fallbacks
         if benchmark_fallbacks_enabled is None:
             benchmark_fallbacks_enabled = (
                 os.getenv("GAIA_ENABLE_BENCHMARK_FALLBACKS", "1").strip().lower()

@@ -34,6 +34,9 @@ La separación importante es esta:
 - el agente general vive en `graph`, `source_pipeline`, `reducers` y `core/recoveries`
 - la lógica muy específica del benchmark ya no debería contaminar el core; vive en `skills/gaia` y en `adapters/`
 
+Además, `fallbacks/` queda solo como **capa legacy de compatibilidad**.
+No debería ser el lugar donde evoluciona la arquitectura nueva.
+
 ## Arquitectura general
 
 El flujo visible empieza en la CLI de `cli.py`, que:
