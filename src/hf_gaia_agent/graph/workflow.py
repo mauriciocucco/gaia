@@ -10,9 +10,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
+from ..adapters import build_source_adapters
 from ..api_client import Question
-from ..fallbacks import FallbackResolver, build_fallback_resolvers
+from ..core.recoveries import RecoveryStrategy, build_core_recoveries
 from ..hooks import AgentHook, BaseAgentHook, CompositeHook
+from ..skills import Skill, build_skills
 from ..source_pipeline import profile_question
 from ..tools import read_file_content
 from .answer_policy import (
@@ -156,7 +158,9 @@ def _prepare_context(state: AgentState) -> dict[str, Any]:
         "question_profile": question_profile.as_dict(),
         "ranked_candidates": [],
         "search_history_normalized": [],
+        "search_history_fingerprints": [],
         "structured_tool_outputs": [],
+        "skill_trace": [],
         "error": None,
         "iterations": 0,
         "final_answer": None,
@@ -189,11 +193,16 @@ class GaiaGraphAgent:
                 os.getenv("GAIA_ENABLE_BENCHMARK_FALLBACKS", "1").strip().lower()
                 not in {"0", "false", "no"}
             )
-        self.fallback_resolvers: list[FallbackResolver] = build_fallback_resolvers(
+        self.core_recoveries: list[RecoveryStrategy] = build_core_recoveries(
+            self.tools_by_name,
+            self.answer_model,
+        )
+        self.skills: list[Skill] = build_skills(
             self.tools_by_name,
             self.answer_model,
             include_benchmark_specific=benchmark_fallbacks_enabled,
         )
+        self.source_adapters = build_source_adapters(self.tools_by_name)
         self._hook: AgentHook = (
             (hooks[0] if len(hooks) == 1 else CompositeHook(hooks))
             if hooks
@@ -202,7 +211,9 @@ class GaiaGraphAgent:
         self._services = GraphWorkflowServices(
             answer_model=self.answer_model,
             tools_by_name=self.tools_by_name,
-            fallback_resolvers=self.fallback_resolvers,
+            core_recoveries=self.core_recoveries,
+            skills=self.skills,
+            source_adapters=self.source_adapters,
             hook=self._hook,
         )
         self._tool_policy = ToolPolicyEngine(self._services)
@@ -413,6 +424,7 @@ class GaiaGraphAgent:
                 "decision_trace": [f"prompt_reducer:{prompt_reducer_used}"],
                 "evidence_used": [],
                 "reducer_used": prompt_reducer_used,
+                "skill_trace": [],
                 "fallback_reason": None,
                 "error": None,
             }
@@ -438,7 +450,9 @@ class GaiaGraphAgent:
                 "question_profile": {},
                 "ranked_candidates": [],
                 "search_history_normalized": [],
+                "search_history_fingerprints": [],
                 "structured_tool_outputs": [],
+                "skill_trace": [],
             },
             config={"recursion_limit": 50},
         )
@@ -454,6 +468,7 @@ class GaiaGraphAgent:
             "decision_trace": final_state.get("decision_trace", []),
             "evidence_used": final_state.get("evidence_used", []),
             "reducer_used": final_state.get("reducer_used"),
+            "skill_trace": final_state.get("skill_trace", []),
             "fallback_reason": final_state.get("fallback_reason"),
             "error": final_state.get("error"),
         }

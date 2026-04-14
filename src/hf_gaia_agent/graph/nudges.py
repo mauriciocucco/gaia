@@ -92,11 +92,11 @@ def build_ranked_candidate_nudge(state: AgentState) -> str | None:
         guidance.append(
             "For stat lookups, prefer batting, hitting, or stats pages over roster pages; once a fetched table contains both relevant metrics, stop and answer from that table."
         )
-    if profile.name == "roster_neighbor_lookup":
+    if profile.name == "temporal_ordered_list":
         guidance.append(
             "Prefer a dated team roster, season-specific player directory, or season-specific player page over a current player biography or current roster template."
         )
-    if profile.name == "botanical_classification":
+    if profile.name == "list_item_classification":
         guidance.append(
             "For botanical classification, search first, then read a source page. Do not finalize from common-usage intuition or from search snippets alone."
         )
@@ -107,7 +107,15 @@ def build_stuck_search_nudge(state: AgentState) -> str | None:
     if _last_tool_name(state) not in _SEARCH_TOOL_NAMES:
         return None
 
-    search_history = [item for item in state.get("search_history_normalized") or [] if item]
+    search_history = [
+        item
+        for item in (
+            state.get("search_history_fingerprints")
+            or state.get("search_history_normalized")
+            or []
+        )
+        if item
+    ]
     if not search_history:
         return None
 

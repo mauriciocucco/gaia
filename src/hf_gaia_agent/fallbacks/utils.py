@@ -92,7 +92,11 @@ def fallback_trace_state(
                 reasons=tuple(raw.get("reasons") or ()),
             )
         )
-    search_history = list(state.get("search_history_normalized") or [])
+    search_history = list(
+        state.get("search_history_fingerprints")
+        or state.get("search_history_normalized")
+        or []
+    )
     return FallbackExecutionContext(
         tools_by_name=tools_by_name,
         state=state,

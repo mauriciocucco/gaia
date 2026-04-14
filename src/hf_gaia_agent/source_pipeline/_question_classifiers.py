@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import re
 
 from ._models import QuestionProfile
 from ._question_detectors import (
@@ -47,14 +48,24 @@ class QuestionClassifier:
         return self.build_profile(context)
 
 
+def _no_urls(_context: QuestionClassificationContext) -> tuple[str, ...]:
+    return ()
+
+
 def _profile(
     context: QuestionClassificationContext,
     *,
     name: str,
+    profile_family: str | None,
     target_urls: Callable[[QuestionClassificationContext], tuple[str, ...]],
     expected_domains_resolver: Callable[[QuestionClassificationContext], tuple[str, ...]],
     preferred_tools: tuple[str, ...],
     text_filter: Callable[[QuestionClassificationContext], str | None],
+    prompt_items: Callable[[QuestionClassificationContext], tuple[str, ...]] = _no_urls,
+    classification_labels: Callable[[QuestionClassificationContext], dict[str, str] | None] = lambda _context: None,
+    ordering_key: Callable[[QuestionClassificationContext], str | None] = lambda _context: None,
+    entity_name: Callable[[QuestionClassificationContext], str | None] = lambda _context: None,
+    scope: Callable[[QuestionClassificationContext], str | None] = lambda _context: None,
 ) -> QuestionProfile:
     return QuestionProfile(
         name=name,
@@ -65,15 +76,34 @@ def _profile(
         expected_author=context.expected_author,
         subject_name=context.subject_name,
         text_filter=text_filter(context),
+        profile_family=profile_family or name,
+        prompt_items=prompt_items(context),
+        classification_labels=classification_labels(context),
+        ordering_key=ordering_key(context),
+        entity_name=entity_name(context),
+        scope=scope(context),
     )
-
-
-def _no_urls(_context: QuestionClassificationContext) -> tuple[str, ...]:
-    return ()
 
 
 def _generic_urls(context: QuestionClassificationContext) -> tuple[str, ...]:
     return context.generic_urls
+
+
+def _prompt_items(context: QuestionClassificationContext) -> tuple[str, ...]:
+    patterns = (
+        r"here's the list i have so far:\s*(?P<body>.+?)(?:\n\s*\n|$)",
+        r"comma separated list[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
+        r"list of items[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, context.question, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        body = re.sub(r"\s+", " ", match.group("body")).strip()
+        items = [item.strip(" .") for item in body.split(",") if item.strip()]
+        if items:
+            return tuple(items)
+    return ()
 
 
 def _youtube_urls(context: QuestionClassificationContext) -> tuple[str, ...]:
@@ -118,6 +148,31 @@ def _entity_role_chain_text_filter(
     return context.text_filter or "cast character"
 
 
+def _botanical_labels(_context: QuestionClassificationContext) -> dict[str, str]:
+    return {"include": "vegetable", "exclude": "fruit"}
+
+
+def _roster_ordering_key(_context: QuestionClassificationContext) -> str:
+    return "jersey_number"
+
+
+def _roster_entity_name(context: QuestionClassificationContext) -> str | None:
+    if not context.subject_name:
+        return None
+    match = context.question.split(context.subject_name)[0]
+    del match
+    return None
+
+
+def _roster_scope(context: QuestionClassificationContext) -> str | None:
+    lowered = context.lowered_question
+    if "pitcher" in lowered:
+        return "pitchers"
+    if "hitter" in lowered or "batter" in lowered:
+        return "hitters"
+    return None
+
+
 QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
     QuestionClassifier(
         name="attachment_required",
@@ -125,6 +180,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="attachment_required",
+            profile_family="attachment_required",
             target_urls=_no_urls,
             expected_domains_resolver=_empty_domains,
             preferred_tools=("read_local_file",),
@@ -137,6 +193,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="transcript_or_video",
+            profile_family="transcript_or_video",
             target_urls=_youtube_urls,
             expected_domains_resolver=_fixed_domains(("youtube.com", "youtu.be")),
             preferred_tools=("get_youtube_transcript", "analyze_youtube_video"),
@@ -149,6 +206,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="article_to_paper",
+            profile_family="article_to_paper",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(("universetoday.com",)),
             preferred_tools=("web_search", "fetch_url", "extract_links_from_url"),
@@ -161,6 +219,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="text_span_lookup",
+            profile_family="text_span_lookup",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(()),
             preferred_tools=("web_search", "find_text_in_url", "fetch_url"),
@@ -175,6 +234,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="wikipedia_lookup",
+            profile_family="wikipedia_lookup",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(("wikipedia.org",)),
             preferred_tools=(
@@ -186,29 +246,36 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         ),
     ),
     QuestionClassifier(
-        name="roster_neighbor_lookup",
+        name="temporal_ordered_list",
         applies=lambda context: is_roster_neighbor_question(context.lowered_question),
         build_profile=lambda context: _profile(
             context,
-            name="roster_neighbor_lookup",
+            name="temporal_ordered_list",
+            profile_family="temporal_ordered_list",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(()),
             preferred_tools=("web_search", "extract_tables_from_url", "fetch_url"),
             text_filter=_roster_text_filter,
+            ordering_key=_roster_ordering_key,
+            entity_name=_roster_entity_name,
+            scope=_roster_scope,
         ),
     ),
     QuestionClassifier(
-        name="botanical_classification",
+        name="list_item_classification",
         applies=lambda context: is_botanical_classification_question(
             context.lowered_question
         ),
         build_profile=lambda context: _profile(
             context,
-            name="botanical_classification",
+            name="list_item_classification",
+            profile_family="list_item_classification",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(()),
             preferred_tools=("web_search", "fetch_url", "find_text_in_url"),
             text_filter=_botanical_text_filter,
+            prompt_items=_prompt_items,
+            classification_labels=_botanical_labels,
         ),
     ),
     QuestionClassifier(
@@ -217,6 +284,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="entity_role_chain",
+            profile_family="entity_role_chain",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(("wikipedia.org",)),
             preferred_tools=("web_search", "fetch_url", "find_text_in_url"),
@@ -229,6 +297,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="direct_url",
+            profile_family="direct_url",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(()),
             preferred_tools=("fetch_url", "extract_tables_from_url", "extract_links_from_url"),
@@ -241,6 +310,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="wikipedia_lookup",
+            profile_family="wikipedia_lookup",
             target_urls=_generic_urls,
             expected_domains_resolver=_fixed_domains(("wikipedia.org",)),
             preferred_tools=(
@@ -257,6 +327,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="table_lookup",
+            profile_family="table_lookup",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(()),
             preferred_tools=("web_search", "extract_tables_from_url", "find_text_in_url"),
@@ -269,6 +340,7 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
         build_profile=lambda context: _profile(
             context,
             name="entity_attribute_lookup",
+            profile_family="entity_attribute_lookup",
             target_urls=_generic_urls,
             expected_domains_resolver=_default_domains(()),
             preferred_tools=("web_search", "fetch_url", "find_text_in_url"),

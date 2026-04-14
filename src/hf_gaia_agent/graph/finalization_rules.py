@@ -51,7 +51,7 @@ class TemporalRosterFinalizationRule:
 
     def applies(self, state: AgentState, answer_text: str) -> bool:
         profile = question_profile_from_state(state)
-        if profile.name != "roster_neighbor_lookup" or not profile.expected_date:
+        if profile.name != "temporal_ordered_list" or not profile.expected_date:
             return False
         normalized = normalize_submitted_answer(answer_text)
         if not normalized or is_invalid_final_response(normalized):

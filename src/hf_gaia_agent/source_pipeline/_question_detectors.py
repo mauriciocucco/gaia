@@ -63,9 +63,19 @@ def is_botanical_classification_question(lowered_question: str) -> bool:
         "here's the list i have so far",
         "comma separated list",
         "fruits and vegetables",
+        "vegetables from this list",
+        "which of these are vegetables",
     )
-    return any(cue in lowered_question for cue in botanical_cues) and any(
-        cue in lowered_question for cue in listing_cues
+    classification_cues = (
+        "classify",
+        "classification",
+        "categorize",
+        "which are",
+        "which of these",
+    )
+    return any(cue in lowered_question for cue in listing_cues) and (
+        any(cue in lowered_question for cue in botanical_cues)
+        or any(cue in lowered_question for cue in classification_cues)
     )
 
 

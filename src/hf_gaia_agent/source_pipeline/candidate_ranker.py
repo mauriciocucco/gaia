@@ -171,7 +171,7 @@ def _apply_general_rules(
     ):
         if context.profile.name in {
             "table_lookup",
-            "roster_neighbor_lookup",
+            "temporal_ordered_list",
             "text_span_lookup",
             "entity_attribute_lookup",
             "wikipedia_lookup",
@@ -217,7 +217,7 @@ def _apply_token_and_metadata_rules(
     elif context.expected_year_tokens and context.expected_year_tokens <= context.haystack_tokens:
         score += _sc("expected_year")
         reasons.append("expected_year")
-    elif context.profile.name == "roster_neighbor_lookup" and context.profile.expected_date:
+    elif context.profile.name == "temporal_ordered_list" and context.profile.expected_date:
         score += _sc("expected_date_miss")
         reasons.append("expected_date_miss")
     if context.author_tokens and context.author_tokens <= query_tokens(context.haystack):
@@ -238,13 +238,13 @@ def _apply_profile_specific_rules(
         score, reasons = _score_text_span(score, reasons, context=context)
     if context.profile.name == "entity_role_chain":
         score, reasons = _score_entity_role_chain(score, reasons, context=context)
-    if context.profile.name in {"table_lookup", "roster_neighbor_lookup", "wikipedia_lookup"}:
+    if context.profile.name in {"table_lookup", "temporal_ordered_list", "wikipedia_lookup"}:
         if any(token in context.candidate.title.lower() for token in ("roster", "statistics", "olympics")):
             score += _sc("tableish_title")
             reasons.append("tableish_title")
     if context.metric_row_lookup:
         score, reasons = _score_metric_row(score, reasons, context=context)
-    if context.profile.name == "roster_neighbor_lookup" and context.profile.expected_date:
+    if context.profile.name == "temporal_ordered_list" and context.profile.expected_date:
         score, reasons = _score_roster_neighbor(score, reasons, context=context)
     return score, reasons
 

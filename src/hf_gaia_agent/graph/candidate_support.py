@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from typing import Any
 from urllib.parse import unquote
@@ -86,10 +87,53 @@ def merge_ranked_candidates(
 
 
 def normalize_search_query(query: str) -> str:
-    tokens = sorted(
-        {token for token in re.findall(r"[a-z0-9]+", query.lower()) if len(token) >= 3}
+    lowered = query.lower()
+    tokens = [token for token in re.findall(r"[a-z0-9]+", lowered) if len(token) >= 3]
+    years = sorted({token for token in tokens if len(token) == 4 and token.isdigit()})
+    site_match = re.search(r"\bsite:([^\s]+)", lowered)
+    site = site_match.group(1).strip().lower() if site_match else ""
+    scope = ""
+    for candidate in ("pitchers", "pitcher", "batters", "batting", "winners", "recipient", "cast", "paper", "award", "botanical"):
+        if candidate in lowered:
+            scope = candidate
+            break
+    source_type = ""
+    for candidate in ("wikipedia", "official", "pdf", "roster", "stats", "paper", "table"):
+        if candidate in lowered:
+            source_type = candidate
+            break
+    action_family = "generic"
+    if any(token in lowered for token in ("botanical", "fruit", "vegetable", "botany")):
+        action_family = "classification"
+    elif any(token in lowered for token in ("roster", "pitcher", "jersey", "number")):
+        action_family = "temporal_ordered_list"
+    elif any(token in lowered for token in ("paper", "award number", "supported by nasa")):
+        action_family = "article_to_paper"
+    elif any(token in lowered for token in ("cast", "character", "played")):
+        action_family = "role_chain"
+    entities = sorted(
+        {
+            token
+            for token in tokens
+            if token not in {
+                "site", "wikipedia", "official", "roster", "pitchers", "pitcher",
+                "paper", "award", "number", "supported", "nasa", "stats", "table",
+                "fruit", "vegetable", "botanical", "botany", "cast", "character",
+                "played", "player", "players", "current", "season",
+            }
+        }
+    )[:6]
+    return json.dumps(
+        {
+            "action_family": action_family,
+            "site": site,
+            "years": years,
+            "source_type": source_type,
+            "scope": scope,
+            "entities": entities,
+        },
+        sort_keys=True,
     )
-    return " ".join(tokens)
 
 
 def is_semantically_duplicate_search(
@@ -97,15 +141,52 @@ def is_semantically_duplicate_search(
 ) -> bool:
     if not signature:
         return False
-    current_tokens = set(signature.split())
+    current = _parse_search_signature(signature)
     for previous in previous_signatures:
-        previous_tokens = set(previous.split())
-        if current_tokens == previous_tokens:
+        parsed_previous = _parse_search_signature(previous)
+        if current == parsed_previous:
             return True
-        union = current_tokens | previous_tokens
-        if union and len(current_tokens & previous_tokens) / len(union) >= 0.8:
+        if current["action_family"] != parsed_previous["action_family"]:
+            continue
+        if current["years"] != parsed_previous["years"]:
+            continue
+        if current["site"] != parsed_previous["site"]:
+            continue
+        if current["source_type"] != parsed_previous["source_type"]:
+            continue
+        if current["scope"] != parsed_previous["scope"]:
+            continue
+        current_entities = set(current["entities"])
+        previous_entities = set(parsed_previous["entities"])
+        if current_entities == previous_entities:
+            return True
+        union = current_entities | previous_entities
+        if union and len(current_entities & previous_entities) / len(union) >= 0.85:
             return True
     return False
+
+
+def _parse_search_signature(signature: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(signature)
+    except Exception:
+        tokens = signature.split()
+        return {
+            "action_family": "generic",
+            "site": "",
+            "years": [],
+            "source_type": "",
+            "scope": "",
+            "entities": tokens,
+        }
+    return {
+        "action_family": str(parsed.get("action_family", "")),
+        "site": str(parsed.get("site", "")),
+        "years": list(parsed.get("years") or []),
+        "source_type": str(parsed.get("source_type", "")),
+        "scope": str(parsed.get("scope", "")),
+        "entities": list(parsed.get("entities") or []),
+    }
 
 
 def execute_python_allowed(state: AgentState) -> tuple[bool, str | None]:
@@ -268,7 +349,7 @@ def preferred_ranked_fetch_candidate(
         ):
             return best_candidate
 
-    if profile.name == "roster_neighbor_lookup" and profile.expected_date:
+    if profile.name == "temporal_ordered_list" and profile.expected_date:
         decoded_requested_lower = unquote(requested_url).lower()
         requested_is_current_roster = (
             "list_of_current" in requested_lower
@@ -362,7 +443,7 @@ def pick_best_unfetched_candidate(
         ranked_candidates_from_state(state),
         fetched_urls=fetched_urls,
     )
-    if buckets.useful_unfetched:
+    if buckets.useful_unfetched and candidate_has_strong_signal(buckets.useful_unfetched[0]):
         return buckets.useful_unfetched[0]
 
     candidates: list[str] = []

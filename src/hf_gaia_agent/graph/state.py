@@ -48,4 +48,6 @@ class AgentState(MessagesState):
     question_profile: dict[str, Any]
     ranked_candidates: list[dict[str, Any]]
     search_history_normalized: list[str]
+    search_history_fingerprints: list[str]
     structured_tool_outputs: list[dict[str, Any]]
+    skill_trace: list[str]

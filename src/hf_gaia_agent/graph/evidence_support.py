@@ -131,7 +131,7 @@ def should_prefer_structured_answer(
     if reducer_used not in PREFERRED_STRUCTURED_REDUCERS:
         return False
     if reducer_used == "roster_neighbor":
-        return profile.name == "roster_neighbor_lookup"
+        return profile.name == "temporal_ordered_list"
     if reducer_used == "text_span_attribute":
         return profile.name == "text_span_lookup"
     return True
@@ -182,7 +182,7 @@ def record_has_roster_context(record: EvidenceRecord) -> bool:
 
 
 def record_matches_roster_subject(record: EvidenceRecord, profile: QuestionProfile) -> bool:
-    if profile.name != "roster_neighbor_lookup" or not profile.subject_name:
+    if profile.name != "temporal_ordered_list" or not profile.subject_name:
         return True
     haystack = normalize_submitted_answer(
         f"{record.source_url}\n{record.title_or_caption}\n{record.content}"
@@ -240,7 +240,7 @@ def record_has_temporal_support(record: EvidenceRecord, profile: QuestionProfile
 
 def has_temporally_grounded_roster_evidence(state: AgentState) -> bool:
     profile = question_profile_from_state(state)
-    if profile.name != "roster_neighbor_lookup" or not profile.expected_date:
+    if profile.name != "temporal_ordered_list" or not profile.expected_date:
         return False
     records = collect_evidence_records_from_state(state)
     relevant_records = [
@@ -253,7 +253,7 @@ def has_temporally_grounded_roster_evidence(state: AgentState) -> bool:
 
 def grounded_temporal_roster_answer(state: AgentState) -> str | None:
     profile = question_profile_from_state(state)
-    if profile.name != "roster_neighbor_lookup" or not profile.expected_date:
+    if profile.name != "temporal_ordered_list" or not profile.expected_date:
         return None
     records = collect_evidence_records_from_state(state)
     temporal_records = [
@@ -269,9 +269,31 @@ def grounded_temporal_roster_answer(state: AgentState) -> str | None:
     return answer if reducer == "roster_neighbor" else None
 
 
+def grounded_temporal_ordered_list_answer(
+    state: AgentState, *, with_records: bool = False
+) -> tuple[str | None, list[EvidenceRecord]] | str | None:
+    profile = question_profile_from_state(state)
+    if profile.name != "temporal_ordered_list" or not profile.expected_date:
+        return (None, []) if with_records else None
+    records = collect_evidence_records_from_state(state)
+    temporal_records = [
+        record
+        for record in records
+        if record.kind in {"table", "text"}
+        and record_has_roster_context(record)
+        and record_has_temporal_support(record, profile)
+    ]
+    if not temporal_records:
+        return (None, []) if with_records else None
+    answer, reducer = solve_answer_from_evidence_records(state["question"], temporal_records)
+    if reducer != "roster_neighbor":
+        return (None, temporal_records) if with_records else None
+    return (answer, temporal_records[-6:]) if with_records else answer
+
+
 def has_temporal_roster_grounding_gap(state: AgentState) -> bool:
     profile = question_profile_from_state(state)
-    if profile.name != "roster_neighbor_lookup" or not profile.expected_date:
+    if profile.name != "temporal_ordered_list" or not profile.expected_date:
         return False
     records = collect_evidence_records_from_state(state)
     if not records:
@@ -291,9 +313,9 @@ def requires_temporal_roster_retry(state: AgentState, answer_text: str) -> bool:
     if not candidate or is_invalid_final_response(candidate):
         return False
     profile = question_profile_from_state(state)
-    if profile.name != "roster_neighbor_lookup" or not profile.expected_date:
+    if profile.name != "temporal_ordered_list" or not profile.expected_date:
         return False
-    grounded_answer = grounded_temporal_roster_answer(state)
+    grounded_answer = grounded_temporal_ordered_list_answer(state)
     if grounded_answer is None:
         return True
     return normalize_submitted_answer(grounded_answer) != candidate
@@ -304,12 +326,21 @@ def requires_botanical_classification_retry(state: AgentState, answer_text: str)
     if not candidate or is_invalid_final_response(candidate):
         return False
     profile = question_profile_from_state(state)
-    if profile.name != "botanical_classification":
+    if profile.name != "list_item_classification":
         return False
-    return not any(
+    if not any(
         record.kind in {"text", "table", "transcript"}
         for record in collect_evidence_records_from_state(state)
+    ):
+        return True
+    prompt_items = list(profile.prompt_items or ())
+    if not prompt_items:
+        return False
+    normalized_answer = normalize_submitted_answer(answer_text).lower()
+    mentioned_items = sum(
+        1 for item in prompt_items if normalize_submitted_answer(item).lower() in normalized_answer
     )
+    return mentioned_items == 0
 
 
 def top_grounded_evidence_records(
@@ -343,7 +374,7 @@ def top_grounded_evidence_records(
             score += 8
         if profile.expected_date and profile.expected_date.lower() in haystack:
             score += 8
-        if profile.name == "roster_neighbor_lookup" and profile.expected_date:
+        if profile.name == "temporal_ordered_list" and profile.expected_date:
             if record_has_temporal_support(record, profile):
                 score += 20
             if record_looks_current_only(record):

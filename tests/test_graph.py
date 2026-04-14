@@ -1504,8 +1504,9 @@ def test_graph_botanical_fallback_ignores_low_signal_fruit_metadata_pages(monkey
         )
     )
 
-    assert result["submitted_answer"] == "broccoli, sweet potatoes"
-    assert result["reducer_used"] == "botanical_classification"
+    assert result["submitted_answer"] == ""
+    assert result["reducer_used"] is None
+    assert result["fallback_reason"] == "botanical_classification_evidence_missing"
 
 
 def test_graph_botanical_fallback_skips_social_noise_when_strong_source_is_present(

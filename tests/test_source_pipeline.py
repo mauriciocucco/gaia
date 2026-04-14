@@ -36,7 +36,7 @@ def test_profile_question_extracts_month_year_expected_date() -> None:
         "Who are the pitchers with the number before and after Taishō Tamai's number as of July 2023?"
     )
 
-    assert profile.name == "roster_neighbor_lookup"
+    assert profile.name == "temporal_ordered_list"
     assert profile.expected_date == "as of July 2023"
 
 

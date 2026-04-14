@@ -16,6 +16,12 @@ class QuestionProfile:
     expected_author: str | None
     subject_name: str | None
     text_filter: str | None
+    profile_family: str | None = None
+    prompt_items: tuple[str, ...] = ()
+    classification_labels: dict[str, str] | None = None
+    ordering_key: str | None = None
+    entity_name: str | None = None
+    scope: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -29,6 +29,12 @@ def question_profile_from_state(state: AgentState) -> QuestionProfile:
             expected_author=raw.get("expected_author"),
             subject_name=raw.get("subject_name"),
             text_filter=raw.get("text_filter"),
+            profile_family=raw.get("profile_family"),
+            prompt_items=tuple(raw.get("prompt_items") or ()),
+            classification_labels=raw.get("classification_labels"),
+            ordering_key=raw.get("ordering_key"),
+            entity_name=raw.get("entity_name"),
+            scope=raw.get("scope"),
         )
     return profile_question(
         state["question"],
@@ -151,7 +157,7 @@ def build_profile_guidance_block(*, question: str, profile: QuestionProfile) -> 
         hints.append(
             "Prefer the canonical Wikipedia page or the directly relevant list page. If the answer depends on counts, rosters, or participants, use extract_tables_from_url before broader search."
         )
-    if profile.name == "roster_neighbor_lookup":
+    if profile.name == "temporal_ordered_list":
         hints.append(
             "Fetch a roster or pitchers table directly and answer from that table. Do not reconstruct roster data from memory or with invented Python lists."
         )
@@ -172,15 +178,15 @@ def build_profile_guidance_block(*, question: str, profile: QuestionProfile) -> 
         hints.append(
             "Find the exact article page, inspect its outgoing links, then read the linked paper or source. Answer only from fetched evidence."
         )
-    if profile.name == "botanical_classification":
+    if profile.name == "list_item_classification":
         hints.append(
-            "This is a botanical classification task. Do not answer from culinary/common usage or from memory."
+            "This is a list item classification task. Do not answer from culinary/common usage or from memory."
         )
         hints.append(
-            "Search snippets alone are not sufficient. Ground the classification in fetched page text before finalizing."
+            "Search snippets alone are not sufficient. Ground classifications in fetched page text before finalizing."
         )
         hints.append(
-            "Use web_search to find relevant sources, then fetch_url or find_text_in_url to verify ambiguous items before filtering and alphabetizing the final list."
+            "Use web_search to find relevant sources, then fetch_url or find_text_in_url to verify ambiguous items before assembling the final list."
         )
     if profile.name == "text_span_lookup":
         hints.append(
@@ -294,15 +300,20 @@ def _parse_markdown_operation_table(question: str) -> dict[tuple[str, str], str]
 
 
 def extract_prompt_list_items(question: str) -> list[str]:
-    match = re.search(
+    patterns = (
         r"here's the list i have so far:\s*(?P<body>.+?)(?:\n\s*\n|$)",
-        question,
-        flags=re.IGNORECASE | re.DOTALL,
+        r"comma separated list[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
+        r"list of items[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
     )
-    if not match:
-        return []
-    body = re.sub(r"\s+", " ", match.group("body")).strip()
-    return [item.strip() for item in body.split(",") if item.strip()]
+    for pattern in patterns:
+        match = re.search(pattern, question, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        body = re.sub(r"\s+", " ", match.group("body")).strip()
+        items = [item.strip(" .") for item in body.split(",") if item.strip()]
+        if items:
+            return items
+    return []
 
 
 def normalize_botanical_text(value: str) -> str:

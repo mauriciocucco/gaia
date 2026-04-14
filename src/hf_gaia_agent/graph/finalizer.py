@@ -13,6 +13,7 @@ from .answer_policy import (
     looks_like_placeholder_answer,
 )
 from .contracts import FinalizationServices
+from .routing import question_profile_from_state
 from .state import AgentState
 
 
@@ -68,9 +69,26 @@ class WorkflowFinalizer:
         if preferred_structured_result:
             return preferred_structured_result
 
-        resolver_result = self._services.run_fallback_resolvers(state)
-        if resolver_result:
-            return resolver_result
+        run_core_recoveries = getattr(self._services, "run_core_recoveries", None)
+        core_recovery = run_core_recoveries(state) if callable(run_core_recoveries) else None
+        if core_recovery:
+            return core_recovery
+
+        run_skills = getattr(self._services, "run_skills", None)
+        skill_result = run_skills(state) if callable(run_skills) else None
+        if skill_result:
+            return skill_result
+
+        profile = question_profile_from_state(state)
+        if profile.name == "temporal_ordered_list":
+            run_adapters = getattr(self._services, "run_adapters", None)
+            adapter_result = (
+                run_adapters("temporal_ordered_list", state)
+                if callable(run_adapters)
+                else None
+            )
+            if adapter_result:
+                return adapter_result
 
         for rule in self._services.finalization_rules:
             if not rule.applies(state, final_answer):

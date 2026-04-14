@@ -143,13 +143,18 @@ class ToolPolicyEngine:
             "decision_trace": context.decision_trace,
             "ranked_candidates": serialize_candidates(context.ranked_candidates),
             "search_history_normalized": context.search_history,
+            "search_history_fingerprints": context.search_history,
             "structured_tool_outputs": context.structured_tool_outputs,
         }
 
     def _build_context(self, state: AgentState) -> ToolPolicyRunContext:
         tool_trace = list(state.get("tool_trace") or [])
         decision_trace = list(state.get("decision_trace") or [])
-        search_history = list(state.get("search_history_normalized") or [])
+        search_history = list(
+            state.get("search_history_fingerprints")
+            or state.get("search_history_normalized")
+            or []
+        )
         return ToolPolicyRunContext(
             tool_trace=tool_trace,
             decision_trace=decision_trace,
@@ -208,6 +213,20 @@ class ToolPolicyEngine:
                     )
                 )
                 return True
+            self._append_trace(context, tool_name, raw_tool_args)
+            context.consecutive_searches += 1
+            context.tool_messages.append(
+                ToolMessage(
+                    content=(
+                        "SEARCH STRATEGY SHIFT REQUIRED: repeated searches did not produce a strong unread candidate. "
+                        "Do not auto-fetch low-signal results. Change strategy now: add a specific year, domain, site:, "
+                        "or source type, or read the best grounded evidence already collected."
+                    ),
+                    tool_call_id=tool_call_id,
+                    name=tool_name,
+                )
+            )
+            return True
 
         if (
             search_signature

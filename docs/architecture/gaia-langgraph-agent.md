@@ -1,549 +1,511 @@
 # GAIA LangGraph Agent
 
-> **Documento de estudio para programadores que empiezan con agentes de IA.**
-> Si encontrás un término que no conocés, buscalo primero en el [Glosario](#glosario) al final de esta página.
+> Documento de estudio para programadores que empiezan con agentes de IA.
+> La idea es explicar el código real de este repo con lenguaje claro, ejemplos y un glosario.
 
 ## Resumen
 
-Este proyecto implementa un agente para el benchmark GAIA (conjunto de preguntas de evaluación para agentes de IA) usando un `StateGraph` de LangGraph relativamente pequeño, pero reforzado con bastante lógica determinística alrededor del estado, las fuentes y la finalización.
+Este proyecto implementa un agente para el benchmark GAIA usando LangGraph, pero la idea central no es "dejar que el modelo haga todo".
 
-La idea central **no es "dejar que el modelo haga todo"**: se usa el LLM como planificador y lector, mientras que el código Python impone restricciones de seguridad (guardrails), ordenamiento de evidencias por confianza (ranking) y extractores determinísticos (reducers) cuando la respuesta puede obtenerse sin otra llamada al modelo.
+El LLM se usa como:
 
-Como caso de estudio de LangGraph, este repo es útil porque separa bastante bien tres capas:
+- planificador
+- lector de evidencia
+- ensamblador de respuestas cuando hace falta
 
-1. **Orquestación del grafo** en `graph/workflow.py` — define el flujo general de nodos
-2. **Clasificación de preguntas y normalización de evidencia** en `source_pipeline/` — analiza qué tipo de pregunta es y qué calidad tienen las fuentes
-3. **Extracción determinística** desde prompt o evidencia estructurada en `reducers/` — intenta sacar la respuesta con código Python puro, sin el modelo
+El código Python se usa como:
+
+- capa de control
+- capa de ranking de fuentes
+- capa de grounding
+- capa de extracción determinística
+
+La arquitectura actual está organizada en capas explícitas:
+
+1. `graph/`: orquestación del workflow
+2. `source_pipeline/`: perfilado de preguntas y ranking de fuentes
+3. `reducers/`: extractores determinísticos sobre evidencia
+4. `core/recoveries/`: recuperaciones reutilizables
+5. `skills/`: capacidades generales orientadas a tipos de tarea
+6. `adapters/`: integración específica por sitio, dominio o ecosistema
+
+La separación importante es esta:
+
+- el agente general vive en `graph`, `source_pipeline`, `reducers` y `core/recoveries`
+- la lógica muy específica del benchmark ya no debería contaminar el core; vive en `skills/gaia` y en `adapters/`
 
 ## Arquitectura general
 
-El flujo visible empieza en la CLI (_command-line interface_, la herramienta de línea de comandos) de `cli.py`, que:
+El flujo visible empieza en la CLI de `cli.py`, que:
 
-- carga variables de entorno
+- carga configuración
 - consulta la API de GAIA con `api_client.py`
-- descarga archivos adjuntos cuando existen
+- descarga adjuntos cuando existen
 - instancia `GaiaGraphAgent`
 - llama `solve(question, local_file_path=...)`
 
-La separación entre ejecución y presentación está en `runner.py`, mientras que la observabilidad (poder ver qué hace el agente internamente) se maneja por medio de hooks (`hooks.py`) en vez de monkeypatching.
-
-> **¿Qué es un hook?** Es una función que el sistema llama automáticamente en ciertos momentos clave (por ejemplo, antes y después de cada tool). Es como suscribirse a eventos sin modificar el código que los dispara.
+La observabilidad se resuelve con `hooks.py`, no con monkeypatching. Eso permite ver qué tools se llaman y con qué resultados sin ensuciar la lógica principal.
 
 `solve()` tiene dos caminos:
 
-- Primero intenta un **`prompt_reducer`** mínimo: un extractor limitado a respuestas que se pueden derivar solo del texto de la pregunta, sin consultar ninguna fuente externa. Hoy ese camino rápido (_fast-path_) cubre tablas o estructuras ya incluidas en la propia pregunta, como `non_commutative_subset`.
-- Si ese extractor no aplica, invoca el `StateGraph` compilado y devuelve un resultado enriquecido con `tool_trace`, `decision_trace`, `evidence_used`, `reducer_used` y `fallback_reason`.
+1. un `prompt_reducer` rápido para preguntas totalmente contenidas en el prompt
+2. el `StateGraph` completo cuando hace falta buscar, leer o validar evidencia
 
-> **Importante:** la decodificación de texto invertido existe como normalización de input (para que el modelo lea mejor), no como resolvedor. La lógica determinística vive _después_ de recolectar evidencia, dentro de reducers y rescates orientados a fuentes concretas.
+## Qué cambió conceptualmente
+
+Antes, mucha lógica especializada caía en una bolsa llamada `fallbacks`.
+
+Ahora hay tres conceptos distintos:
+
+### Core recovery
+
+Una estrategia reusable del agente general.
+
+Ejemplos:
+
+- `article_to_paper`
+- `text_span`
+
+Regla práctica:
+
+- si sirve fuera de GAIA y no depende de un sitio raro, probablemente es core recovery
+
+### Skill
+
+Una capacidad general del agente para resolver una familia de tareas.
+
+Ejemplos:
+
+- `temporal_ordered_list`
+- `set_classification`
+
+Regla práctica:
+
+- si describe "qué tipo de problema sé resolver", es una skill
+
+### Adapter
+
+Una integración específica de fuente o ecosistema.
+
+Ejemplos:
+
+- `FightersAdapter`
+- `WikipediaRosterAdapter`
+- `OfficialTeamDirectoryAdapter`
+
+Regla práctica:
+
+- si sabe de un dominio, una estructura HTML concreta o un patrón de URL, es un adapter
 
 ## Mapa de módulos
 
-### `graph/` — Núcleo del workflow
+### `graph/` - Núcleo del workflow
 
-Está partido en módulos con responsabilidades claras:
+| Módulo | Responsabilidad |
+| --- | --- |
+| `workflow.py` | `GaiaGraphAgent`, construcción del `StateGraph`, `solve()` |
+| `state.py` | `AgentState`: contrato de estado entre nodos |
+| `tool_policy.py` | Ejecuta tools y aplica guardrails |
+| `finalizer.py` | Orquesta la decisión final |
+| `services.py` | Implementa los servicios que consumen workflow y finalizer |
+| `contracts.py` | Protocolos chicos para evidence, recoveries, skills y finalización |
+| `routing.py` | Helpers de perfilado, hints y decisiones de flujo |
+| `candidate_support.py` | Dedupe de búsquedas, ranking auxiliar, selección de candidatos |
+| `evidence_support.py` | Recolección de evidencia, grounding y structured answers |
+| `finalization_rules.py` | Reglas finales específicas para casos sensibles |
+| `retry_rules.py` | Reglas para reintentos de respuestas inválidas |
+| `nudges.py` | Sugerencias que se inyectan al prompt |
 
-| Módulo                  | Responsabilidad                                                                                                             |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `workflow.py`           | `GaiaGraphAgent`, compilación del `StateGraph`, nodos principales, `solve()`                                                |
-| `state.py`              | `AgentState` — el estado compartido entre nodos, con campos de control y auditoría                                          |
-| `contracts.py`          | Protocolos chicos para evidencia, ranking, ejecucion de tools y finalizacion                                                |
-| `services.py`           | Implementacion concreta que compone esas interfaces sin exponer un service locator unico                                    |
-| `tool_policy.py`        | Coordinador del nodo `tools`; aplica politicas, followups y actualizacion de candidatos                                     |
-| `finalizer.py`          | Arbitraje final de respuesta apoyado en servicios de evidencia y fallbacks                                                  |
-| `prompts.py`            | System prompt, ajuste del prompt (_prompt shaping_), pistas de investigación                                                |
-| `routing.py`            | Conexiones condicionales (_conditional edges_), política de tools, guardias de búsqueda                                     |
-| `candidate_support.py`  | Clasifica candidatos en cubos de calidad (`RankedCandidateBuckets`): útiles no leídos, útiles ya agotados y de baja calidad |
-| `evidence_support.py`   | Helpers de _grounding_ y detección de respuestas estructuradas en el estado                                                 |
-| `nudges.py`             | Sugerencias inyectadas al prompt: candidatos no leídos, búsqueda atascada (_stuck search_), saturación de búsquedas         |
-| `finalization_rules.py` | Reglas benchmark-specific de finalización (cuándo forzar reducer, cuándo aceptar tool)                                      |
-| `retry_rules.py`        | Reglas de reintento de respuesta inválida                                                                                   |
-| `answer_policy.py`      | Validación de respuestas, canonicalización, detección de placeholders (respuestas vacías)                                   |
+### `core/recoveries/` - Recuperaciones reutilizables
 
-`workflow.py` concentra la orquestación del grafo, mientras que `tool_policy.py` y `finalizer.py` consumen protocolos chicos definidos en `contracts.py`.
+Acá viven estrategias que no dependen de GAIA como benchmark.
 
-### `fallbacks/` — Registro de resolvers de rescate
+| Recovery | Qué hace |
+| --- | --- |
+| `article_to_paper` | Va desde un artículo a una fuente primaria para encontrar un award number |
+| `text_span` | Busca un fragmento puntual en una página o fetch completo y lo reduce |
 
-Los **rescates orientados a la fuente** (_source-aware fallbacks_) son estrategias alternativas que se activan cuando el flujo principal no logró una respuesta confiable. Están organizados como un registro (_registry_) con una interfaz común:
+### `skills/` - Capacidades generales
 
-```python
-class FallbackResolver(Protocol):
-    # Protocol en Python equivale a una "interfaz" en otros lenguajes:
-    # define qué métodos debe tener cualquier clase que quiera ser un FallbackResolver.
-    name: str
-    def applies(self, state: AgentState, profile: QuestionProfile) -> bool: ...
-    def run(self, state: AgentState) -> dict[str, Any] | None: ...
-```
+| Skill | Qué resuelve |
+| --- | --- |
+| `temporal_ordered_list` | Preguntas del tipo "quién está antes o después en una lista ordenada válida para una fecha" |
+| `set_classification` | Clasificación determinística de ítems de un conjunto |
 
-| Resolver           | Para qué sirve                                                                                                                                                                                                                |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `article_to_paper` | Busca fuentes alternativas al sitio editorial (_publisher_) original y llama a `find_text`/`fetch` para encontrar el número de subvención (_award_number_)                                                                    |
-| `text_span`        | Toma páginas candidatas con buena puntuación (_score_), intenta `find_text` → `fetch` completo para extraer un fragmento de texto (_text span_)                                                                               |
-| `roster`           | Delega en resolvers oficiales por ecosistema/fuente para listas de jugadores (_rosters_) sensibles a la fecha                                                                                                                 |
-| `botanical`        | Reutiliza la evidencia ya recolectada por el flujo principal antes de hacer nuevas búsquedas; si no alcanza, busca por ítem con presupuesto propio (`FallbackAttemptBudget`) y vota la clasificación desde pasajes relevantes |
-| `role_chain`       | Fuerza evidencia para los dos pasos de la cadena entidad → rol (por ejemplo: "¿qué cargo tenía la persona X en la organización Y?")                                                                                           |
-| `competition`      | Descarga páginas oficiales de la competición para obtener nacionalidad/país                                                                                                                                                   |
+### `skills/gaia/` - Especializaciones del benchmark
 
-`utils.py` concentra los helpers compartidos por todos los resolvers. El más importante es `FallbackAttemptBudget`: un objeto que cada resolver instancia con un límite de búsquedas y fetches permitidos. Antes de ejecutar cada búsqueda o descarga, le pregunta al budget si aún tiene crédito; si se agotó, para. Esto evita que un resolver gaste recursos ilimitados cuando la evidencia ya no mejora.
+| Skill | Qué hace |
+| --- | --- |
+| `botanical_gaia` | Clasifica ítems del prompt como vegetable o fruit en sentido botánico |
+| `competition_gaia` | Recupera evidencia de competiciones o premios para preguntas de nacionalidad/ganador |
+| `role_chain_gaia` | Resuelve preguntas de cadena entidad -> rol con dos pasos |
 
-**Patrón clave:** `finalize` itera el registro en vez de tener un `if`/`elif` por familia de pregunta. Esto facilita agregar nuevos rescates sin tocar la lógica central.
+### `adapters/` - Integración específica por fuente
 
-### `reducers/` — Extractores determinísticos sobre evidencia
+| Adapter | Qué encapsula |
+| --- | --- |
+| `FightersAdapter` | Heurísticas concretas de `npb.jp` y `fighters.co.jp` |
+| `WikipediaRosterAdapter` | Extracción de tablas roster desde Wikipedia |
+| `OfficialTeamDirectoryAdapter` | Lectura de directorios oficiales de jugadores |
 
-Cada familia de extracción tiene su propio módulo.
+### `reducers/` - Extractores determinísticos
 
-> **¿Qué es un reducer acá?** No tiene nada que ver con Redux. Es simplemente una función que toma evidencia estructurada (una tabla, una lista, un texto) y extrae la respuesta con lógica Python pura, sin llamar al modelo. Se llama "reducer" porque _reduce_ un conjunto de evidencia a una respuesta concreta.
+> Acá "reducer" no significa Redux. Significa "función que reduce evidencia a una respuesta concreta".
 
-| Reducer         | Qué extrae                                                                                |
-| --------------- | ----------------------------------------------------------------------------------------- |
-| `metric_row`    | Una fila de tabla, texto lineal de estadísticas, tablas de clasificación (_leaderboards_) |
-| `roster`        | El jugador anterior o siguiente en una lista ordenada (_roster_)                          |
-| `text_span`     | Atributos extraídos desde fragmentos de texto (_text spans_)                              |
-| `award`         | Números de beca/subvención (_award/grant numbers_) con validación del sujeto              |
-| `table_compare` | Comparaciones entre celdas de tablas                                                      |
-| `temporal`      | Filtros por fecha o temporada deportiva                                                   |
+| Reducer | Qué extrae |
+| --- | --- |
+| `metric_row` | Una fila o líder en una tabla de estadísticas |
+| `roster` | Vecino anterior o siguiente en una lista ordenada |
+| `text_span` | Un atributo desde un fragmento de texto |
+| `award` | Números de subvención o beca |
+| `table_compare` | Comparaciones entre celdas |
+| `temporal` | Filtros por fecha o temporada |
 
-`evidence_solver.py` queda como orquestador que itera los reducers por prioridad.
+### `source_pipeline/` - Perfilado y ranking
 
-`base.py` define la interfaz común `ReducerResult`.
+| Módulo | Responsabilidad |
+| --- | --- |
+| `question_classifier.py` | Devuelve `QuestionProfile` |
+| `_question_classifiers.py` | Registro ordenado de clasificadores |
+| `_question_detectors.py` | Detectores booleanos de familia de pregunta |
+| `_question_extractors.py` | Fecha, autor, sujeto, text filter |
+| `candidate_ranker.py` | Puntúa URLs y snippets |
+| `evidence_normalizer.py` | Convierte output de tools en `EvidenceRecord` |
+| `_models.py` | `QuestionProfile`, `SourceCandidate`, `EvidenceRecord` |
 
-### `source_pipeline/` — Clasificación y ordenamiento de fuentes
+## El `QuestionProfile`
 
-Convierte los resultados de las tools en estructuras útiles para razonar:
-
-| Módulo                     | Responsabilidad                                                                                                                                                                                                                                                                                    |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `question_classifier.py`   | `QuestionProfile`: tipo de pregunta, dominio esperado, pistas para buscar                                                                                                                                                                                                                          |
-| `candidate_ranker.py`      | `score_candidates`: asigna puntuación a cada URL según su relevancia percibida; descarta ruido comercial irrelevante (restaurantes, farmacias, reservas, etc.) sin señal fuerte de relevancia; aplica un boost a páginas que mencionan financiamiento NASA o número de subvención (_funding hint_) |
-| `evidence_normalizer.py`   | `EvidenceRecord`: normaliza la evidencia producida por las tools en un formato único                                                                                                                                                                                                               |
-| `source_labels.py`         | Etiquetas del tipo de fuente (Wikipedia, estadísticas, libro de texto, etc.)                                                                                                                                                                                                                       |
-| `_models.py`               | Objetos de datos (_DTOs_): `QuestionProfile`, `SourceCandidate`, `EvidenceRecord`                                                                                                                                                                                                                  |
-| `_question_classifiers.py` | Registro ordenado de clasificadores: conecta detectores y extractores en un pipeline único                                                                                                                                                                                                         |
-| `_question_detectors.py`   | Funciones booleanas que detectan el tipo de pregunta                                                                                                                                                                                                                                               |
-| `_question_extractors.py`  | Extracción de fechas, nombres y entidades del enunciado de la pregunta                                                                                                                                                                                                                             |
-
-> **¿Qué es un DTO?** _Data Transfer Object_: una clase simple que solo agrupa datos relacionados, sin lógica de negocio. Es el equivalente a un struct en C o un record en Java. Aquí se usan para pasar información entre módulos con un formato bien definido.
-
-### `tools/` — Herramientas del agente
-
-Separado por dominio:
-
-| Módulo         | Qué hace                                                                                         |
-| -------------- | ------------------------------------------------------------------------------------------------ |
-| `search.py`    | Búsqueda web: Brave, DuckDuckGo, Tavily, Wikipedia                                               |
-| `web.py`       | `fetch_url`, `find_text_in_url`, `extract_tables_from_url`, `extract_links_from_url`             |
-| `document.py`  | Lectura de archivos locales (PDF, XLSX, CSV, JSON, HTML, audio)                                  |
-| `media.py`     | Descarga de YouTube, extracción de frames de video, transcripción de audio                       |
-| `compute.py`   | `calculate`, `execute_python_code`                                                               |
-| `_http.py`     | Cliente HTTP centralizado con cabeceras (_headers_), tiempos límite y reintentos                 |
-| `_payloads.py` | Payloads tipados internos (`SearchResultPayload`, `TextDocumentPayload`, `StructuredToolResult`) |
-
-### `api_client.py` — Cliente de la API de evaluación
-
-Capa delgada sobre la API del curso. Usa objetos de datos normalizados (`Question.level` en vez del `Level` heredado de la API). Incluye **reintentos con backoff**: si la API falla con errores temporales (502, 503, 504, 429), espera un poco más en cada intento en lugar de fallar inmediatamente.
-
-> **¿Qué es backoff?** Es una estrategia de reintentos donde cada nuevo intento espera un poco más que el anterior (por ejemplo: 1 s, 2 s, 4 s...). Evita saturar un servicio que ya está bajo presión.
-
-### `hooks.py` — Observabilidad
-
-Sistema de hooks para observar el comportamiento del agente:
-
-- `AgentHook` (interfaz / `Protocol`): define los eventos `on_tool_start`, `on_tool_end`, `on_solve_start`, `on_solve_end`
-- `VerboseHook`: imprime las llamadas a tools en la consola
-- `CompositeHook`: reenvía los eventos a múltiples hooks al mismo tiempo
-
-### `runner.py` — Orquestación de ejecución
-
-Separa la ejecución de la presentación de resultados:
-
-- `solve_questions()`: resuelve un lote (_batch_) de preguntas
-- `solve_question_by_id()`: por task-id o índice
-- `resolve_attachment()`: descarga de archivos adjuntos
-- `write_results()`: guarda los resultados en disco
-
-### `normalize.py` — Normalización de respuestas
-
-Pequeño, claro y bien testeado. Extrae bloques `[ANSWER]`, limpia etiquetas, comillas y marcadores de código (_fences_), normaliza espacios y comas.
-
-## El `AgentState` y por qué importa
-
-En LangGraph, el **estado** es el contrato entre nodos: es el objeto que todos los nodos leen y escriben. Aquí no solo se guardan mensajes de conversación; también se conserva contexto operacional para controlar el comportamiento del agente. El estado está definido en `graph/state.py`.
+`QuestionProfile` es la representación estructurada de "qué tipo de pregunta parece ser esto".
 
 Campos importantes:
 
-- `messages`: historial de mensajes para el modelo y las tools
-- `question`, `file_name`, `local_file_path`: contexto base de la tarea (la pregunta y el archivo adjunto si existe)
-- `iterations`, `max_iterations`: contador para evitar que el agente entre en un loop infinito
-- `tool_trace`: registro legible de qué tools se llamaron y con qué argumentos
-- `decision_trace`: registro de decisiones del modelo, útil para detectar patrones como búsquedas repetidas
-- `question_profile`: clasificación estructurada de la pregunta (tipo, dominio, pistas)
-- `ranked_candidates`: URLs ordenadas por confianza percibida (las mejores primero)
-- `search_history_normalized`: historial normalizado de búsquedas para bloquear consultas casi duplicadas
-- `evidence_used`, `reducer_used`, `fallback_reason`: explican por qué y cómo se llegó a la respuesta final
-- `final_answer`, `error`: salida final del flujo
+- `name`: nombre del perfil
+- `profile_family`: familia más general
+- `expected_domains`: dominios preferidos
+- `expected_date`: fecha o temporada esperada
+- `subject_name`: sujeto principal
+- `text_filter`: hint para tablas, links o spans
+- `prompt_items`: ítems extraídos del prompt
+- `classification_labels`: etiquetas de inclusión/exclusión
+- `ordering_key`: clave de orden esperada
+- `scope`: subgrupo relevante, por ejemplo `pitchers`
 
-**La idea reutilizable:** en LangGraph no conviene pensar el estado solo como "historial del chat". También puede ser:
+### Ejemplo 1: clasificación botánica
 
-- **Memoria de control**: cuántas veces buscamos, qué candidatos tenemos
-- **Memoria de calidad**: cuáles fuentes son confiables
-- **Memoria de auditoría**: por qué se eligió esta respuesta
+Pregunta:
+
+```text
+Here's the list I have so far:
+broccoli, plums, sweet potatoes
+Please alphabetize the vegetables...
+```
+
+Perfil esperado:
+
+```python
+QuestionProfile(
+    name="list_item_classification",
+    profile_family="list_item_classification",
+    prompt_items=("broccoli", "plums", "sweet potatoes"),
+    classification_labels={"include": "vegetable", "exclude": "fruit"},
+)
+```
+
+### Ejemplo 2: roster temporal
+
+Pregunta:
+
+```text
+Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023?
+```
+
+Perfil esperado:
+
+```python
+QuestionProfile(
+    name="temporal_ordered_list",
+    profile_family="temporal_ordered_list",
+    expected_date="as of July 2023",
+    subject_name="Taisho Tamai",
+    ordering_key="jersey_number",
+    scope="pitchers",
+)
+```
+
+## El `AgentState` y por qué importa
+
+En LangGraph, el estado es el contrato entre nodos. No es solo historial de chat.
+
+Campos importantes:
+
+- `messages`: historial para el modelo y las tools
+- `question`, `file_name`, `local_file_path`: contexto base
+- `iterations`, `max_iterations`: control de loops
+- `tool_trace`: registro legible de tools ejecutadas
+- `decision_trace`: decisiones tomadas por el sistema
+- `skill_trace`: skills o adapters usados
+- `question_profile`: perfil estructurado
+- `ranked_candidates`: URLs ordenadas por confianza
+- `search_history_fingerprints`: historial de búsquedas con fingerprint estructurado
+- `structured_tool_outputs`: outputs tipados de tools
+- `evidence_used`, `reducer_used`, `fallback_reason`: explicación del resultado
+- `final_answer`, `error`: salida final
+
+Esto convierte al estado en tres cosas a la vez:
+
+- memoria de control
+- memoria de calidad
+- memoria de auditoría
 
 ## Ciclo completo de una pregunta
 
-1. La CLI (`cli.py`) obtiene una `Question` y opcionalmente descarga el archivo adjunto vía `runner.py`.
-2. `GaiaGraphAgent.solve()` (en `graph/workflow.py`) intenta primero `_try_prompt_reducer()`.
-3. Si ese extractor no aplica, inicializa el estado y ejecuta `self.app.invoke(...)`.
-4. `prepare_context` (usa `graph/prompts.py`) construye el prompt real para el modelo:
-   - prompt de sistema
-   - contexto del adjunto si existe
-   - pistas de investigación (_research hints_)
-   - ajustes de normalización, como mostrar la versión decodificada de texto invertido
-   - `QuestionProfile` (el perfil de la pregunta)
-5. `agent` llama al modelo con las tools disponibles.
-6. Si el modelo pidió tools, `tools` las ejecuta, corrige o redirige esas llamadas.
-7. Después de ejecutar las tools:
-   - si ya existe una respuesta estructurada confiable, el flujo puede finalizar
-   - si no, vuelve al nodo `agent`
-8. Si el modelo responde con algo inválido (disculpas, meta-comentarios), entra `retry_invalid_answer` y vuelve a `agent` con una instrucción correctiva.
-9. `finalize` decide qué respuesta aceptar:
-   - respuesta del modelo
-   - respuesta de una tool
-   - respuesta estructurada extraída de evidencia
-   - rescates orientados a la fuente (_source-aware fallbacks_), basados en candidatos y evidencia ya recolectada
-   - rescate final desde la evidencia mejor clasificada (_top-ranked evidence_)
+1. `cli.py` obtiene la `Question`
+2. `runner.py` resuelve adjuntos si existen
+3. `GaiaGraphAgent.solve()` intenta primero el `prompt_reducer`
+4. si no alcanza, arma el estado inicial y ejecuta el `StateGraph`
+5. `prepare_context` construye el prompt real
+6. `agent` decide si responde o llama tools
+7. `tools` ejecuta herramientas bajo `ToolPolicyEngine`
+8. si aparece una respuesta estructurada válida, puede cortarse antes
+9. si el modelo responde con un no-answer, entra `retry_invalid_answer`
+10. `finalize` arbitra la respuesta final
 
-## Nodos del grafo
+## Cómo decide `finalize`
 
-### `prepare_context`
+El orden actual es importante:
 
-Este nodo prepara el terreno. No decide respuestas; decide **cómo presentarle el problema al modelo**.
+1. `preferred structured answer`
+2. `core recovery from evidence`
+3. `skill execution`
+4. `adapter-assisted recovery`
+5. reglas finales específicas
+6. salvage LLM desde evidencia grounding
+7. verificación final
+8. error final
 
-Lo importante acá es que el prompt no es fijo: se enriquece con:
+La idea es que lo benchmark-specific actúe tarde, no temprano.
 
-- lectura previa del archivo adjunto local
-- detección de URLs en el prompt
-- pistas para videos de YouTube
-- detección de preguntas autocontenidas (que no necesitan búsqueda externa)
-- `QuestionProfile` — el perfil clasificado de la pregunta
+## Cómo funciona `tool_policy`
 
-**Patrón reutilizable:** un nodo inicial de _prompt shaping_ (ajuste del prompt) puede concentrar todo el preprocesamiento y evitar ensuciar el resto del flujo.
+`tool_policy.py` no es un dispatcher tonto. Hace policy enforcement:
 
-### `agent`
+- bloquea Python no grounding
+- redirige fetches a candidatos mejores
+- actualiza `ranked_candidates`
+- evita loops de búsqueda
+- dispara auto-followups en algunos casos
 
-Este es el nodo LLM principal.
+### Antes
 
-Responsabilidades:
+La deduplicación de búsquedas dependía demasiado del set de tokens.
 
-- toma `messages`
-- trunca outputs de tools demasiado largos para proteger la ventana de contexto del modelo
-- agrega _nudges_ si detecta que ya hay buenas fuentes candidatas no leídas, demasiadas búsquedas consecutivas del mismo tipo, o una **búsqueda atascada** (_stuck search_): el mismo término de búsqueda se repitió sin producir evidencia útil nueva. En ese último caso, el nudge describe el estado de los cubos: si hay candidatos útiles sin leer, los lista y pide hacer fetch antes de buscar otra vez; si ya se agotaron, avisa que cambiar de estrategia es la única salida
-- fuerza `tool_choice="none"` (el modelo no puede llamar más tools) al llegar al límite de iteraciones
+### Ahora
 
-Conceptualmente, este nodo representa el _planner/reader_: el que decide qué buscar y qué leer, pero **no** el dueño absoluto de la verdad.
+Usa un fingerprint estructurado con:
 
-### `tools`
+- `action_family`
+- `entities`
+- `years`
+- `site`
+- `source_type`
+- `scope`
 
-Es el nodo más interesante desde el punto de vista de diseño de producto. La política de tools vive en `graph/tool_policy.py`, implementada por `ToolPolicyEngine`. El archivo `routing.py` se ocupa ahora exclusivamente de las conexiones condicionales del grafo y del perfilado de preguntas.
+Eso permite distinguir entre:
 
-No se limita a ejecutar las llamadas a tools que pide el modelo; también las **gobierna**:
+- `taisho tamai npb.jp players`
+- `site:fighters.co.jp taisho tamai 2023`
+- `fighters 2023 roster pitchers taisho tamai`
 
-- detecta búsquedas consecutivas excesivas y reemplaza una búsqueda por `fetch_url` sobre el mejor candidato no leído **de calidad suficiente**: usa `RankedCandidateBuckets` para separar los candidatos en tres cubos — útiles no leídos (`useful_unfetched`), útiles ya agotados (`exhausted_useful`) y baja calidad sin leer (`low_quality_unfetched`) — y solo hace fetch del primero; si no hay ninguno de calidad, no fuerza el reemplazo
-- detecta consultas casi duplicadas y bloquea loops de búsqueda
-- redirige fetches hacia URLs mejor clasificadas (_higher-ranked URLs_)
-- inyecta un filtro de texto (`text_filter`) derivado del `QuestionProfile`
-- bloquea `execute_python_code` si no está fundamentado (_grounded_) en el prompt, en el adjunto o en evidencia previa — más sobre esto abajo
-- si `extract_tables_from_url` falla en una pregunta de estadísticas, agrega automáticamente un fallback a `fetch_url`
-- parsea los resultados de búsqueda y actualiza `ranked_candidates`
+aunque compartan varias palabras.
 
-> **¿Qué significa "grounded" o "fundamentado"?**
-> Se dice que algo está _grounded_ cuando la respuesta o el código se apoya en evidencia concreta (un texto descargado, una tabla extraída, el contenido del adjunto), en lugar de que el modelo lo invente desde su memoria. El bloqueo de Python no grounded evita que `execute_python_code` se use para fabricar datasets o reconstruir hechos que el agente nunca realmente encontró.
+### Auto-fetch
 
-**Patrón reutilizable:** en LangGraph, el nodo de tools puede ser una capa de _policy enforcement_ (aplicación de políticas), no solo un dispatcher que ejecuta ciegamente lo que pide el modelo.
+El auto-fetch ahora solo ocurre si:
 
-### `retry_invalid_answer`
+- existe un candidato no leído
+- el candidato tiene señal fuerte real
+- el score supera el umbral práctico
 
-Es un nodo simple pero valioso. Si el modelo responde con meta-comentarios, disculpas o texto no útil, el sistema **no finaliza enseguida**: reinyecta una instrucción precisa para que reintente usando la evidencia ya reunida.
+Si no hay señal fuerte, el sistema no fuerza lectura. En cambio, pide cambio de estrategia.
 
-También tiene variantes especiales:
+## Ejemplo detallado: `botanical_gaia`
 
-- Para preguntas de lista de jugadores (_roster_) sensibles al tiempo: le recuerda al modelo que no use una lista actual o sin respaldo temporal como respuesta final.
-- Para `botanical_classification`: le exige no responder desde el uso común/cocina ni desde fragmentos de búsqueda, sino leer al menos una fuente y cerrar desde evidencia fundamentada (_grounded evidence_).
+La skill botánica ya no responde con una lista parcial "más o menos aceptable".
 
-**Patrón reutilizable:** en vez de tratar una respuesta inválida como un fallo terminal, insertarla en un loop corto de corrección controlada.
+Hace esto:
 
-### `finalize`
+1. extrae ítems del prompt
+2. crea un estado por ítem:
+   - `include`
+   - `exclude`
+   - `unknown`
+   - `discarded`
+3. intenta clasificar primero desde evidencia ya recolectada
+4. solo busca para los ítems `unknown`
+5. finaliza únicamente si todos los ítems relevantes están resueltos
+6. arma la respuesta final en orden alfabético
 
-Es el árbitro final. Usa `graph/answer_policy.py` para validación y canonicalización, e itera el registro de `fallbacks/` en vez de tener lógica incrustada directamente.
+### Ejemplo
 
-**Orden de preferencia, simplificado:**
+Si el prompt trae:
 
-1. Si ya hay `final_answer` en el estado, la conserva.
-2. Si falta un adjunto requerido, falla salvo que exista una respuesta concreta de alguna tool.
-3. Si hay un extractor determinístico (reducer) apropiado y usable en este momento, lo prioriza.
-4. Si no alcanza con eso, intenta rescates orientados a la fuente por familia de pregunta:
-   - `article_to_paper`: busca fuentes externas a la editorial (_publisher_) original y prueba `find_text_in_url`/`fetch_url` esperando un número de subvención (_award_number_). Si el paper enlazado cae en un captcha o no se puede leer, puede relanzar la búsqueda con el título exacto del paper para encontrar una fuente externa con metadatos o información de financiamiento.
-   - `text_span_lookup`: toma páginas candidatas con buena puntuación (_score_), prueba `find_text_in_url`, y si falla hace `fetch_url` completo esperando un atributo de fragmento de texto (`text_span_attribute`).
-   - `entity_role_chain`: fuerza evidencia para los dos pasos de la cadena: busca tanto la página del actor/personaje en la versión polaca como una fuente de `Magda M.` antes de dar la respuesta.
-   - `roster_neighbor_lookup` sensible al tiempo: delega en un registro de resolvers oficiales por ecosistema/fuente. Un _roster neighbor_ es "el jugador que estaba antes o después del jugador X en esa lista en una fecha específica".
-   - `botanical_classification`: primero lee la evidencia ya descargada por el flujo principal (mensajes de `fetch_url`/`find_text_in_url` en el historial de mensajes) antes de hacer nuevas búsquedas. Por cada ítem, si los registros existentes ya son decisivos, no gasta ni una búsqueda más. Si no alcanza, busca con un presupuesto propio por ítem (`FallbackAttemptBudget(remaining_searches=2, remaining_fetches=2)`) y vota la clasificación botánica solo desde pasajes relevantes, penalizando páginas que mezclan "fruit" botánico con "vegetable" culinario.
-5. Si la respuesta del modelo es inválida, intenta fallbacks en cascada:
-   - respuesta concreta de tool
-   - respuesta estructurada desde evidencia
-   - rescate LLM usando solo la evidencia mejor fundamentada (_top-grounded evidence_)
-   - verificación LLM final usando esa misma evidencia
-6. Si nada sirve, deja error y `fallback_reason`.
-
-Este nodo muestra otra idea fuerte de LangGraph: **la finalización no tiene por qué ser "usar la última respuesta del modelo"**. Puede ser un arbitraje multi-fuente.
-
-Los rescates orientados a la fuente ahora viven en `fallbacks/`, cada uno como un `FallbackResolver` registrado. `finalize` los itera:
-
-```python
-for resolver in self.fallback_resolvers:
-    if resolver.applies(state, profile):
-        result = resolver.run(state)
-        if result:
-            return result
+```text
+broccoli, plums, sweet potatoes
 ```
 
-**Algunos detalles del estado actual:**
+y la evidencia grounding dice:
 
-- `article_to_paper` y `text_span_lookup` ya usan helpers relativamente reutilizables (`candidate_urls_from_state`, intentos de `find`/`fetch`, validación por reducer esperado).
-- `entity_role_chain` también reutiliza esos helpers, pero con una restricción importante: no le alcanza con una URL "parecida". Necesita cobertura de ambos lados de la cadena antes de dar por suficiente el fundamento (_grounding_).
-- `roster_neighbor_lookup` ya tiene la interfaz correcta, pero hoy el resolver realmente implementado sigue siendo uno específico del caso Fighters/NPB. La arquitectura quedó preparada para agregar otros resolvers oficiales sin volver a meter toda la lógica en un único bloque.
-- `botanical_classification` primero reutiliza los fetches que el agente ya hizo; si los registros existentes son decisivos para un ítem, no lanza ninguna búsqueda nueva para ese ítem. Solo cuando la evidencia acumulada es insuficiente busca activamente, con un presupuesto acotado por ítem. Esto reduce el costo y la latencia respecto de buscar todo de cero.
+- broccoli -> vegetable
+- plums -> fruit
+- sweet potatoes -> vegetable
 
-## Conexiones condicionales y forma real del workflow
+la salida es:
 
-El grafo compilado es:
-
-```mermaid
----
-config:
-  flowchart:
-    curve: linear
----
-graph TD;
-    __start__([<p>__start__</p>]):::first
-    prepare_context(prepare_context)
-    agent(agent)
-    tools(tools)
-    retry_invalid_answer(retry_invalid_answer)
-    finalize(finalize)
-    __end__([<p>__end__</p>]):::last
-    __start__ --> prepare_context;
-    agent -.-> finalize;
-    agent -.-> retry_invalid_answer;
-    agent -.-> tools;
-    prepare_context --> agent;
-    retry_invalid_answer --> agent;
-    tools -.-> agent;
-    tools -.-> finalize;
-    finalize --> __end__;
-    classDef default fill:#f2f0ff,line-height:1.2
-    classDef first fill-opacity:0
-    classDef last fill:#bfb6fc
+```text
+broccoli, sweet potatoes
 ```
 
-> Las flechas con línea punteada (`-.->`) representan **conexiones condicionales (_conditional edges_)**: el sistema elige a qué nodo ir según el estado actual. Por ejemplo, desde `agent` puede ir a `tools` (si el modelo pidió tools), a `retry_invalid_answer` (si la respuesta es inválida) o a `finalize` (si está listo para responder).
+Si `plums` queda ambiguo o sin evidencia fuerte, la skill no debería responder todavía.
 
-Comando para regenerarlo:
+## Ejemplo detallado: `temporal_ordered_list` + adapters
 
-```bash
-python -m hf_gaia_agent.cli graph --format mermaid
-```
+La idea de esta skill es separar:
 
-o escribirlo a archivo:
+- la lógica del problema
+- de la lógica del sitio
 
-```bash
-python -m hf_gaia_agent.cli graph --format mermaid --output docs/architecture/gaia-graph.mmd
-```
+La skill general sabe resolver:
 
-**La observación clave** es que el grafo es pequeño a propósito. La complejidad del comportamiento no está en tener veinte nodos, sino en:
+- "quién está antes"
+- "quién está después"
+- "qué vecino tiene este sujeto"
 
-- estado rico con memoria de control
-- restricciones (_guardrails_) en el nodo de tools
-- extractores determinísticos (_reducers_) sobre evidencia
-- finalización jerárquica con múltiples fuentes
+si ya hay evidencia temporal grounding.
 
-Es un buen recordatorio de que "usar LangGraph" no significa necesariamente construir un DAG (_Directed Acyclic Graph_, grafo acíclico dirigido) enorme.
+Los adapters se ocupan de conseguir esa evidencia cuando la web no es uniforme.
 
-## LangGraph aplicado: patrones reutilizables
+### Caso Fighters
 
-### 1. Grafo pequeño, lógica grande
+`FightersAdapter` encapsula todo lo que sería feo dejar en el core:
 
-Este repo usa pocos nodos y concentra la sofisticación en funciones Python puras. Eso mantiene el flujo mentalmente manejable y hace más fácil testear el comportamiento.
+- `npb.jp`
+- `fighters.co.jp`
+- URLs tipo `/team/player/detail/{year}_{id}.html`
+- heurísticas de predicción de IDs
 
-### 2. Estado como memoria operativa
+Eso permite que el core siga siendo general aunque exista un adapter hackeado para un benchmark.
 
-`decision_trace`, `ranked_candidates` y `search_history_normalized` no son memoria conversacional; son **memoria de control**. Esto sirve para romper loops y guiar mejor al agente.
+## Qué queda en core y qué no
 
-En las versiones más recientes, `ranked_candidates` pasó a ser aún más importante: no solo sirve para guiar al modelo, sino también para rescates determinísticos posteriores. Por ejemplo, `finalize` puede reutilizar esos candidatos para probar una página externa a la editorial (_publisher_) de un artículo o una página candidata de texto exacto, sin depender de una nueva conjetura del modelo.
+### Sí debería vivir en core
 
-### 3. Extractores determinísticos después de las tools
+- recoveries reutilizables
+- validación de grounding
+- reducers
+- ranking general
+- tool policy general
 
-Después de recolectar evidencia, el sistema intenta resolver con código Python. Esto baja la variabilidad y mejora el fundamento (_grounding_). Es un patrón especialmente útil cuando la respuesta sale de:
+### No debería vivir en core
 
-- tablas
-- listas
-- fragmentos de texto (_text spans_)
-- fechas
-- filas filtradas
+- patrones de URL de un club específico
+- heurísticas de un benchmark concreto
+- wording ultra acoplado a una sola familia de prompts
 
-Conviene separar esta capa de las capas anteriores:
+## Términos clave
 
-- **Normalización / prompt shaping**: transforma la entrada para que el modelo lea mejor el problema (por ejemplo, mostrando la versión decodificada de texto invertido)
-- **`prompt_reducers`**: derivan una respuesta solo desde el prompt cuando la estructura ya está completa en la pregunta
-- **Reducers sobre evidencia**: operan después de tools o lectura de adjuntos, cuando ya existen `EvidenceRecord`
+### Hook
 
-### 4. Restricciones antes de ejecutar tools
+Función que se llama en momentos importantes del flujo, por ejemplo antes y después de cada tool.
 
-El repo no confía ciegamente en la llamada a tool que pide el modelo. Intercepta, corrige, redirige o bloquea. Esta capa vale mucho cuando las tools son costosas o propensas a loops.
+### DTO
 
-### 5. Finalización como arbitraje
+Objeto simple que transporta datos.
 
-La respuesta final puede venir del modelo, de una tool o de evidencia procesada. Esta separación entre "explorar" y "cerrar" es muy reutilizable.
+En este repo:
 
-Una extensión práctica de este patrón: "cerrar" no significa solo leer la última evidencia, sino poder aplicar un _rescue path_ (camino de rescate) específico pero reutilizable para una familia de preguntas cuando el modelo ya encontró el terreno correcto y solo le faltó el último salto.
+- `QuestionProfile`
+- `SourceCandidate`
+- `EvidenceRecord`
 
-## Decisiones no obvias y tradeoffs
+### Grounding
 
-### Extractores de prompt previos al grafo
+Significa que una respuesta está apoyada en evidencia real ya recolectada, no en memoria o intuición del modelo.
 
-**Ventaja:**
+### Reducer
 
-- evita costo y latencia cuando el prompt ya contiene una estructura suficiente para derivar la respuesta
+Función determinística que toma evidencia estructurada y deriva una respuesta sin llamar al modelo.
 
-**Tradeoff:**
+### Skill
 
-- obliga a mantener un contrato estricto sobre qué significa "derivable del prompt"
-- si se mezclan con conocimiento de dominio embebido, se vuelve borroso qué parte del sistema está fundamentada (_grounded_) y cuál no
+Capacidad general orientada a un tipo de tarea.
 
-### Clasificación y ordenamiento de fuentes (_ranking_)
+Ejemplo:
 
-**Ventaja:**
+- `temporal_ordered_list`
 
-- reduce que el modelo lea la primera URL mediocre que encontró
-- favorece dominios esperados, coincidencia temporal y tipos de fuente correctos
+### Adapter
 
-**Tradeoff:**
+Integración específica con una fuente o ecosistema.
 
-- requiere una función de puntuación (_scoring_) y reglas por dominio/tipo de pregunta
+Ejemplo:
 
-### Fundamento temporal en listas de jugadores (_temporal grounding in rosters_)
+- `FightersAdapter`
 
-> Un **roster** en deportes es la lista oficial de jugadores de un equipo o liga, con nombres y números. En este contexto, el agente necesita encontrar al jugador que estaba en cierta posición de la lista **en una fecha concreta**, no la lista actual.
+### Core recovery
 
-**Ventaja:**
+Recuperación reusable del agente general, no acoplada a una sola fuente rara.
 
-- evita respuestas aparentemente plausibles pero incorrectas para la fecha preguntada
+### Fingerprint de búsqueda
 
-**Tradeoff:**
+Representación estructurada de una búsqueda para detectar duplicados reales sin bloquear refinamientos válidos.
 
-- agrega complejidad específica de dominio y más reglas de validación
-- cuando se necesita llegar a una fuente oficial histórica, puede requerir resolvers por ecosistema o sitio, no solo puntuación genérica de URLs
+### Candidate ranking
 
-### Rescates orientados a la fuente y reutilizables
+Proceso de puntuar URLs candidatas según:
 
-**Ventaja:**
-
-- capturan familias de error recurrentes del modelo sin hardcodear directamente una respuesta
-- reutilizan `QuestionProfile`, `ranked_candidates` y reducers existentes
-- permiten cerrar preguntas donde el modelo falla en el "último salto", aunque ya existe evidencia suficiente o casi suficiente
-
-**Tradeoff:**
-
-- si se llevan demasiado lejos, pueden convertirse en una segunda capa opaca de lógica de negocio _ad hoc_
-- conviene mantenerlos como patrones explícitamente nombrados y testeados, no como condiciones dispersas dentro de `finalize`
-
-Un buen ejemplo del tradeoff actual es `botanical_classification`: ya no hay heurística con conocimiento fijo, pero sí un fallback que busca evidencia por ítem y decide desde texto descargado. Eso mejora el fundamento (_grounding_), aunque aumenta el costo y la complejidad respecto de dejar que el modelo "adivine" desde el prompt.
-
-### Bloqueo de Python sin fundamento
-
-**Ventaja:**
-
-- evita que `execute_python_code` se convierta en una herramienta para inventar datasets o reconstruir hechos desde la memoria del modelo
-
-**Tradeoff:**
-
-- algunas estrategias potencialmente útiles quedan prohibidas si no están suficientemente fundamentadas en evidencia
-
-### Rescate final desde evidencia (_salvage_)
-
-**Ventaja:**
-
-- rescata respuestas cuando el modelo principal falló en el formato, no en el conocimiento
-
-**Tradeoff:**
-
-- introduce una segunda/tercera oportunidad LLM, con más complejidad de control
-
-## Qué aprender de este proyecto para futuros agentes con LangGraph
-
-Si mañana querés construir algo con LangGraph, lo más transferible de este repo no es GAIA sino estas decisiones:
-
-- mantener el workflow pequeño y entendible
-- invertir en un buen estado, no solo en prompts
-- usar clasificación (_profiling_) para entender la tarea antes de actuar
-- tratar las tools como recursos gobernados por políticas
-- resolver determinísticamente cuando la evidencia ya tiene forma estructurada
-- separar bien exploración, corrección y finalización
-
-Si tu próximo agente trabaja con tickets, documentos, scraping o backoffice, la plantilla conceptual es reutilizable:
-
-- `prepare_context` para clasificar y enriquecer el prompt
-- `agent` para planear (qué buscar / qué leer)
-- `tools` para ejecutar con restricciones (_guardrails_)
-- reducers para convertir evidencia en respuesta
-- `finalize` para arbitrar la salida final
-
----
+- dominio esperado
+- fecha
+- autor
+- hints del tipo de tarea
+- penalizaciones por ruido o fuentes débiles
 
 ## Glosario
 
-Esta sección explica en español los términos técnicos y en inglés que aparecen en el documento. Los términos en inglés se mantienen donde son nombres de código o conceptos de la industria sin traducción estándar clara.
+| Término | Significado en este repo |
+| --- | --- |
+| `adapter` | Lógica específica de fuente o ecosistema |
+| `award number` | Número de subvención o beca |
+| `backoff` | Reintentos con espera creciente |
+| `bucket` | Grupo de candidatos según calidad y estado de lectura |
+| `candidate` | URL que podría contener la respuesta |
+| `core recovery` | Recuperación reusable del agente general |
+| `DTO` | Objeto simple de datos |
+| `evidence` | Texto, tabla o dato obtenido de una fuente real |
+| `fallback` | Término viejo para rescates; sigue existiendo en compatibilidad, pero ya no es el concepto principal |
+| `fingerprint` | Firma estructurada de búsqueda |
+| `grounded` | Apoyado en evidencia real |
+| `guardrail` | Restricción que evita acciones malas o inútiles |
+| `profile` | Clasificación estructurada de una pregunta |
+| `prompt reducer` | Camino rápido para resolver desde el prompt sin tools |
+| `reducer` | Extractor determinístico de respuesta |
+| `registry` | Lista de componentes del mismo tipo que se recorre dinámicamente |
+| `skill` | Capacidad general orientada a una familia de tareas |
+| `StateGraph` | Grafo de LangGraph con nodos y aristas condicionales |
+| `tool trace` | Registro legible de tools ejecutadas |
+| `workflow` | Secuencia de pasos que sigue el agente |
 
-| Término                                  | Significado en este contexto                                                                                                                                                                                                                                                                                                                                                |
-| ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **award / grant number**                 | Número de una beca o subvención de investigación (fondos públicos o privados dados a investigadores). El agente intenta encontrar ese número en artículos o páginas de financiadores.                                                                                                                                                                                       |
-| **backoff**                              | Estrategia de reintentos donde cada intento espera más tiempo que el anterior (1 s, 2 s, 4 s...). Evita saturar un servicio con errores temporales.                                                                                                                                                                                                                         |
-| **batch**                                | Lote: procesar un conjunto de preguntas de una sola vez en lugar de una por una.                                                                                                                                                                                                                                                                                            |
-| **bucket / cubos de candidatos**         | Clasificación de las URLs candidatas en tres grupos según calidad y estado de lectura: `useful_unfetched` (útiles sin leer todavía), `exhausted_useful` (útiles ya leídas) y `low_quality_unfetched` (baja calidad sin leer). La lógica de selección trabaja con estos cubos para evitar gastar fetches en fuentes de baja calidad cuando hay mejores opciones disponibles. |
-| **candidate / ranked candidates**        | URL candidata: una página que podría contener la respuesta. Las candidatas se ordenan por puntuación de confianza (_score_); las mejores están primero.                                                                                                                                                                                                                     |
-| **canonicalization / canonicalización**  | Proceso de llevar una respuesta a su forma estándar: eliminar artículos, normalizar mayúsculas, quitar espacios innecesarios. Permite comparar respuestas sin que variaciones de formato generen diferencias falsas.                                                                                                                                                        |
-| **commercial noise / ruido comercial**   | Páginas que aparecen en resultados de búsqueda pero son irrelevantes para la pregunta (restaurantes, farmacias, reservas online, menúes). El ranker las descarta si no tienen señal fuerte de relevancia con la pregunta.                                                                                                                                                   |
-| **conditional edge**                     | Conexión condicional en el grafo: en vez de ir siempre al mismo nodo, el sistema elige el siguiente nodo según el estado actual.                                                                                                                                                                                                                                            |
-| **context window / ventana de contexto** | Límite de texto (medido en _tokens_) que el modelo puede leer de una vez. Si el historial de mensajes crece demasiado, el modelo pierde acceso a información anterior. Por eso el nodo `agent` trunca los outputs de tools demasiado largos.                                                                                                                                |
-| **DAG**                                  | _Directed Acyclic Graph_ — Grafo acíclico dirigido: una red de nodos con flechas en una sola dirección y sin ciclos. LangGraph usa DAGs para representar el flujo del agente.                                                                                                                                                                                               |
-| **dispatcher**                           | Componente que recibe una solicitud y la reenvía al manejador correcto sin modificarla. Se menciona para contrastar: el nodo `tools` _no_ es un dispatcher simple, sino que inspecciona y gobierna las llamadas antes de ejecutarlas.                                                                                                                                       |
-| **DTO**                                  | _Data Transfer Object_ — Objeto de transferencia de datos: clase simple que solo agrupa campos, sin lógica. Similar a un `struct` en C. Aquí: `QuestionProfile`, `SourceCandidate`, `EvidenceRecord`.                                                                                                                                                                       |
-| **evidence / grounded evidence**         | Evidencia: texto, tabla o dato descargado de una fuente real. "Grounded" significa que la respuesta se apoya en esa evidencia, no en suposiciones del modelo.                                                                                                                                                                                                               |
-| **fallback**                             | Estrategia alternativa que se activa cuando el método principal falla. En este repo hay fallbacks en cascada: cada uno intenta algo más hasta que alguno funciona o se agotan.                                                                                                                                                                                              |
-| **FallbackAttemptBudget**                | Objeto que controla cuántas búsquedas y fetches puede gastar un resolver de rescate. Se instancia con límites específicos (por ejemplo, `remaining_searches=3, remaining_fetches=6`) y se le consulta antes de cada operación. Si el crédito se agotó, el resolver para. Evita que un fallback consuma recursos ilimitados cuando la evidencia ya no mejora.                |
-| **fast-path**                            | Camino rápido: si la pregunta puede responderse sin ejecutar todo el grafo, se responde directamente.                                                                                                                                                                                                                                                                       |
-| **fetch**                                | Descargar el contenido completo de una URL. Diferente a una búsqueda (_search_): se descarga la página específica, no se busca en la web.                                                                                                                                                                                                                                   |
-| **grounding / grounded**                 | Ver _evidence_. Decir que código o una respuesta está "grounded" significa que se apoya en datos concretos ya recolectados, no en memoria o suposiciones del modelo.                                                                                                                                                                                                        |
-| **guardrail**                            | Restricción de seguridad: una regla que previene que el agente haga algo perjudicial o inútil (como llamar a `execute_python_code` sin datos reales, o hacer búsquedas en loop).                                                                                                                                                                                            |
-| **hook**                                 | Punto de extensión: función que el sistema llama automáticamente en momentos clave (antes/después de una tool, al iniciar/terminar una resolución). Permite observar o extender el comportamiento sin modificar el código original.                                                                                                                                         |
-| **leaderboard**                          | Tabla de clasificación con ranking (por ejemplo, tabla de posiciones de un torneo).                                                                                                                                                                                                                                                                                         |
-| **monkeypatching**                       | Técnica de modificar funciones o clases ya existentes en memoria durante la ejecución. Es frágil y difícil de rastrear; los hooks son la alternativa limpia usada aquí.                                                                                                                                                                                                     |
-| **nudge**                                | Sugerencia sutil inyectada en el prompt para guiar al modelo. Por ejemplo: "ya tenés buenas fuentes candidatas, priorizalas". No es una instrucción dura, sino un empujoncito.                                                                                                                                                                                              |
-| **pipeline**                             | Flujo de procesamiento secuencial: la entrada pasa por varios pasos en orden. Aquí `source_pipeline/` clasifica la pregunta y normaliza la evidencia antes de que el agente actúe.                                                                                                                                                                                          |
-| **policy enforcement**                   | Aplicación de políticas: el nodo `tools` no solo ejecuta, también aplica reglas (bloquear duplicados, redirigir fetches, etc.).                                                                                                                                                                                                                                             |
-| **profile / profiling**                  | Clasificar y caracterizar algo. `QuestionProfile` es la clasificación estructurada de la pregunta: qué tipo es, qué dominio, qué pistas hay. Ayuda al sistema a tomar mejores decisiones.                                                                                                                                                                                   |
-| **prompt shaping**                       | Ajuste dinámico del prompt antes de enviarlo al modelo: agregar pistas de investigación, el `QuestionProfile`, contexto del adjunto o versión decodificada de texto invertido. El nodo `prepare_context` concentra todo este procesamiento.                                                                                                                                 |
-| **Protocol**                             | En Python `typing`, es la forma de definir una interfaz: especifica qué métodos debe tener una clase sin obligarla a heredar. Equivalente a `interface` en TypeScript o Java.                                                                                                                                                                                               |
-| **publisher**                            | Editorial o sitio web que publicó un artículo académico o artículo de noticias. En preguntas sobre papers científicos, el publisher puede bloquear el acceso (paywall), forzando al agente a buscar fuentes alternativas.                                                                                                                                                   |
-| **reducer**                              | Extractor determinístico: función Python que toma evidencia estructurada (tabla, lista, texto) y deriva la respuesta **sin llamar al modelo**. Reduce un conjunto de datos a una respuesta concreta. Sin relación con reducers de Redux.                                                                                                                                    |
-| **registry**                             | Registro: lista de objetos del mismo tipo que se itera dinámicamente. Aquí, el registro de `FallbackResolver` permite agregar nuevos rescates sin modificar el código de `finalize`.                                                                                                                                                                                        |
-| **rescue path / salvage**                | Camino de rescate: estrategia de último recurso para recuperar una respuesta cuando todo lo anterior falló. "Salvage" implica rescatar algo de lo que ya se recolectó.                                                                                                                                                                                                      |
-| **resolver**                             | Objeto que encapsula la estrategia para resolver un problema específico. En este repo, un `FallbackResolver` sabe cuándo aplica y cómo actuar para una familia de preguntas (artículos académicos, listas de jugadores, clasificación botánica, etc.). El sistema itera el registro de resolvers en vez de tener un `if/elif` por caso.                                     |
-| **roster**                               | Lista oficial de jugadores de un equipo o liga deportiva, con nombres y números, válida para una fecha concreta. Las preguntas de roster suelen ser del tipo "¿quién era el jugador número X del equipo Y en el año Z?".                                                                                                                                                    |
-| **score / scoring**                      | Puntuación: valor numérico que indica cuánto se confía en una URL o fuente. Las URLs con mayor score se priorizan para ser leídas primero.                                                                                                                                                                                                                                  |
-| **search history normalized**            | Historial de búsquedas normalizado: registro de qué se buscó, usado para detectar y bloquear consultas duplicadas o casi iguales.                                                                                                                                                                                                                                           |
-| **source-aware fallback**                | Rescate orientado a la fuente: estrategia que sabe de qué tipo de fuente viene la pregunta (artículo académico, estadísticas deportivas, clasificación botánica, etc.) y actúa específicamente para ese caso.                                                                                                                                                               |
-| **StateGraph**                           | El tipo de grafo que usa LangGraph. Define nodos (funciones) y aristas (conexiones) que pueden ser condicionales. El estado se pasa entre nodos.                                                                                                                                                                                                                            |
-| **stuck search / búsqueda atascada**     | Situación donde el agente repite el mismo término de búsqueda sin obtener evidencia nueva útil. El sistema la detecta comparando el historial normalizado de búsquedas y emite un nudge específico: si hay candidatos sin leer, los lista; si se agotaron, pide cambiar de estrategia.                                                                                      |
-| **text span**                            | Fragmento o segmento de texto: una porción específica de un texto más largo de donde se quiere extraer un dato concreto.                                                                                                                                                                                                                                                    |
-| **tool trace**                           | Registro legible de qué tools se llamaron, con qué argumentos y qué devolvieron. Útil para debuggear y para la explicabilidad de la respuesta.                                                                                                                                                                                                                              |
-| **top-ranked**                           | Las URLs o evidencias con la puntuación más alta; las consideradas más confiables.                                                                                                                                                                                                                                                                                          |
-| **TypedDict**                            | Tipo de diccionario en Python donde cada clave tiene un tipo declarado. `AgentState` usa `TypedDict` para que el editor y el linter detecten accesos incorrectos al estado, sin necesidad de definir una clase completa con métodos.                                                                                                                                        |
-| **workflow**                             | Flujo de trabajo: la secuencia de pasos que sigue el agente desde recibir la pregunta hasta entregar la respuesta.                                                                                                                                                                                                                                                          |
+## Idea reutilizable
+
+Aunque este repo está hecho para GAIA, la plantilla conceptual sirve para otros agentes:
+
+- `prepare_context` para clasificar y enriquecer el prompt
+- `agent` para planear
+- `tools` para ejecutar con guardrails
+- `source_pipeline` para perfilar preguntas y rankear fuentes
+- `reducers` para extraer respuestas determinísticas
+- `core recoveries` para rescates reutilizables
+- `skills` para capacidades generales
+- `adapters` para encapsular hacks inevitables de fuente
+- `finalize` para arbitrar la respuesta final
+
+Esa es la parte realmente reusable de esta arquitectura.

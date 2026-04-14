@@ -13,6 +13,15 @@ pinned: false
 
 Agente con LangGraph para resolver y enviar el challenge de GAIA de la Unit 4 del curso de agentes de Hugging Face.
 
+La arquitectura actual ya no gira alrededor de un único bloque de `fallbacks`. El agente está separado en capas:
+
+- `graph/`: orquestación del workflow
+- `core/recoveries/`: recuperaciones reutilizables
+- `skills/`: capacidades generales orientadas a tipos de tarea
+- `adapters/`: lógica específica de fuente o ecosistema
+- `reducers/`: extractores determinísticos sobre evidencia
+- `source_pipeline/`: perfilado de preguntas, ranking de fuentes y normalización de evidencia
+
 ## Space público para verificación
 
 Usá esta URL como `agent_code` en el endpoint de submit:
@@ -24,10 +33,10 @@ https://huggingface.co/spaces/MauriSC88/gaia-langgraph-agent/tree/main
 ## Setup rápido
 
 ```bash
-# Opción 1 — bootstrap automático (Linux/macOS)
+# Opción 1 - bootstrap automático (Linux/macOS)
 bash scripts/bootstrap.sh
 
-# Opción 2 — manual
+# Opción 2 - manual
 python -m venv .venv
 source .venv/bin/activate          # o .venv\Scripts\Activate.ps1 en Windows
 pip install -e ".[dev]"
@@ -37,10 +46,10 @@ pip install -e ".[dev]"
 
 Las tools de video/media necesitan:
 
-| Herramienta | Para qué se usa               | Instalación               |
-| ----------- | ----------------------------- | ------------------------- |
-| `ffmpeg`    | Extracción de frames de video | `sudo apt install ffmpeg` |
-| `yt-dlp`    | Descarga de videos YouTube    | `pip install yt-dlp`      |
+| Herramienta | Para qué se usa | Instalación |
+| --- | --- | --- |
+| `ffmpeg` | Extracción de frames de video | `sudo apt install ffmpeg` |
+| `yt-dlp` | Descarga de videos YouTube | `pip install yt-dlp` |
 
 ## Comandos
 
@@ -54,7 +63,7 @@ hf-gaia-agent submit \
   --username <hf_user> \
   --agent-code-url https://huggingface.co/spaces/MauriSC88/gaia-langgraph-agent/tree/main
 
-# Debuggear una pregunta individual (por índice 1-based o prefijo de task_id)
+# Debuggear una pregunta individual
 hf-gaia-agent debug-question 7
 
 # Exportar el grafo del workflow
@@ -74,98 +83,175 @@ bash scripts/package_clean.sh
 
 ## Variables de entorno
 
-| Variable              | Descripción                     | Default                                        |
-| --------------------- | ------------------------------- | ---------------------------------------------- |
-| `MODEL_PROVIDER`      | `openai` o `huggingface`        | —                                              |
-| `MODEL_NAME`          | Nombre del modelo               | —                                              |
-| `OPENAI_API_KEY`      | API key de OpenAI               | —                                              |
-| `OPENAI_BASE_URL`     | Base URL custom (opcional)      | —                                              |
-| `HF_TOKEN`            | Token de Hugging Face           | —                                              |
-| `TAVILY_API_KEY`      | Proveedor de búsqueda principal | —                                              |
-| `GAIA_API_URL`        | URL de la API de scoring        | `https://agents-course-unit4-scoring.hf.space` |
-| `GAIA_DOWNLOAD_DIR`   | Directorio para adjuntos        | `.cache/gaia`                                  |
-| `GAIA_MAX_ITERATIONS` | Iteraciones máximas agent↔tools | `15`                                           |
+| Variable | Descripción | Default |
+| --- | --- | --- |
+| `MODEL_PROVIDER` | `openai` o `huggingface` | - |
+| `MODEL_NAME` | Nombre del modelo | - |
+| `OPENAI_API_KEY` | API key de OpenAI | - |
+| `OPENAI_BASE_URL` | Base URL custom | - |
+| `HF_TOKEN` | Token de Hugging Face | - |
+| `TAVILY_API_KEY` | Proveedor principal de búsqueda | - |
+| `GAIA_API_URL` | URL de la API de scoring | `https://agents-course-unit4-scoring.hf.space` |
+| `GAIA_DOWNLOAD_DIR` | Directorio para adjuntos | `.cache/gaia` |
+| `GAIA_MAX_ITERATIONS` | Iteraciones máximas agent-tools | `15` |
+| `GAIA_ENABLE_BENCHMARK_FALLBACKS` | Activa skills benchmark-specific de GAIA | `1` |
+
+## Arquitectura rápida
+
+### 1. Workflow
+
+`GaiaGraphAgent` construye un `StateGraph` con estos nodos principales:
+
+- `prepare_context`
+- `agent`
+- `tools`
+- `retry_invalid_answer`
+- `finalize`
+
+La idea no es "dejar que el modelo haga todo". El modelo planifica y lee; el código Python controla:
+
+- qué herramientas se pueden usar
+- cómo se rankean fuentes
+- cuándo una respuesta está grounding
+- cuándo se puede resolver en forma determinística
+
+### 2. Recoveries, Skills y Adapters
+
+La arquitectura nueva separa tres conceptos que antes estaban mezclados:
+
+- `core recoveries`: rescates reutilizables del agente general
+  Ejemplos: `article_to_paper`, `text_span`
+- `skills`: capacidades de tarea
+  Ejemplos: `temporal_ordered_list`, `botanical_gaia`
+- `adapters`: integración específica de fuente o ecosistema
+  Ejemplos: `FightersAdapter`, `WikipediaRosterAdapter`, `OfficialTeamDirectoryAdapter`
+
+Una regla práctica:
+
+- si algo describe una capacidad general, es `skill`
+- si algo sabe de un sitio o un patrón de URLs concreto, es `adapter`
+- si algo es recuperación reusable del core, es `core recovery`
+
+### 3. Finalización
+
+El `finalizer` sigue este orden:
+
+1. respuesta estructurada preferida
+2. core recovery desde evidencia
+3. skill general
+4. adapter-assisted recovery
+5. reglas finales específicas
+6. salvage LLM desde evidencia grounding
+7. verificación final
+
+Eso evita que una lógica benchmark-specific tome el control demasiado pronto.
+
+### 4. Política de búsqueda
+
+`tool_policy.py` ya no deduplica búsquedas solo por tokens ordenados. Ahora usa un fingerprint estructurado con:
+
+- familia de acción
+- entidades principales
+- año o fecha
+- dominio o `site:`
+- tipo de fuente
+- scope
+
+Ejemplo:
+
+- `taisho tamai npb.jp players`
+- `site:fighters.co.jp taisho tamai 2023`
+- `fighters 2023 roster pitchers taisho tamai`
+
+ya no se consideran automáticamente la misma búsqueda.
+
+Además, el `auto-fetch` solo se dispara cuando el candidato no leído tiene señal fuerte real.
 
 ## Estructura del proyecto
 
-```
+```text
 src/hf_gaia_agent/
-├── api_client.py          # Cliente HTTP para la API de scoring (con retry/backoff)
-├── cli.py                 # CLI: run, submit, graph, debug-question
-├── runner.py              # Orquestación de ejecución (separada de presentación)
-├── hooks.py               # Sistema de hooks para observabilidad (reemplaza monkeypatch)
-├── normalize.py           # Normalización de respuestas
-├── evidence_solver.py     # Orquestador de reducers determinísticos
-├── graph/                 # Core del workflow LangGraph
-│   ├── workflow.py        #   GaiaGraphAgent + StateGraph
-│   ├── state.py           #   AgentState (TypedDict rico)
-│   ├── prompts.py         #   System prompt y prompt shaping
-│   ├── routing.py         #   Conditional edges + perfilado de preguntas
-│   ├── tool_policy.py     #   ToolPolicyEngine: políticas y followups de tools
-│   ├── finalizer.py       #   WorkflowFinalizer: arbitraje final de respuesta
-│   ├── contracts.py       #   Protocolos WorkflowServices, FinalizationRule, etc.
-│   ├── services.py        #   Implementación concreta de WorkflowServices
-│   ├── candidate_support.py #  Helpers de ranking y seguimiento de candidatos
-│   ├── evidence_support.py  #  Helpers de grounding y respuestas estructuradas
-│   ├── nudges.py          #   Sugerencias inyectadas al prompt
-│   ├── finalization_rules.py # Reglas benchmark-specific de finalización
-│   ├── retry_rules.py     #   Reglas de reintento de respuesta inválida
-│   └── answer_policy.py   #   Validación y canonicalización de respuestas
-├── fallbacks/             # Registry de fallback resolvers
-│   ├── base.py            #   Protocolo FallbackResolver
-│   ├── article_to_paper.py
-│   ├── text_span.py
-│   ├── roster.py
-│   ├── botanical.py
-│   ├── role_chain.py
-│   ├── competition.py
-│   └── utils.py           #   Helpers compartidos
-├── reducers/              # Extractores determinísticos sobre evidencia
-│   ├── base.py            #   Protocolo ReducerResult
-│   ├── metric_row.py
-│   ├── roster.py
-│   ├── text_span.py
-│   ├── award.py
-│   ├── table_compare.py
-│   └── temporal.py
-├── source_pipeline/       # Perfilado de preguntas y ranking de fuentes
-│   ├── question_classifier.py
-│   ├── candidate_ranker.py
-│   ├── evidence_normalizer.py
-│   ├── source_labels.py
-│   ├── _question_classifiers.py # Registro ordenado de clasificadores
-│   ├── _question_detectors.py   # Detectores booleanos de tipo de pregunta
-│   ├── _question_extractors.py  # Extractores de fechas y entidades
-│   └── _models.py               # DTOs: QuestionProfile, SourceCandidate, EvidenceRecord
-└── tools/                 # Herramientas del agente
-    ├── search.py          #   Brave, DDG, Tavily, Wikipedia
-    ├── web.py             #   fetch_url, find_text, extract_tables/links
-    ├── document.py        #   Lectura de archivos locales (PDF, XLSX, etc.)
-    ├── media.py           #   YouTube, video frames, audio transcription
-    └── compute.py         #   calculate, execute_python_code
-
-tests/
-├── conftest.py            # Fixtures compartidas
-├── test_api_client.py
-├── test_normalize.py
-├── test_graph.py
-├── test_graph_services.py # Tests de WorkflowServices, ToolPolicyEngine y contratos
-├── test_evidence_solver.py
-├── test_source_pipeline.py
-├── test_search_tools.py
-├── test_audio_tools.py
-├── test_tools.py
-└── test_cli.py
+├── adapters/                # Integración específica por fuente o ecosistema
+│   ├── base.py
+│   └── temporal_roster.py
+├── api_client.py
+├── core/
+│   └── recoveries/          # Recoveries reutilizables del agente general
+│       ├── article_to_paper.py
+│       ├── text_span.py
+│       └── utils.py
+├── cli.py
+├── evidence_solver.py       # Orquesta reducers determinísticos
+├── graph/                   # Workflow LangGraph y políticas del agente
+│   ├── workflow.py
+│   ├── tool_policy.py
+│   ├── finalizer.py
+│   ├── services.py
+│   ├── contracts.py
+│   ├── routing.py
+│   ├── evidence_support.py
+│   ├── candidate_support.py
+│   ├── finalization_rules.py
+│   └── retry_rules.py
+├── hooks.py
+├── normalize.py
+├── reducers/                # Extractores determinísticos sobre evidencia
+├── runner.py
+├── skills/                  # Capacidades generales y especializaciones GAIA
+│   ├── base.py
+│   ├── set_classification.py
+│   ├── temporal_ordered_list.py
+│   └── gaia/
+│       ├── botanical_gaia.py
+│       ├── competition_gaia.py
+│       └── role_chain_gaia.py
+├── source_pipeline/         # Perfilado de preguntas y ranking de fuentes
+└── tools/                   # Tools del agente
 ```
+
+## Ejemplos rápidos
+
+### Botanical GAIA
+
+Pregunta:
+
+```text
+Here's the list I have so far:
+broccoli, plums, sweet potatoes
+Please alphabetize the vegetables...
+```
+
+Flujo:
+
+1. `source_pipeline` clasifica la pregunta como `list_item_classification`
+2. `botanical_gaia` extrae los ítems del prompt
+3. cada ítem queda en estado `include | exclude | unknown | discarded`
+4. si un ítem sigue `unknown`, busca evidencia
+5. solo responde cuando todos los ítems relevantes están resueltos
+
+### Temporal ordered list
+
+Pregunta:
+
+```text
+Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023?
+```
+
+Flujo:
+
+1. `source_pipeline` clasifica la pregunta como `temporal_ordered_list`
+2. el skill intenta resolver con evidencia temporal ya grounding
+3. si no alcanza, los adapters aportan evidencia adicional
+4. el reducer `roster_neighbor` arma la respuesta final
 
 ## Notas técnicas
 
 - El backend oficial evalúa con `strip().lower()`.
 - La respuesta enviada no debe incluir wrappers como `[ANSWER]`.
 - El Space existe para exponer el código públicamente; el flujo de resolución y submit corre en local.
-- `metric_row_lookup` puede resolver desde texto lineal de páginas de stats y desde leaderboards rankeados cuando `extract_tables_from_url` no encuentra HTML útil.
-- `award_number` prioriza matches donde el sujeto de la pregunta queda ligado localmente al award. En `article_to_paper`, puede buscar por título exacto del paper cuando el publisher primario bloquea el fetch.
-- `analyze_youtube_video` extrae y transcribe el audio (Whisper) antes del análisis de frames.
+- `metric_row_lookup` puede resolver desde texto lineal y desde leaderboards.
+- `award_number` prioriza matches donde el sujeto queda ligado localmente al award.
+- `analyze_youtube_video` extrae y transcribe audio antes del análisis de frames.
 
 ## Package limpio
 
@@ -181,6 +267,8 @@ bash scripts/package_clean.sh
 
 Los scripts excluyen `.git`, `.env`, `.venv`, caches, artefactos de runtime/test y `__pycache__`.
 
-## Arquitectura
+## Documentación de arquitectura
 
-Hay una descripción detallada del flujo en `docs/architecture/gaia-langgraph-agent.md`.
+La explicación detallada de la arquitectura, términos y flujo real del agente está en:
+
+[`docs/architecture/gaia-langgraph-agent.md`](docs/architecture/gaia-langgraph-agent.md)

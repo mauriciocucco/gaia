@@ -6,10 +6,13 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from ..fallbacks import FallbackResolver
+from ..adapters import SourceAdapter
+from ..core.recoveries import RecoveryStrategy
+from ..evidence_solver import solve_answer_from_evidence_records
 from ..hooks import AgentHook
 from ..normalize import normalize_submitted_answer
 from ..source_pipeline import QuestionProfile, SourceCandidate, serialize_evidence
+from ..skills import Skill
 from .. import tools as tools_module
 from ..tools import STRUCTURED_TOOL_INVOKERS
 from ..tools._payloads import StructuredToolResult, serialize_tool_payloads
@@ -46,18 +49,30 @@ class GraphWorkflowServices:
         *,
         answer_model: Any,
         tools_by_name: dict[str, Any],
-        fallback_resolvers: list[FallbackResolver],
+        core_recoveries: list[RecoveryStrategy],
+        skills: list[Skill],
+        source_adapters: list[SourceAdapter],
         hook: AgentHook,
     ) -> None:
         self._answer_model = answer_model
         self._tools_by_name = tools_by_name
-        self._fallback_resolvers = list(fallback_resolvers)
+        self._core_recoveries = list(core_recoveries)
+        self._skills = list(skills)
+        self._source_adapters = list(source_adapters)
         self._hook = hook
         self._finalization_rules = build_finalization_rules()
 
     @property
-    def fallback_resolvers(self) -> list[FallbackResolver]:
-        return list(self._fallback_resolvers)
+    def core_recoveries(self) -> list[RecoveryStrategy]:
+        return list(self._core_recoveries)
+
+    @property
+    def skills(self) -> list[Skill]:
+        return list(self._skills)
+
+    @property
+    def source_adapters(self) -> list[SourceAdapter]:
+        return list(self._source_adapters)
 
     @property
     def finalization_rules(self):
@@ -85,7 +100,7 @@ class GraphWorkflowServices:
             reducer_used=reducer_used,
         ):
             return None
-        if reducer_used == "roster_neighbor" and profile.name == "roster_neighbor_lookup" and profile.expected_date:
+        if reducer_used == "roster_neighbor" and profile.name == "temporal_ordered_list" and profile.expected_date:
             grounded_answer = grounded_temporal_roster_answer(state)
             if grounded_answer is None:
                 return None
@@ -165,23 +180,80 @@ class GraphWorkflowServices:
     ):
         return top_grounded_evidence_records(state, limit=limit)
 
-    def run_fallback_resolvers(self, state: AgentState) -> dict[str, Any] | None:
+    def run_core_recoveries(self, state: AgentState) -> dict[str, Any] | None:
         profile = question_profile_from_state(state)
-        for resolver in self._fallback_resolvers:
-            if resolver.applies(state, profile):
-                result = resolver.run(state)
-                if result:
-                    return result
+        for recovery in self._core_recoveries:
+            if not recovery.applies(state, profile):
+                continue
+            result = recovery.run(state)
+            if result:
+                return result
         return None
+
+    def run_skills(self, state: AgentState) -> dict[str, Any] | None:
+        profile = question_profile_from_state(state)
+        for skill in self._skills:
+            if not skill.applies(state, profile):
+                continue
+            result = skill.run(state)
+            if result:
+                return result
+        return None
+
+    def run_skill(self, skill_name: str, state: AgentState) -> dict[str, Any] | None:
+        profile = question_profile_from_state(state)
+        for skill in self._skills:
+            if skill.name != skill_name or not skill.applies(state, profile):
+                continue
+            return skill.run(state)
+        return None
+
+    def run_adapters(
+        self, skill_name: str, state: AgentState
+    ) -> dict[str, Any] | None:
+        profile = question_profile_from_state(state)
+        ranked_candidates = ranked_candidates_from_state(state)
+        for adapter in self._source_adapters:
+            if adapter.skill_name != skill_name or not adapter.applies(profile, ranked_candidates):
+                continue
+            records = adapter.fetch_grounded_records(state)
+            if not records:
+                continue
+            answer, reducer = solve_answer_from_evidence_records(state["question"], records)
+            if not answer:
+                continue
+            return {
+                "final_answer": answer,
+                "error": None,
+                "reducer_used": reducer,
+                "skill_used": skill_name,
+                "skill_trace": [skill_name, adapter.name],
+                "evidence_used": serialize_evidence(records[-6:]),
+                "fallback_reason": None,
+                "tool_trace": list(getattr(adapter, "last_tool_trace", []) or []),
+                "decision_trace": list(getattr(adapter, "last_decision_trace", []) or []),
+            }
+        return None
+
+    def run_fallback_resolvers(self, state: AgentState) -> dict[str, Any] | None:
+        return self.run_core_recoveries(state) or self.run_skills(state)
 
     def run_named_fallback(
         self, resolver_name: str, state: AgentState
     ) -> dict[str, Any] | None:
+        if resolver_name == "roster":
+            return self.run_adapters("temporal_ordered_list", state)
+        if resolver_name == "competition":
+            return self.run_skill("competition_gaia", state)
+        if resolver_name == "role_chain":
+            return self.run_skill("role_chain_gaia", state)
+        if resolver_name == "botanical":
+            return self.run_skill("botanical_gaia", state)
         profile = question_profile_from_state(state)
-        for resolver in self._fallback_resolvers:
-            if resolver.name != resolver_name or not resolver.applies(state, profile):
+        for recovery in self._core_recoveries:
+            if recovery.name != resolver_name or not recovery.applies(state, profile):
                 continue
-            return resolver.run(state)
+            return recovery.run(state)
         return None
 
     def ranked_candidates_from_state(self, state: AgentState) -> list[SourceCandidate]:
