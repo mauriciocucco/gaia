@@ -30,7 +30,7 @@ class WorkflowFinalizer:
                 "error": state.get("error"),
                 "reducer_used": state.get("reducer_used"),
                 "evidence_used": state.get("evidence_used", []),
-                "fallback_reason": state.get("fallback_reason"),
+                "recovery_reason": state.get("recovery_reason"),
             }
 
         last_ai = self._services.last_ai_message(state["messages"])
@@ -39,27 +39,27 @@ class WorkflowFinalizer:
         error = state.get("error")
         reducer_used = state.get("reducer_used")
         evidence_used = list(state.get("evidence_used") or [])
-        fallback_reason = state.get("fallback_reason")
+        recovery_reason = state.get("recovery_reason")
 
         if attachment_required_but_missing(
             question=state["question"],
             file_name=state.get("file_name"),
             local_file_path=state.get("local_file_path"),
         ):
-            fallback_tool_answer = self._services.fallback_tool_answer(
+            derived_answer = self._services.tool_derived_answer(
                 state["messages"],
                 state["question"],
             )
-            if fallback_tool_answer:
+            if derived_answer:
                 return {
-                    "final_answer": fallback_tool_answer,
+                    "final_answer": derived_answer,
                     "error": None,
-                    "fallback_reason": None,
+                    "recovery_reason": None,
                 }
             return {
                 "final_answer": "",
                 "error": error or "Required attachment was not available locally.",
-                "fallback_reason": fallback_reason or "attachment_missing",
+                "recovery_reason": recovery_reason or "attachment_missing",
             }
 
         preferred_structured_result = self._services.structured_answer_result(
@@ -98,7 +98,7 @@ class WorkflowFinalizer:
                 final_answer,
                 services=self._services,
                 error=error,
-                fallback_reason=fallback_reason,
+                recovery_reason=recovery_reason,
             )
             if result:
                 return result
@@ -117,33 +117,33 @@ class WorkflowFinalizer:
                 return recovered
             final_answer = ""
             error = error or "Model produced an invalid non-answer."
-            fallback_reason = fallback_reason or "invalid_model_non_answer"
+            recovery_reason = recovery_reason or "invalid_model_non_answer"
 
         if not final_answer:
             recovered = self._recover_from_evidence(state)
             if recovered:
                 return recovered
             error = error or "Model did not produce a final answer."
-            fallback_reason = fallback_reason or "missing_final_answer"
+            recovery_reason = recovery_reason or "missing_final_answer"
 
         return {
             "final_answer": final_answer,
             "error": error,
             "reducer_used": reducer_used,
             "evidence_used": evidence_used,
-            "fallback_reason": fallback_reason,
+            "recovery_reason": recovery_reason,
         }
 
     def _recover_from_evidence(self, state: AgentState) -> dict[str, Any] | None:
-        fallback_tool_answer = self._services.fallback_tool_answer(
+        derived_answer = self._services.tool_derived_answer(
             state["messages"],
             state["question"],
         )
-        if fallback_tool_answer:
+        if derived_answer:
             return {
-                "final_answer": fallback_tool_answer,
+                "final_answer": derived_answer,
                 "error": None,
-                "fallback_reason": None,
+                "recovery_reason": None,
             }
 
         structured_result = self._services.structured_answer_result(state)
@@ -158,7 +158,7 @@ class WorkflowFinalizer:
                 "evidence_used": serialize_evidence(
                     self._services.top_grounded_evidence_records(state)
                 ),
-                "fallback_reason": None,
+                "recovery_reason": None,
             }
 
         verified_answer = self._services.verify_answer_from_evidence(state)
@@ -169,6 +169,6 @@ class WorkflowFinalizer:
                 "evidence_used": serialize_evidence(
                     self._services.top_grounded_evidence_records(state)
                 ),
-                "fallback_reason": None,
+                "recovery_reason": None,
             }
         return None

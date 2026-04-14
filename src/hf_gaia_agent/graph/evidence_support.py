@@ -417,7 +417,7 @@ def extract_answer_from_tool_output(
     return None
 
 
-def fallback_tool_answer(messages: list[Any], question: str) -> str | None:
+def tool_derived_answer(messages: list[Any], question: str) -> str | None:
     for message in reversed(messages):
         if not isinstance(message, ToolMessage):
             continue

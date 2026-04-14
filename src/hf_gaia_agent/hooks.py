@@ -67,8 +67,8 @@ class VerboseHook(BaseAgentHook):
         print(f"Decision trace: {result.get('decision_trace', [])}")
         if result.get("error"):
             print(f"Error: {result['error']}")
-        if result.get("fallback_reason"):
-            print(f"Fallback: {result['fallback_reason']}")
+        if result.get("recovery_reason"):
+            print(f"Recovery reason: {result['recovery_reason']}")
         print(separator, flush=True)
 
 

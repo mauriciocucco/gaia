@@ -120,7 +120,7 @@ class ToolPolicyEngine:
                 tool_args=tool_args,
                 execution=execution,
             )
-            self._apply_metric_table_auto_fallback(
+            self._apply_metric_table_auto_followup(
                 context=context,
                 state=state,
                 tool_call_id=tool_call["id"],
@@ -459,7 +459,7 @@ class ToolPolicyEngine:
             tool_call_id=f"auto-find-{tool_call_id}",
         )
 
-    def _apply_metric_table_auto_fallback(
+    def _apply_metric_table_auto_followup(
         self,
         *,
         context: ToolPolicyRunContext,
@@ -486,8 +486,8 @@ class ToolPolicyEngine:
             context,
             "fetch_url",
             auto_args,
-            decision_label="tool:fetch_url:auto_fallback",
-            trace_label="auto_fallback_from_extract_tables",
+            decision_label="tool:fetch_url:auto_followup",
+            trace_label="auto_followup_from_extract_tables",
         )
         self._execute_tool_call(
             context=context,

@@ -473,9 +473,9 @@ def pick_best_unfetched_candidate(
                 title=url,
                 url=url,
                 snippet="",
-                origin_tool="fallback",
+                origin_tool="derived_url",
                 score=1,
-                reasons=("fallback_url",),
+                reasons=("derived_url",),
             )
     if not candidates:
         return None
@@ -483,9 +483,9 @@ def pick_best_unfetched_candidate(
         title=candidates[0],
         url=candidates[0],
         snippet="",
-        origin_tool="fallback",
+        origin_tool="derived_url",
         score=1,
-        reasons=("fallback_url",),
+        reasons=("derived_url",),
     )
 
 

@@ -27,5 +27,5 @@ class TemporalOrderedListSkill:
             "skill_used": self.name,
             "skill_trace": [self.name],
             "evidence_used": serialize_evidence(records),
-            "fallback_reason": None,
+            "recovery_reason": None,
         }

@@ -17,7 +17,7 @@ class SkillResult:
     skill_used: str | None = None
     evidence_used: list[dict[str, Any]] = field(default_factory=list)
     skill_trace: list[str] = field(default_factory=list)
-    fallback_reason: str | None = None
+    recovery_reason: str | None = None
     tool_trace: list[str] = field(default_factory=list)
     decision_trace: list[str] = field(default_factory=list)
 
@@ -29,7 +29,7 @@ class SkillResult:
             "skill_used": self.skill_used,
             "evidence_used": self.evidence_used,
             "skill_trace": self.skill_trace,
-            "fallback_reason": self.fallback_reason,
+            "recovery_reason": self.recovery_reason,
             "tool_trace": self.tool_trace,
             "decision_trace": self.decision_trace,
         }

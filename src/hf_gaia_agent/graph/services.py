@@ -29,12 +29,12 @@ from .candidate_support import (
 )
 from .contracts import ToolInvocationResult
 from .evidence_support import (
-    fallback_tool_answer,
     format_grounded_evidence_for_llm,
     grounded_temporal_roster_answer,
     last_ai_message,
     should_prefer_structured_answer,
     structured_answer_from_state,
+    tool_derived_answer,
     top_grounded_evidence_records,
 )
 from .answer_policy import is_invalid_final_response
@@ -85,8 +85,8 @@ class GraphWorkflowServices:
     def last_ai_message(self, messages: list[Any]):
         return last_ai_message(messages)
 
-    def fallback_tool_answer(self, messages: list[Any], question: str) -> str | None:
-        return fallback_tool_answer(messages, question)
+    def tool_derived_answer(self, messages: list[Any], question: str) -> str | None:
+        return tool_derived_answer(messages, question)
 
     def structured_answer_result(
         self, state: AgentState, *, preferred_only: bool = False
@@ -110,7 +110,7 @@ class GraphWorkflowServices:
             "error": None,
             "reducer_used": reducer_used,
             "evidence_used": serialize_evidence(used_records),
-            "fallback_reason": None,
+            "recovery_reason": None,
         }
 
     def salvage_answer_from_evidence(self, state: AgentState) -> str | None:
@@ -229,7 +229,7 @@ class GraphWorkflowServices:
                 "skill_used": skill_name,
                 "skill_trace": [skill_name, adapter.name],
                 "evidence_used": serialize_evidence(records[-6:]),
-                "fallback_reason": None,
+                "recovery_reason": None,
                 "tool_trace": list(getattr(adapter, "last_tool_trace", []) or []),
                 "decision_trace": list(getattr(adapter, "last_decision_trace", []) or []),
             }

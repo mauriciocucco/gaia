@@ -32,7 +32,7 @@ def build_set_classification_result(
         "skill_used": skill_name,
         "skill_trace": [skill_name],
         "evidence_used": serialize_evidence(records[-6:]),
-        "fallback_reason": None,
+        "recovery_reason": None,
         "tool_trace": list(tool_trace or []),
         "decision_trace": list(decision_trace or []),
     }

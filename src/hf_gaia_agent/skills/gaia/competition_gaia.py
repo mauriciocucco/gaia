@@ -60,9 +60,9 @@ class CompetitionGaiaSkill:
             {
                 "final_answer": answer,
                 "error": None,
-                "reducer_used": reducer or "competition_nationality_fallback",
+                "reducer_used": reducer or "competition_nationality_recovery",
                 "evidence_used": serialize_evidence(records[-3:]),
-                "fallback_reason": None,
+                "recovery_reason": None,
                 "skill_used": self.name,
                 "skill_trace": [self.name],
             },

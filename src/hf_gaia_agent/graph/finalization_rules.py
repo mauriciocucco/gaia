@@ -28,20 +28,20 @@ class BotanicalClassificationFinalizationRule:
         *,
         services: FinalizationServices,
         error: str | None,
-        fallback_reason: str | None,
+        recovery_reason: str | None,
     ) -> dict[str, Any] | None:
         del answer_text
-        fallback_answer = services.fallback_tool_answer(state["messages"], state["question"])
-        if fallback_answer and not requires_botanical_classification_retry(state, fallback_answer):
+        derived_answer = services.tool_derived_answer(state["messages"], state["question"])
+        if derived_answer and not requires_botanical_classification_retry(state, derived_answer):
             return {
-                "final_answer": fallback_answer,
+                "final_answer": derived_answer,
                 "error": None,
-                "fallback_reason": None,
+                "recovery_reason": None,
             }
         return {
             "final_answer": "",
             "error": error or "Botanical classification answer lacked grounded evidence.",
-            "fallback_reason": fallback_reason
+            "recovery_reason": recovery_reason
             or "botanical_classification_evidence_missing",
         }
 
@@ -65,24 +65,21 @@ class TemporalRosterFinalizationRule:
         *,
         services: FinalizationServices,
         error: str | None,
-        fallback_reason: str | None,
+        recovery_reason: str | None,
     ) -> dict[str, Any] | None:
         del answer_text
-        targeted_roster_result = services.run_targeted_resolution("roster", state)
-        if targeted_roster_result:
-            return targeted_roster_result
-        fallback_answer = services.fallback_tool_answer(state["messages"], state["question"])
-        if fallback_answer and not requires_temporal_roster_retry(state, fallback_answer):
+        derived_answer = services.tool_derived_answer(state["messages"], state["question"])
+        if derived_answer and not requires_temporal_roster_retry(state, derived_answer):
             return {
-                "final_answer": fallback_answer,
+                "final_answer": derived_answer,
                 "error": None,
-                "fallback_reason": None,
+                "recovery_reason": None,
             }
         return {
             "final_answer": "",
             "error": error
             or "Date-sensitive roster answer lacked temporally grounded evidence.",
-            "fallback_reason": fallback_reason or "temporal_roster_evidence_missing",
+            "recovery_reason": recovery_reason or "temporal_roster_evidence_missing",
         }
 
 

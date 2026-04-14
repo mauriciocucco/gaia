@@ -44,7 +44,7 @@ class AgentState(MessagesState):
     decision_trace: list[str]
     evidence_used: list[dict[str, Any]]
     reducer_used: str | None
-    fallback_reason: str | None
+    recovery_reason: str | None
     question_profile: dict[str, Any]
     ranked_candidates: list[dict[str, Any]]
     search_history_normalized: list[str]

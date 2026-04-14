@@ -56,7 +56,7 @@ class FakeAgentWithHook:
             "decision_trace": [],
             "evidence_used": [],
             "reducer_used": None,
-            "fallback_reason": None,
+            "recovery_reason": None,
             "error": None,
         }
         self._hook.on_solve_end(question.task_id, result)

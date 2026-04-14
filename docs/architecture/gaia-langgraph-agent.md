@@ -251,7 +251,7 @@ Campos importantes:
 - `ranked_candidates`: URLs ordenadas por confianza
 - `search_history_fingerprints`: historial de búsquedas con fingerprint estructurado
 - `structured_tool_outputs`: outputs tipados de tools
-- `evidence_used`, `reducer_used`, `fallback_reason`: explicación del resultado
+- `evidence_used`, `reducer_used`, `recovery_reason`: explicación del resultado
 - `final_answer`, `error`: salida final
 
 Esto convierte al estado en tres cosas a la vez:
@@ -484,7 +484,7 @@ Proceso de puntuar URLs candidatas según:
 | `core recovery` | Recuperación reusable del agente general |
 | `DTO` | Objeto simple de datos |
 | `evidence` | Texto, tabla o dato obtenido de una fuente real |
-| `fallback` | Término viejo para rescates; sigue existiendo en compatibilidad, pero ya no es el concepto principal |
+| `fallback` | Término histórico de etapas anteriores; ya no describe la arquitectura vigente |
 | `fingerprint` | Firma estructurada de búsqueda |
 | `grounded` | Apoyado en evidencia real |
 | `guardrail` | Restricción que evita acciones malas o inútiles |

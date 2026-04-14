@@ -513,7 +513,7 @@ class FakeModelWithWrongConcreteMetricAnswer:
         return AIMessage(content="[ANSWER]595[/ANSWER]")
 
 
-class FakeModelWithMetricTextFallback:
+class FakeModelWithMetricTextAutoFollowup:
     def __init__(self) -> None:
         self.calls = 0
 
@@ -527,7 +527,7 @@ class FakeModelWithMetricTextFallback:
                 content="",
                 tool_calls=[
                     {
-                        "id": "call-metric-fallback",
+                        "id": "call-metric-followup",
                         "name": "extract_tables_from_url",
                         "args": {
                             "url": "https://www.baseball-almanac.com/teamstats/hitting.php?y=1977&t=NYA",
@@ -536,7 +536,7 @@ class FakeModelWithMetricTextFallback:
                     }
                 ],
             )
-        raise AssertionError("Graph should finalize from auto fetch fallback before another model turn.")
+        raise AssertionError("Graph should finalize from the auto-fetch followup before another model turn.")
 
 
 def test_graph_runs_tools_and_normalizes_answer() -> None:
@@ -565,7 +565,7 @@ def test_graph_retries_when_model_returns_non_answer() -> None:
     assert result["error"] is None
 
 
-def test_graph_falls_back_to_tool_answer_when_final_response_is_invalid(monkeypatch) -> None:
+def test_graph_uses_tool_derived_answer_when_final_response_is_invalid(monkeypatch) -> None:
     @tool
     def analyze_youtube_video(url: str, question: str) -> str:
         """Return a concrete count from mocked video analysis."""
@@ -701,10 +701,10 @@ def test_graph_auto_fetches_text_when_metric_table_extraction_finds_no_html_tabl
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [extract_tables_from_url, fetch_url])
 
-    agent = GaiaGraphAgent(model=FakeModelWithMetricTextFallback(), max_iterations=2)
+    agent = GaiaGraphAgent(model=FakeModelWithMetricTextAutoFollowup(), max_iterations=2)
     result = agent.solve(
         Question(
-            task_id="metric-text-fallback",
+            task_id="metric-text-auto-followup",
             question="How many at bats did the Yankee with the most walks in the 1977 regular season have that same season?",
             file_name=None,
         )
@@ -712,7 +712,7 @@ def test_graph_auto_fetches_text_when_metric_table_extraction_finds_no_html_tabl
 
     assert result["submitted_answer"] == "519"
     assert result["reducer_used"] == "metric_row_lookup"
-    assert any("[auto_fallback_from_extract_tables]" in item for item in result["tool_trace"])
+    assert any("[auto_followup_from_extract_tables]" in item for item in result["tool_trace"])
     assert result["error"] is None
 
 
@@ -894,7 +894,7 @@ def test_graph_article_to_paper_auto_retries_links_and_redirects_fetch(monkeypat
     )
 
 
-def test_graph_article_identifier_fallback_fetches_external_candidate(monkeypatch) -> None:
+def test_graph_article_identifier_recovery_fetches_external_candidate(monkeypatch) -> None:
     @tool
     def fetch_url(url: str) -> str:
         """Return the Northwestern for-journalists page with the award number."""
@@ -933,7 +933,7 @@ def test_graph_article_identifier_fallback_fetches_external_candidate(monkeypatc
     assert result["reducer_used"] == "award_number"
 
 
-def test_graph_article_identifier_fallback_searches_by_supported_subject(monkeypatch) -> None:
+def test_graph_article_identifier_recovery_searches_by_supported_subject(monkeypatch) -> None:
     @tool
     def web_search(query: str, max_results: int = 5) -> str:
         """Return a paper page when searching by supported subject."""
@@ -972,7 +972,7 @@ def test_graph_article_identifier_fallback_searches_by_supported_subject(monkeyp
     assert result["reducer_used"] == "award_number"
 
 
-def test_graph_article_identifier_fallback_searches_by_exact_paper_title_when_primary_source_is_blocked(
+def test_graph_article_identifier_recovery_searches_by_exact_paper_title_when_primary_source_is_blocked(
     monkeypatch,
 ) -> None:
     search_queries: list[str] = []
@@ -1047,7 +1047,7 @@ def test_graph_article_identifier_fallback_searches_by_exact_paper_title_when_pr
     )
 
 
-def test_graph_article_identifier_fallback_prefers_new_external_candidate_after_blocked_fetch(
+def test_graph_article_identifier_recovery_prefers_new_external_candidate_after_blocked_fetch(
     monkeypatch,
 ) -> None:
     fetched_urls: list[str] = []
@@ -1064,7 +1064,7 @@ def test_graph_article_identifier_fallback_prefers_new_external_candidate_after_
 
     @tool
     def find_text_in_url(url: str, query: str, max_matches: int = 1) -> str:
-        """Force the fallback to escalate from targeted text lookup to fetch."""
+        """Force the recovery path to escalate from targeted text lookup to fetch."""
         assert max_matches == 1
         return "No matches found."
 
@@ -1338,7 +1338,7 @@ def test_graph_retries_botanical_classification_until_it_has_grounding(monkeypat
     assert result["tool_trace"] == ["fetch_url({'url': 'https://example.com/botany'})"]
 
 
-def test_graph_botanical_fallback_classifies_items_from_fetched_sources(monkeypatch) -> None:
+def test_graph_botanical_recovery_classifies_items_from_fetched_sources(monkeypatch) -> None:
     @tool
     def web_search(query: str, max_results: int = 5) -> str:
         """Return one source candidate per botanical query."""
@@ -1383,7 +1383,7 @@ def test_graph_botanical_fallback_classifies_items_from_fetched_sources(monkeypa
     )
     result = agent.solve(
         Question(
-            task_id="botany-fallback",
+            task_id="botany-recovery",
             question=(
                 "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
                 "to categorizing things. Here's the list I have so far:\n\n"
@@ -1398,7 +1398,7 @@ def test_graph_botanical_fallback_classifies_items_from_fetched_sources(monkeypa
     assert result["reducer_used"] == "botanical_classification"
 
 
-def test_graph_botanical_fallback_recovers_prompt_item_omitted_by_model(monkeypatch) -> None:
+def test_graph_botanical_recovery_recovers_prompt_item_omitted_by_model(monkeypatch) -> None:
     search_queries: list[str] = []
 
     @tool
@@ -1449,7 +1449,7 @@ def test_graph_botanical_fallback_recovers_prompt_item_omitted_by_model(monkeypa
     )
     result = agent.solve(
         Question(
-            task_id="botany-fallback-omitted-item",
+            task_id="botany-recovery-omitted-item",
             question=(
                 "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
                 "to categorizing things. Here's the list I have so far:\n\n"
@@ -1465,7 +1465,7 @@ def test_graph_botanical_fallback_recovers_prompt_item_omitted_by_model(monkeypa
     assert any(query.startswith("fresh basil botanical fruit or vegetable") for query in search_queries)
 
 
-def test_graph_botanical_fallback_ignores_low_signal_fruit_metadata_pages(monkeypatch) -> None:
+def test_graph_botanical_recovery_ignores_low_signal_fruit_metadata_pages(monkeypatch) -> None:
     @tool
     def web_search(query: str, max_results: int = 5) -> str:
         """Return one source candidate per botanical query."""
@@ -1515,7 +1515,7 @@ def test_graph_botanical_fallback_ignores_low_signal_fruit_metadata_pages(monkey
     )
     result = agent.solve(
         Question(
-            task_id="botany-fallback-low-signal-fruit",
+            task_id="botany-recovery-low-signal-fruit",
             question=(
                 "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
                 "to categorizing things. Here's the list I have so far:\n\n"
@@ -1528,10 +1528,10 @@ def test_graph_botanical_fallback_ignores_low_signal_fruit_metadata_pages(monkey
 
     assert result["submitted_answer"] == ""
     assert result["reducer_used"] is None
-    assert result["fallback_reason"] == "botanical_classification_evidence_missing"
+    assert result["recovery_reason"] == "botanical_classification_evidence_missing"
 
 
-def test_graph_botanical_fallback_skips_social_noise_when_strong_source_is_present(
+def test_graph_botanical_recovery_skips_social_noise_when_strong_source_is_present(
     monkeypatch,
 ) -> None:
     fetched_urls: list[str] = []
@@ -1594,7 +1594,7 @@ def test_graph_botanical_fallback_skips_social_noise_when_strong_source_is_prese
     )
 
 
-def test_graph_botanical_fallback_recognizes_explicit_vegetable_title_metadata(
+def test_graph_botanical_recovery_recognizes_explicit_vegetable_title_metadata(
     monkeypatch,
 ) -> None:
     @tool
@@ -1650,7 +1650,7 @@ def test_graph_botanical_fallback_recognizes_explicit_vegetable_title_metadata(
     assert result["reducer_used"] == "botanical_classification"
 
 
-def test_graph_botanical_fallback_ignores_ambiguous_culinary_zucchini_page(monkeypatch) -> None:
+def test_graph_botanical_recovery_ignores_ambiguous_culinary_zucchini_page(monkeypatch) -> None:
     @tool
     def web_search(query: str, max_results: int = 5) -> str:
         """Return one source candidate per botanical query."""
@@ -1699,7 +1699,7 @@ def test_graph_botanical_fallback_ignores_ambiguous_culinary_zucchini_page(monke
     )
     result = agent.solve(
         Question(
-            task_id="botany-fallback-ambiguous-zucchini",
+            task_id="botany-recovery-ambiguous-zucchini",
             question=(
                 "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
                 "to categorizing things. Here's the list I have so far:\n\n"
@@ -1737,7 +1737,7 @@ def test_graph_rejects_ungrounded_botanical_classification_when_retry_budget_is_
 
     assert result["submitted_answer"] == ""
     assert result["error"] == "Botanical classification answer lacked grounded evidence."
-    assert result["fallback_reason"] == "botanical_classification_evidence_missing"
+    assert result["recovery_reason"] == "botanical_classification_evidence_missing"
 
 
 def test_graph_marks_audio_access_meta_answer_invalid() -> None:
@@ -2193,7 +2193,7 @@ def test_temporal_roster_retry_requires_positive_grounded_roster_evidence() -> N
     assert requires_temporal_roster_retry(state, "Yamasaki, Uehara") is True
 
 
-def test_graph_targeted_fighters_roster_fallback_solves_from_projected_season_page(monkeypatch) -> None:
+def test_graph_targeted_fighters_roster_adapter_solves_from_projected_season_page(monkeypatch) -> None:
     @tool
     def fetch_url(url: str) -> str:
         """Return mocked Fighters roster pages."""
@@ -2277,7 +2277,7 @@ def test_graph_targeted_fighters_roster_fallback_solves_from_projected_season_pa
     assert result["reducer_used"] == "roster_neighbor"
 
 
-def test_graph_targeted_fighters_roster_fallback_can_start_from_pacificleague_and_team_wiki(monkeypatch) -> None:
+def test_graph_targeted_fighters_roster_adapter_can_start_from_pacificleague_and_team_wiki(monkeypatch) -> None:
     @tool
     def fetch_url(url: str) -> str:
         """Return mocked Pacific League and Fighters pages."""
@@ -2364,7 +2364,7 @@ def test_graph_targeted_fighters_roster_fallback_can_start_from_pacificleague_an
     assert result["final_answer"] == "Yoshida, Uehara"
 
 
-def test_graph_text_span_source_fallback_solves_from_ranked_candidate(monkeypatch) -> None:
+def test_graph_text_span_recovery_solves_from_ranked_candidate(monkeypatch) -> None:
     calls: list[tuple[str, str]] = []
 
     @tool
@@ -2405,7 +2405,7 @@ def test_graph_text_span_source_fallback_solves_from_ranked_candidate(monkeypatc
     assert any("Chabot_College" in url for url, _ in calls)
 
 
-def test_graph_text_span_source_fallback_fetches_candidate_page_after_find_miss(
+def test_graph_text_span_recovery_fetches_candidate_page_after_find_miss(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
@@ -2464,7 +2464,7 @@ def test_graph_text_span_source_fallback_fetches_candidate_page_after_find_miss(
     assert any(call.startswith("fetch:") and "Chabot_College" in call for call in calls)
 
 
-def test_graph_entity_role_chain_fallback_overrides_ungrounded_final_answer(
+def test_graph_entity_role_chain_recovery_overrides_ungrounded_final_answer(
     monkeypatch,
 ) -> None:
     search_queries: list[str] = []
@@ -2511,7 +2511,7 @@ def test_graph_entity_role_chain_fallback_overrides_ungrounded_final_answer(
     agent = GaiaGraphAgent(model=FakeModelForEntityRoleChainFallback(), max_iterations=1)
     result = agent.solve(
         Question(
-            task_id="role-chain-fallback",
+            task_id="role-chain-recovery",
             question=(
                 "Who did the actor who played Ray in the Polish-language version of Everybody Loves Raymond play in Magda M.? "
                 "Give only the first name."
@@ -2534,14 +2534,14 @@ def test_graph_entity_role_chain_fallback_overrides_ungrounded_final_answer(
     )
 
 
-def test_graph_entity_role_chain_fallback_searches_past_weak_raymond_candidates(
+def test_graph_entity_role_chain_recovery_searches_past_weak_raymond_candidates(
     monkeypatch,
 ) -> None:
     search_queries: list[str] = []
 
     @tool
     def web_search(query: str, max_results: int = 5) -> str:
-        """Return strong two-hop candidates only after targeted fallback searches."""
+        """Return strong two-hop candidates only after targeted recovery searches."""
         assert max_results == 5
         search_queries.append(query)
         return (

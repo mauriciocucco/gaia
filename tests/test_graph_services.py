@@ -5,6 +5,7 @@ from langchain_core.messages import AIMessage, ToolMessage
 from hf_gaia_agent.graph.candidate_support import ranked_candidates_from_state
 from hf_gaia_agent.graph.contracts import ToolInvocationResult
 from hf_gaia_agent.graph.finalizer import WorkflowFinalizer
+from hf_gaia_agent.graph.finalization_rules import TemporalRosterFinalizationRule
 from hf_gaia_agent.graph.nudges import build_search_nudge, build_stuck_search_nudge
 from hf_gaia_agent.graph.tool_policy import ToolPolicyEngine
 from hf_gaia_agent.source_pipeline import (
@@ -30,7 +31,7 @@ class _FakeFinalizationServices:
                 return message
         return None
 
-    def fallback_tool_answer(self, messages, question):
+    def tool_derived_answer(self, messages, question):
         del messages, question
         return None
 
@@ -139,12 +140,43 @@ def test_workflow_finalizer_depends_on_service_interface() -> None:
             "error": None,
             "reducer_used": None,
             "evidence_used": [],
-            "fallback_reason": None,
+            "recovery_reason": None,
         }
     )
 
     assert result["final_answer"] == "42"
     assert result["error"] is None
+
+
+def test_temporal_roster_rule_no_longer_reinvokes_targeted_resolution() -> None:
+    class _RuleServices:
+        def tool_derived_answer(self, messages, question):
+            del messages, question
+            return None
+
+    rule = TemporalRosterFinalizationRule()
+    state = {
+        "question": "Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023?",
+        "messages": [],
+        "question_profile": {
+            "name": "temporal_ordered_list",
+            "expected_date": "as of July 2023",
+        },
+    }
+
+    result = rule.finalize(
+        state,
+        "",
+        services=_RuleServices(),
+        error=None,
+        recovery_reason=None,
+    )
+
+    assert result == {
+        "final_answer": "",
+        "error": "Date-sensitive roster answer lacked temporally grounded evidence.",
+        "recovery_reason": "temporal_roster_evidence_missing",
+    }
 
 
 def test_tool_policy_engine_runs_with_explicit_services() -> None:

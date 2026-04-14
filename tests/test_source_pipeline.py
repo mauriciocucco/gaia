@@ -51,7 +51,7 @@ def test_profile_question_prioritizes_attachment_required_before_specialized_fam
     assert profile.preferred_tools == ("read_local_file",)
 
 
-def test_profile_question_prioritizes_youtube_before_direct_url_fallback() -> None:
+def test_profile_question_prioritizes_youtube_before_direct_url_detection() -> None:
     profile = profile_question(
         "What is said in this video https://www.youtube.com/watch?v=L1vXCYZAYYM and this page https://example.com/context?"
     )

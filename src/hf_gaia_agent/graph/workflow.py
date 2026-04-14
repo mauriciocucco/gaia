@@ -154,7 +154,7 @@ def _prepare_context(state: AgentState) -> dict[str, Any]:
         "decision_trace": [],
         "evidence_used": [],
         "reducer_used": None,
-        "fallback_reason": None,
+        "recovery_reason": None,
         "question_profile": question_profile.as_dict(),
         "ranked_candidates": [],
         "search_history_normalized": [],
@@ -422,7 +422,7 @@ class GaiaGraphAgent:
                 "evidence_used": [],
                 "reducer_used": prompt_reducer_used,
                 "skill_trace": [],
-                "fallback_reason": None,
+                "recovery_reason": None,
                 "error": None,
             }
             self._hook.on_solve_end(question.task_id, result)
@@ -439,7 +439,7 @@ class GaiaGraphAgent:
                 "decision_trace": [],
                 "evidence_used": [],
                 "reducer_used": None,
-                "fallback_reason": None,
+                "recovery_reason": None,
                 "error": None,
                 "final_answer": None,
                 "iterations": 0,
@@ -466,7 +466,7 @@ class GaiaGraphAgent:
             "evidence_used": final_state.get("evidence_used", []),
             "reducer_used": final_state.get("reducer_used"),
             "skill_trace": final_state.get("skill_trace", []),
-            "fallback_reason": final_state.get("fallback_reason"),
+            "recovery_reason": final_state.get("recovery_reason"),
             "error": final_state.get("error"),
         }
         self._hook.on_solve_end(question.task_id, result)

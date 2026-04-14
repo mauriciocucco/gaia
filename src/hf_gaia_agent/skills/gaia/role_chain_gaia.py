@@ -165,7 +165,7 @@ class RoleChainGaiaSkill:
                 "error": None,
                 "reducer_used": "entity_role_chain",
                 "evidence_used": serialize_evidence(attempted_records[-6:]),
-                "fallback_reason": None,
+                "recovery_reason": None,
                 "skill_used": self.name,
                 "skill_trace": [self.name],
             },

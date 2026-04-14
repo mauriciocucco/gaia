@@ -248,7 +248,7 @@ def recovery_result_from_records(
         "error": None,
         "reducer_used": reducer,
         "evidence_used": serialize_evidence(records[-3:]),
-        "fallback_reason": None,
+        "recovery_reason": None,
     }
 
 
