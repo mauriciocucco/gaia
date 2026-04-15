@@ -1398,6 +1398,76 @@ def test_graph_botanical_recovery_classifies_items_from_fetched_sources(monkeypa
     assert result["reducer_used"] == "botanical_classification"
 
 
+def test_graph_botanical_recovery_prefers_wikipedia_first_for_clean_item(monkeypatch) -> None:
+    tool_calls: list[str] = []
+
+    @tool
+    def search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Return a direct Wikipedia hit for a clean produce name."""
+        tool_calls.append(f"search_wikipedia:{query}")
+        assert max_results == 5
+        assert query == "sweet potatoes"
+        return (
+            "1. Sweet potato\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato\n"
+            "Snippet: Sweet potato is an edible root vegetable.\n\n"
+            "2. Sweet potato pie\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato_pie\n"
+            "Snippet: Sweet potato pie is a dessert.\n"
+        )
+
+    @tool
+    def fetch_wikipedia_page(title: str) -> str:
+        """Return the matching Wikipedia page text."""
+        tool_calls.append(f"fetch_wikipedia_page:{title}")
+        assert title == "Sweet potato"
+        return (
+            "Title: Sweet potato\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato\n\n"
+            "Sweet potato is an edible root vegetable."
+        )
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Broad web should not be needed after a clean Wikipedia resolution."""
+        raise AssertionError(f"Unexpected broad-web fallback for query={query!r}, max_results={max_results!r}")
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Broad web should not be fetched after a clean Wikipedia resolution."""
+        raise AssertionError(f"Unexpected broad-web fetch for url={url!r}")
+
+    monkeypatch.setattr(
+        graph_module,
+        "build_tools",
+        lambda: [search_wikipedia, fetch_wikipedia_page, web_search, fetch_url],
+    )
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-wikipedia-first-clean-item",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"].lower() == "sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+    assert tool_calls == [
+        "search_wikipedia:sweet potatoes",
+        "fetch_wikipedia_page:Sweet potato",
+    ]
+
+
 def test_graph_botanical_recovery_recovers_prompt_item_omitted_by_model(monkeypatch) -> None:
     search_queries: list[str] = []
 
@@ -1463,6 +1533,81 @@ def test_graph_botanical_recovery_recovers_prompt_item_omitted_by_model(monkeypa
     assert result["submitted_answer"] == "broccoli, fresh basil, sweet potatoes"
     assert result["reducer_used"] == "botanical_classification"
     assert any(query.startswith("fresh basil botanical fruit or vegetable") for query in search_queries)
+
+
+def test_graph_botanical_recovery_exits_wikipedia_quickly_on_weak_title_match(monkeypatch) -> None:
+    tool_calls: list[str] = []
+
+    @tool
+    def search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Return a weak Wikipedia title match that should not be fetched."""
+        tool_calls.append(f"search_wikipedia:{query}")
+        assert max_results == 5
+        assert query == "sweet potatoes"
+        return (
+            "1. Potato\n"
+            "URL: https://en.wikipedia.org/wiki/Potato\n"
+            "Snippet: Potato is a starchy tuber.\n"
+        )
+
+    @tool
+    def fetch_wikipedia_page(title: str) -> str:
+        """Weak title matches should exit before Wikipedia fetch."""
+        raise AssertionError(f"Unexpected Wikipedia fetch for weak title match {title!r}")
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Fallback to broad web after the weak Wikipedia candidate is rejected."""
+        tool_calls.append(f"web_search:{query}")
+        assert max_results == 5
+        assert query == "sweet potatoes botanical fruit or vegetable"
+        return (
+            "1. Sweet potato facts\n"
+            "URL: https://example.com/sweet-potato\n"
+            "Snippet: Sweet potato is an edible root vegetable.\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Fetch the broad-web fallback source."""
+        tool_calls.append(f"fetch_url:{url}")
+        assert url == "https://example.com/sweet-potato"
+        return (
+            "Title: Sweet potato\n"
+            "URL: https://example.com/sweet-potato\n\n"
+            "Sweet potato is an edible root vegetable."
+        )
+
+    monkeypatch.setattr(
+        graph_module,
+        "build_tools",
+        lambda: [search_wikipedia, fetch_wikipedia_page, web_search, fetch_url],
+    )
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-wikipedia-quick-exit",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"].lower() == "sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+    assert tool_calls == [
+        "search_wikipedia:sweet potatoes",
+        "web_search:sweet potatoes botanical fruit or vegetable",
+        "fetch_url:https://example.com/sweet-potato",
+    ]
 
 
 def test_graph_botanical_recovery_ignores_low_signal_fruit_metadata_pages(monkeypatch) -> None:
@@ -1591,6 +1736,80 @@ def test_graph_botanical_recovery_skips_social_noise_when_strong_source_is_prese
         "quora.com" in item or "tiktok.com" in item
         for item in result["tool_trace"]
         if item.startswith("fetch_url(")
+    )
+
+
+def test_graph_botanical_recovery_skips_grotesque_noise_when_reasonable_source_exists(
+    monkeypatch,
+) -> None:
+    fetched_urls: list[str] = []
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return the live-noise pattern with one reasonable botanical source."""
+        assert max_results == 5
+        assert query == "sweet potatoes botanical fruit or vegetable"
+        return (
+            "1. Amazon Fresh\n"
+            "URL: https://www.amazon.com/fresh\n"
+            "Snippet: Buy groceries online.\n\n"
+            "2. PayPal Checkout\n"
+            "URL: https://www.paypal.com/checkout\n"
+            "Snippet: Fast checkout for produce merchants.\n\n"
+            "3. Sweet potato - Wikipedia\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato\n"
+            "Snippet: Sweet potato is an edible root vegetable.\n\n"
+            "4. mobile01 forum thread\n"
+            "URL: https://www.mobile01.com/topicdetail.php?f=123&t=456\n"
+            "Snippet: Phone discussion mentioning sweet potatoes.\n\n"
+            "5. Sweet Potato Guide - IMDb\n"
+            "URL: https://www.imdb.com/title/tt1234567/\n"
+            "Snippet: Cast and crew for Sweet Potato.\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Only the reasonable botanical source should be fetched."""
+        fetched_urls.append(url)
+        assert url == "https://en.wikipedia.org/wiki/Sweet_potato"
+        return (
+            "Title: Sweet potato\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato\n\n"
+            "Sweet potato is an edible root vegetable."
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-live-noise-regression",
+            question=(
+                "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+                "to categorizing things. Here's the list I have so far:\n\n"
+                "sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"].lower() == "sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+    assert fetched_urls == ["https://en.wikipedia.org/wiki/Sweet_potato"]
+    assert not any(
+        fragment in entry
+        for fragment in (
+            "amazon.com",
+            "paypal.com",
+            "mobile01.com",
+            "imdb.com",
+        )
+        for entry in result["tool_trace"]
+        if entry.startswith("fetch_url(")
     )
 
 

@@ -75,6 +75,17 @@ def test_profile_question_does_not_false_positive_generic_vegetable_request() ->
     assert profile.name != "list_item_classification"
 
 
+def test_profile_question_prefers_wikipedia_tools_for_botanical_classification() -> None:
+    profile = profile_question(
+        "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+
+    assert profile.name == "list_item_classification"
+    assert profile.expected_domains == ("wikipedia.org",)
+    assert profile.preferred_tools[:2] == ("search_wikipedia", "fetch_wikipedia_page")
+
+
 def test_profile_question_prioritizes_attachment_required_before_specialized_families() -> None:
     profile = profile_question(
         "What is the surname of the equine veterinarian mentioned in the attached chapter notes?",
@@ -122,6 +133,90 @@ def test_score_candidates_prefers_expected_domain_author_and_date() -> None:
 
     assert scored[0].url.endswith("mysterious-filaments-at-the-center-of-the-milky-way")
     assert scored[0].score > scored[1].score
+
+
+def test_score_candidates_prefers_reasonable_botanical_source_over_noise() -> None:
+    question = (
+        "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Bell pepper - Wikipedia\n"
+        "URL: https://en.wikipedia.org/wiki/Bell_pepper\n"
+        "Snippet: Bell pepper is the fruit of plants in the Grossum Group of the species Capsicum annuum.\n\n"
+        "2. Amazon sign in\n"
+        "URL: https://www.amazon.com/\n"
+        "Snippet: Sign in to your account.\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://en.wikipedia.org/wiki/Bell_pepper"
+    assert "botanical_source_hint" in scored[0].reasons
+    assert "botanical_page_match" in scored[0].reasons
+    assert any("botanical_offtopic_vertical_penalty" in candidate.reasons for candidate in scored)
+
+
+def test_score_candidates_botanical_ranking_beats_grotesque_vertical_noise() -> None:
+    question = (
+        "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Amazon Fresh\n"
+        "URL: https://www.amazon.com/fresh\n"
+        "Snippet: Buy groceries online.\n\n"
+        "2. PayPal Checkout\n"
+        "URL: https://www.paypal.com/checkout\n"
+        "Snippet: Fast checkout for produce merchants.\n\n"
+        "3. Sweet potato - Wikipedia\n"
+        "URL: https://en.wikipedia.org/wiki/Sweet_potato\n"
+        "Snippet: Sweet potato is an edible root vegetable.\n\n"
+        "4. Sweet Potato Guide - IMDb\n"
+        "URL: https://www.imdb.com/title/tt1234567/\n"
+        "Snippet: Cast and crew for Sweet Potato.\n\n"
+        "5. mobile01 forum thread\n"
+        "URL: https://www.mobile01.com/topicdetail.php?f=123&t=456\n"
+        "Snippet: Phone discussion mentioning sweet potatoes.\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://en.wikipedia.org/wiki/Sweet_potato"
+    assert "botanical_source_hint" in scored[0].reasons
+    assert "botanical_page_match" in scored[0].reasons
+    assert all(
+        candidate.url == "https://en.wikipedia.org/wiki/Sweet_potato"
+        or "botanical_offtopic_vertical_penalty" in candidate.reasons
+        or "low_signal_domain" in candidate.reasons
+        for candidate in scored
+    )
+
+
+def test_score_candidates_does_not_treat_irrelevant_edu_as_automatically_good_for_botanical() -> None:
+    question = (
+        "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Student portal\n"
+        "URL: https://portal.example.edu/\n"
+        "Snippet: Sign in to manage your student account.\n\n"
+        "2. Sweet potato - Wikipedia\n"
+        "URL: https://en.wikipedia.org/wiki/Sweet_potato\n"
+        "Snippet: Sweet potato is an edible root vegetable.\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://en.wikipedia.org/wiki/Sweet_potato"
+    assert "botanical_source_hint" not in scored[1].reasons
 
 
 def test_score_candidates_prefers_linked_primary_source_for_article_to_paper() -> None:

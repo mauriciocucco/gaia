@@ -76,17 +76,61 @@ def botanical_relevant_text(item: str, text: str) -> str:
         for segment in re.split(r"(?:\n+|(?<=[.!?])\s+)", text)
         if segment.strip()
     ]
-    relevant_segments: list[str] = []
-    for segment in segments:
+    direct_match_indices: list[int] = []
+    for index, segment in enumerate(segments):
         normalized_segment = normalize_botanical_text(segment)
         if all(any(variant in normalized_segment for variant in variants) for variants in token_groups):
-            relevant_segments.append(segment)
+            direct_match_indices.append(index)
+    relevant_segments: list[str] = []
+    if direct_match_indices:
+        selected_indices: list[int] = []
+        for index in direct_match_indices:
+            selected_indices.append(index)
+            for neighbor in (index - 1, index + 1):
+                if 0 <= neighbor < len(segments) and _is_botanical_adjacent_context(segments[neighbor]):
+                    selected_indices.append(neighbor)
+        seen_indices: set[int] = set()
+        for index in selected_indices:
+            if index in seen_indices:
+                continue
+            seen_indices.add(index)
+            relevant_segments.append(segments[index])
     if relevant_segments:
         return " ".join(relevant_segments)
     normalized = normalize_botanical_text(text)
     if all(any(variant in normalized for variant in variants) for variants in token_groups):
         return text
     return ""
+
+
+def _is_botanical_adjacent_context(segment: str) -> bool:
+    normalized = normalize_botanical_text(segment)
+    if not normalized:
+        return False
+    if not normalized.startswith(("its ", "their ", "this ", "these ", "those ", "they ", "it ")):
+        return False
+    return any(
+        cue in normalized
+        for cue in (
+            "fruit",
+            "vegetable",
+            "root",
+            "roots",
+            "leaf",
+            "leaves",
+            "stem",
+            "stalk",
+            "flower",
+            "flowers",
+            "tuber",
+            "tubers",
+            "seed",
+            "seeds",
+            "berry",
+            "berries",
+            "herb",
+        )
+    )
 
 
 def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
@@ -104,10 +148,7 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         )
     ):
         return None
-    if (
-        "made from" in normalized
-        and any(token in normalized for token in ("milled", "grinding", "ground", "powder"))
-    ):
+    if re.search(r"made from[\w\s,-]{0,60}\b(?:milled|grinding|ground|powder)\b", normalized):
         return None
     fruit_score = 0
     vegetable_score = 0

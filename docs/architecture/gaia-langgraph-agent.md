@@ -1,533 +1,451 @@
 # GAIA LangGraph Agent
 
-> Documento de estudio para programadores que empiezan con agentes de IA.
-> La idea es explicar el código real de este repo con lenguaje claro, ejemplos y un glosario.
+> Documento de arquitectura del runtime actual.
+> El objetivo es explicar como funciona hoy el agente, que responsabilidades tiene cada capa y donde mirar cuando algo falla.
 
 ## Resumen
 
-Este proyecto implementa un agente para el benchmark GAIA usando LangGraph, pero la idea central no es "dejar que el modelo haga todo".
+Este repo implementa un agente para GAIA sobre LangGraph, pero no delega toda la resolucion al modelo.
 
-El LLM se usa como:
+El sistema combina:
 
-- planificador
-- lector de evidencia
-- ensamblador de respuestas cuando hace falta
+- un LLM para planear, decidir que tools usar y producir respuestas cortas cuando la evidencia ya esta cerrada
+- codigo Python para perfilar preguntas, rankear fuentes, aplicar guardrails, normalizar evidencia y resolver casos deterministas
 
-El código Python se usa como:
+La idea central es esta:
 
-- capa de control
-- capa de ranking de fuentes
-- capa de grounding
-- capa de extracción determinística
+- el modelo propone acciones
+- las tools traen evidencia
+- el runtime intenta cerrar por una via canonica antes de aceptar una respuesta libre
 
-La arquitectura actual está organizada en capas explícitas:
+## Estructura del proyecto
 
-1. `graph/`: orquestación del workflow
-2. `source_pipeline/`: perfilado de preguntas y ranking de fuentes
-3. `reducers/`: extractores determinísticos sobre evidencia
-4. `core/recoveries/`: recuperaciones reutilizables
-5. `skills/`: capacidades generales orientadas a tipos de tarea
-6. `adapters/`: integración específica por sitio, dominio o ecosistema
+Las carpetas principales bajo `src/hf_gaia_agent/` son:
 
-La separación importante es esta:
+| Carpeta | Rol |
+| --- | --- |
+| `graph/` | Orquestacion del workflow, policy, retry, finalizacion |
+| `source_pipeline/` | Question profiling, candidate ranking, normalizacion de evidencia |
+| `reducers/` | Extractores deterministas que reducen evidencia a una respuesta |
+| `core/recoveries/` | Estrategias reutilizables para recuperar respuestas desde evidencia o fuentes relacionadas |
+| `skills/` | Capacidades orientadas a familias de tareas |
+| `skills/gaia/` | Skills especificas del benchmark cuando el caso lo requiere |
+| `adapters/` | Integraciones concretas por dominio, sitio o ecosistema |
+| `tools/` | Herramientas expuestas al agente y sus variantes estructuradas |
 
-- el agente general vive en `graph`, `source_pipeline`, `reducers` y `core/recoveries`
-- la lógica muy específica del benchmark ya no debería contaminar el core; vive en `skills/gaia` y en `adapters/`
+Archivos importantes en la raiz del paquete:
 
-La capa legacy de `fallbacks/` ya fue eliminada del árbol principal.
-La arquitectura nueva evoluciona en `core/recoveries`, `skills/` y `adapters/`.
+| Archivo | Rol |
+| --- | --- |
+| `cli.py` | Entrada de linea de comandos |
+| `runner.py` | Loop para resolver preguntas desde la API de scoring |
+| `api_client.py` | Cliente contra la API de GAIA |
+| `hooks.py` | Observabilidad del runtime |
+| `botanical_classification.py` | Helpers compartidos para clasificacion botanica |
+| `evidence_solver.py` | Resolucion determinista desde `EvidenceRecord` |
 
-## Arquitectura general
+## Flujo de alto nivel
 
-El flujo visible empieza en la CLI de `cli.py`, que:
+El recorrido normal de una pregunta es:
 
-- carga configuración
-- consulta la API de GAIA con `api_client.py`
-- descarga adjuntos cuando existen
-- instancia `GaiaGraphAgent`
-- llama `solve(question, local_file_path=...)`
+1. `cli.py` carga configuracion y crea `GaiaGraphAgent`.
+2. `runner.py` obtiene la `Question` y resuelve adjuntos si hace falta.
+3. `GaiaGraphAgent.solve()` intenta primero un camino corto via `prompt_reducer`.
+4. Si el prompt no alcanza, construye el estado inicial y ejecuta el `StateGraph`.
+5. El nodo `agent` decide entre responder o llamar tools.
+6. El nodo `tools` ejecuta herramientas bajo `ToolPolicyEngine`.
+7. `resolve_after_tools` intenta cerrar por una via canonica.
+8. Si no alcanza, el flujo vuelve al modelo.
+9. `finalize` arbitra la salida final y decide si hay respuesta o error.
 
-La observabilidad se resuelve con `hooks.py`, no con monkeypatching. Eso permite ver qué tools se llaman y con qué resultados sin ensuciar la lógica principal.
+La forma corta de leer el sistema es:
 
-`solve()` tiene dos caminos:
+- `agent -> tools -> resolve_after_tools -> finalize`
 
-1. un `prompt_reducer` rápido para preguntas totalmente contenidas en el prompt
-2. el `StateGraph` completo cuando hace falta buscar, leer o validar evidencia
+con un retorno a `agent` solo cuando la evidencia todavia no alcanza.
 
-## Qué cambió conceptualmente
+## El prompt reducer
 
-Antes, mucha lógica especializada caía en una bolsa llamada `fallbacks`.
+No toda pregunta necesita herramientas.
 
-Ahora hay tres conceptos distintos:
+`try_prompt_reducer()` resuelve preguntas completamente contenidas en el prompt, por ejemplo:
+
+- calculos directos
+- transformaciones simples
+- tareas con lista ya visible y sin necesidad de grounding externo
+
+Si el reducer no puede cerrar con confianza, el agente entra al grafo completo.
+
+## El `QuestionProfile`
+
+`QuestionProfile` es la representacion estructurada del tipo de tarea detectado.
+
+Campos utiles:
+
+- `name`: nombre del perfil
+- `profile_family`: familia general
+- `expected_domains`: dominios preferidos
+- `preferred_tools`: secuencia sugerida de tools
+- `expected_date`: fecha o temporada esperada
+- `subject_name`: sujeto principal
+- `text_filter`: hint para spans, tablas o links
+- `prompt_items`: items detectados en el prompt
+- `classification_labels`: etiquetas de inclusion y exclusion
+- `ordering_key`: clave de orden
+- `scope`: subgrupo relevante
+
+Ejemplo botanico:
+
+```python
+QuestionProfile(
+    name="list_item_classification",
+    profile_family="list_item_classification",
+    prompt_items=("broccoli", "bell pepper", "sweet potatoes", "fresh basil"),
+    classification_labels={"include": "vegetable", "exclude": "fruit"},
+    preferred_tools=(
+        "search_wikipedia",
+        "fetch_wikipedia_page",
+        "web_search",
+        "fetch_url",
+        "find_text_in_url",
+    ),
+)
+```
+
+El profile influye en varias capas:
+
+- el guidance que ve el modelo
+- el ranking de candidatos
+- las reglas de retry y finalizacion
+- las skills y adapters aplicables
+
+## El `AgentState`
+
+El estado no es solo historial de chat. Es el contrato entero del workflow.
+
+Campos importantes:
+
+- `messages`: historial de mensajes y tools
+- `question`, `file_name`, `local_file_path`: contexto base
+- `iterations`, `max_iterations`: control de loops
+- `question_profile`: version serializada del `QuestionProfile`
+- `ranked_candidates`: URLs puntuadas
+- `search_history_fingerprints`: fingerprints para dedupe de busquedas
+- `structured_tool_outputs`: payloads estructurados de tools
+- `tool_trace`: log legible de llamadas a tools
+- `decision_trace`: breadcrumbs del runtime
+- `skill_trace`: skills o adapters que cerraron con exito
+- `evidence_used`: evidencia usada en la respuesta final
+- `reducer_used`: reducer o skill que cerro
+- `recovery_reason`: razon del cierre o del error
+- `final_answer`, `error`: salida final
+
+Regla util de observabilidad:
+
+- `decision_trace` registra intentos, abortos y decisiones intermedias
+- `skill_trace` se reserva para exito real
+
+## `graph/`: el runtime
+
+La carpeta `graph/` concentra el control del agente.
+
+Piezas principales:
+
+| Modulo | Responsabilidad |
+| --- | --- |
+| `workflow.py` | Construccion del `StateGraph` y metodo `solve()` |
+| `state.py` | Tipo de estado compartido |
+| `services.py` | Servicios concretos usados por workflow y finalizer |
+| `tool_policy.py` | Ejecuta tools y aplica guardrails |
+| `routing.py` | Helpers de perfilado, hints y decisiones de flujo |
+| `candidate_support.py` | Dedupe, buckets y seleccion de candidatos |
+| `evidence_support.py` | Lectura de evidencia grounding y structured answers |
+| `retry_rules.py` | Reglas para invalidar respuestas y pedir otro intento |
+| `finalization_rules.py` | Reglas finales especificas para casos sensibles |
+| `finalizer.py` | Arbitraje final de la respuesta |
+| `prompts.py` y `nudges.py` | Prompt base y sugerencias dinamicas |
+
+## `source_pipeline/`: perfilado, ranking y evidencia
+
+Esta capa decide de que clase parece ser una pregunta y que fuentes merecen atencion.
+
+Subpartes relevantes:
+
+| Modulo | Responsabilidad |
+| --- | --- |
+| `_question_detectors.py` | Detectores booleanos por familia de pregunta |
+| `_question_classifiers.py` | Registro ordenado de perfiles |
+| `_question_extractors.py` | Extraccion de fecha, autor, sujeto, etc. |
+| `candidate_ranker.py` | Ranking de resultados de busqueda y links |
+| `evidence_normalizer.py` | Convierte salida de tools en `EvidenceRecord` |
+| `_models.py` | DTOs como `QuestionProfile`, `SourceCandidate`, `EvidenceRecord` |
+
+El ranking considera:
+
+- dominio esperado
+- overlap con la pregunta
+- pistas del profile
+- metadata fuerte del candidato
+- penalizaciones por ruido comercial o paginas de bajo valor
+
+Para botanica existe ademas una rama especifica de scoring que:
+
+- prioriza Wikipedia y fuentes ag/extension cuando realmente matchean el item
+- premia paginas con senales de clasificacion botanica
+- penaliza verticales grotescos como e-commerce, payments, app stores o entertainment
+
+## `reducers/`: cierre determinista
+
+Un reducer toma evidencia estructurada y deriva una respuesta sin volver a preguntarle al modelo.
+
+Ejemplos comunes:
+
+- `metric_row`
+- `roster`
+- `text_span`
+- `award`
+- `table_compare`
+- `temporal`
+
+La regla practica es:
+
+- si el problema puede resolverse por transformacion determinista de la evidencia ya obtenida, debe vivir en un reducer o en un helper canonico reutilizable
+
+## `core/recoveries/`, `skills/` y `adapters/`
+
+Estas tres capas no hacen lo mismo.
 
 ### Core recovery
 
-Una estrategia reusable del agente general.
+Una estrategia reusable para recuperar una respuesta cuando ya hay una forma conocida de navegar desde una pista hasta la evidencia correcta.
 
 Ejemplos:
 
 - `article_to_paper`
 - `text_span`
 
-Regla práctica:
-
-- si sirve fuera de GAIA y no depende de un sitio raro, probablemente es core recovery
-
 ### Skill
 
-Una capacidad general del agente para resolver una familia de tareas.
+Una capacidad orientada a una familia de tareas.
 
 Ejemplos:
 
 - `temporal_ordered_list`
 - `set_classification`
-
-Regla práctica:
-
-- si describe "qué tipo de problema sé resolver", es una skill
+- `botanical_gaia`
 
 ### Adapter
 
-Una integración específica de fuente o ecosistema.
+Codigo que sabe hablar con una fuente concreta o una estructura de sitio concreta.
 
 Ejemplos:
 
-- `FightersAdapter`
 - `WikipediaRosterAdapter`
 - `OfficialTeamDirectoryAdapter`
+- `FightersAdapter`
 
-Regla práctica:
+Resumen rapido:
 
-- si sabe de un dominio, una estructura HTML concreta o un patrón de URL, es un adapter
+- `recovery`: como recuperar una respuesta
+- `skill`: que tipo de problema se esta resolviendo
+- `adapter`: como extraer evidencia de una fuente concreta
 
-## Mapa de módulos
+## Resolucion canonica post-tools
 
-### `graph/` - Núcleo del workflow
+Despues de cada ronda de tools, el runtime no le da automaticamente otro turno al modelo.
 
-| Módulo | Responsabilidad |
-| --- | --- |
-| `workflow.py` | `GaiaGraphAgent`, construcción del `StateGraph`, `solve()` |
-| `state.py` | `AgentState`: contrato de estado entre nodos |
-| `tool_policy.py` | Ejecuta tools y aplica guardrails |
-| `finalizer.py` | Orquesta la decisión final |
-| `services.py` | Implementa los servicios que consumen workflow y finalizer |
-| `contracts.py` | Protocolos chicos para evidence, recoveries, skills y finalización |
-| `routing.py` | Helpers de perfilado, hints y decisiones de flujo |
-| `candidate_support.py` | Dedupe de búsquedas, ranking auxiliar, selección de candidatos |
-| `evidence_support.py` | Recolección de evidencia, grounding y structured answers |
-| `finalization_rules.py` | Reglas finales específicas para casos sensibles |
-| `retry_rules.py` | Reglas para reintentos de respuestas inválidas |
-| `nudges.py` | Sugerencias que se inyectan al prompt |
+Primero pasa por `resolve_after_tools`, que usa `GraphWorkflowServices.run_resolution_pipeline()`.
 
-### `core/recoveries/` - Recuperaciones reutilizables
+El orden actual es:
 
-Acá viven estrategias que no dependen de GAIA como benchmark.
-
-| Recovery | Qué hace |
-| --- | --- |
-| `article_to_paper` | Va desde un artículo a una fuente primaria para encontrar un award number |
-| `text_span` | Busca un fragmento puntual en una página o fetch completo y lo reduce |
-
-### `skills/` - Capacidades generales
-
-| Skill | Qué resuelve |
-| --- | --- |
-| `temporal_ordered_list` | Preguntas del tipo "quién está antes o después en una lista ordenada válida para una fecha" |
-| `set_classification` | Clasificación determinística de ítems de un conjunto |
-
-### `skills/gaia/` - Especializaciones del benchmark
-
-| Skill | Qué hace |
-| --- | --- |
-| `botanical_gaia` | Clasifica ítems del prompt como vegetable o fruit en sentido botánico |
-| `competition_gaia` | Recupera evidencia de competiciones o premios para preguntas de nacionalidad/ganador |
-| `role_chain_gaia` | Resuelve preguntas de cadena entidad -> rol con dos pasos |
-
-### `adapters/` - Integración específica por fuente
-
-| Adapter | Qué encapsula |
-| --- | --- |
-| `FightersAdapter` | Heurísticas concretas de `npb.jp` y `fighters.co.jp` |
-| `WikipediaRosterAdapter` | Extracción de tablas roster desde Wikipedia |
-| `OfficialTeamDirectoryAdapter` | Lectura de directorios oficiales de jugadores |
-
-### `reducers/` - Extractores determinísticos
-
-> Acá "reducer" no significa Redux. Significa "función que reduce evidencia a una respuesta concreta".
-
-| Reducer | Qué extrae |
-| --- | --- |
-| `metric_row` | Una fila o líder en una tabla de estadísticas |
-| `roster` | Vecino anterior o siguiente en una lista ordenada |
-| `text_span` | Un atributo desde un fragmento de texto |
-| `award` | Números de subvención o beca |
-| `table_compare` | Comparaciones entre celdas |
-| `temporal` | Filtros por fecha o temporada |
-
-### `source_pipeline/` - Perfilado y ranking
-
-| Módulo | Responsabilidad |
-| --- | --- |
-| `question_classifier.py` | Devuelve `QuestionProfile` |
-| `_question_classifiers.py` | Registro ordenado de clasificadores |
-| `_question_detectors.py` | Detectores booleanos de familia de pregunta |
-| `_question_extractors.py` | Fecha, autor, sujeto, text filter |
-| `candidate_ranker.py` | Puntúa URLs y snippets |
-| `evidence_normalizer.py` | Convierte output de tools en `EvidenceRecord` |
-| `_models.py` | `QuestionProfile`, `SourceCandidate`, `EvidenceRecord` |
-
-## El `QuestionProfile`
-
-`QuestionProfile` es la representación estructurada de "qué tipo de pregunta parece ser esto".
-
-Campos importantes:
-
-- `name`: nombre del perfil
-- `profile_family`: familia más general
-- `expected_domains`: dominios preferidos
-- `expected_date`: fecha o temporada esperada
-- `subject_name`: sujeto principal
-- `text_filter`: hint para tablas, links o spans
-- `prompt_items`: ítems extraídos del prompt
-- `classification_labels`: etiquetas de inclusión/exclusión
-- `ordering_key`: clave de orden esperada
-- `scope`: subgrupo relevante, por ejemplo `pitchers`
-
-### Ejemplo 1: clasificación botánica
-
-Pregunta:
-
-```text
-Here's the list I have so far:
-broccoli, plums, sweet potatoes
-Please alphabetize the vegetables...
-```
-
-Perfil esperado:
-
-```python
-QuestionProfile(
-    name="list_item_classification",
-    profile_family="list_item_classification",
-    prompt_items=("broccoli", "plums", "sweet potatoes"),
-    classification_labels={"include": "vegetable", "exclude": "fruit"},
-)
-```
-
-### Ejemplo 2: roster temporal
-
-Pregunta:
-
-```text
-Who are the pitchers with the number before and after Taisho Tamai's number as of July 2023?
-```
-
-Perfil esperado:
-
-```python
-QuestionProfile(
-    name="temporal_ordered_list",
-    profile_family="temporal_ordered_list",
-    expected_date="as of July 2023",
-    subject_name="Taisho Tamai",
-    ordering_key="jersey_number",
-    scope="pitchers",
-)
-```
-
-## El `AgentState` y por qué importa
-
-En LangGraph, el estado es el contrato entre nodos. No es solo historial de chat.
-
-Campos importantes:
-
-- `messages`: historial para el modelo y las tools
-- `question`, `file_name`, `local_file_path`: contexto base
-- `iterations`, `max_iterations`: control de loops
-- `tool_trace`: registro legible de tools ejecutadas
-- `decision_trace`: decisiones tomadas por el sistema
-- `skill_trace`: skills o adapters usados con éxito
-- `question_profile`: perfil estructurado
-- `ranked_candidates`: URLs ordenadas por confianza
-- `search_history_fingerprints`: historial de búsquedas con fingerprint estructurado
-- `structured_tool_outputs`: outputs tipados de tools
-- `evidence_used`, `reducer_used`, `recovery_reason`: explicación del resultado
-- `final_answer`, `error`: salida final
-
-Esto convierte al estado en tres cosas a la vez:
-
-- memoria de control
-- memoria de calidad
-- memoria de auditoría
-
-En particular:
-
-- `decision_trace` puede guardar breadcrumbs de intentos fallidos o abortados
-- `skill_trace` queda reservado para resoluciones exitosas
-- en botánica, los abortos dejan marcas `skill:botanical_gaia:*` en `decision_trace`
-
-## Ciclo completo de una pregunta
-
-1. `cli.py` obtiene la `Question`
-2. `runner.py` resuelve adjuntos si existen
-3. `GaiaGraphAgent.solve()` intenta primero el `prompt_reducer`
-4. si no alcanza, arma el estado inicial y ejecuta el `StateGraph`
-5. `prepare_context` construye el prompt real
-6. `agent` decide si responde o llama tools
-7. `tools` ejecuta herramientas bajo `ToolPolicyEngine`
-8. `resolve_after_tools` intenta cerrar por la vía canónica
-9. si no alcanzó, el flujo vuelve al `agent`
-10. si el modelo responde con un no-answer, entra `retry_invalid_answer`
-11. `finalize` arbitra la respuesta final
-
-## Cómo decide `finalize`
-
-El orden actual es importante:
-
-1. `preferred structured answer`
-2. `run_resolution_pipeline()` cuando ya hay tool outputs/evidencia o se agotó el presupuesto
-3. reglas finales específicas
-4. salvage LLM desde evidencia grounding
-5. verificación final
-6. error final
-
-`run_resolution_pipeline()` es el entrypoint canónico para:
-
-1. structured answers disponibles
+1. structured answer disponible
 2. core recoveries
 3. skills
 4. adapters aplicables
 
-La idea es resolver temprano cuando la evidencia ya está, pero dejar una barrera final para no aceptar respuestas libres del modelo en tareas sensibles.
+Esto es importante porque evita este patron malo:
 
-## Cómo funciona `tool_policy`
+- el modelo ve evidencia parcial
+- improvisa una respuesta plausible
+- el sistema la acepta sin haber intentado la via determinista
 
-`tool_policy.py` no es un dispatcher tonto. Hace policy enforcement:
+## Finalizacion
 
-- bloquea Python no grounding
-- redirige fetches a candidatos mejores
-- actualiza `ranked_candidates`
-- evita loops de búsqueda
-- dispara auto-followups en algunos casos
+`finalize` es la ultima barrera de calidad.
 
-### Antes
+El orden de decision es:
 
-La deduplicación de búsquedas dependía demasiado del set de tokens.
+1. structured answer preferido
+2. pipeline canonico de resolucion si ya hay evidencia o se agoto el presupuesto
+3. reglas finales especificas
+4. salvage LLM desde evidencia grounding
+5. verificacion final
+6. error
 
-### Ahora
+Las reglas finales existen para casos donde "respuesta plausible" no alcanza.
 
-Usa un fingerprint estructurado con:
+## Retry rules
 
-- `action_family`
-- `entities`
-- `years`
-- `site`
-- `source_type`
-- `scope`
+Las retry rules deciden cuando una respuesta del modelo no puede aceptarse todavia.
 
-Eso permite distinguir entre:
+Ejemplos:
 
-- `taisho tamai npb.jp players`
-- `site:fighters.co.jp taisho tamai 2023`
-- `fighters 2023 roster pitchers taisho tamai`
+- respuestas vacias o meta
+- respuestas no grounding
+- respuestas que contradicen un cierre canonico
+- tareas sensibles donde todavia faltan items por resolver
 
-aunque compartan varias palabras.
+En botanica, la regla fuerte es:
 
-### Auto-fetch
+- si no hay cierre canonico, la respuesta no se acepta
+- si hay cierre canonico pero no coincide con `canonical_answer`, tampoco se acepta
 
-El auto-fetch ahora solo ocurre si:
+## `tool_policy.py`
 
-- existe un candidato no leído
-- el candidato tiene señal fuerte real
-- el score supera el umbral práctico
+`ToolPolicyEngine` no solo ejecuta tools. Tambien impone politica de uso.
 
-Si no hay señal fuerte, el sistema no fuerza lectura. En cambio, pide cambio de estrategia.
+Responsabilidades:
 
-## Ejemplo detallado: `botanical_gaia`
+- bloquear Python sin grounding
+- deduplicar busquedas
+- redirigir fetches a mejores candidatos cuando corresponde
+- mantener `ranked_candidates`
+- decidir auto-followups
+- frenar loops de exploracion pobres
 
-La skill botánica ya no responde con una lista parcial "más o menos aceptable".
+El dedupe de busquedas usa fingerprints estructurados, no solo tokens.
 
-Hace esto:
+Eso permite distinguir refinamientos validos entre queries parecidas pero no equivalentes.
 
-1. extrae ítems del prompt
-2. construye un estado canónico compartido con:
+## Caso detallado: `botanical_gaia`
+
+La skill botanica resuelve preguntas del tipo:
+
+```text
+fresh basil, broccoli, bell pepper, sweet potatoes
+
+Please alphabetize the vegetables and place each item in a comma separated list.
+```
+
+Su contrato es all-or-nothing:
+
+- si todos los items relevantes quedan en `include` o `exclude`, cierra
+- si alguno queda `unknown`, no entrega una lista parcial
+
+El flujo interno es:
+
+1. extrae los items del prompt
+2. arma un estado canonico compartido con:
    - `included_items`
    - `excluded_items`
    - `unresolved_items`
    - `canonical_answer`
    - `is_closed`
-3. intenta clasificar primero desde evidencia ya recolectada
-4. solo busca para los ítems `unresolved`
-5. finaliza únicamente si todos los ítems relevantes están resueltos
-6. arma la respuesta final en orden alfabético
-7. si no cierra, deja trazas como `skill:botanical_gaia:profile_match`, `items_extracted=...`, `unresolved=...` y `aborted_partial_resolution`
+3. intenta clasificar desde evidencia ya presente
+4. para cada item sin resolver, prueba primero una via corta de Wikipedia
+5. si Wikipedia no cierra rapido, cae a broad web botanico
+6. vuelve a construir el estado canonico
+7. solo finaliza si `is_closed == True`
 
-### Ejemplo
+La estrategia Wikipedia-first actual es:
 
-Si el prompt trae:
+- usar `search_wikipedia` para nombres de produce limpios
+- elegir el mejor titulo, no cualquier match superficial
+- hacer a lo sumo un `fetch_wikipedia_page`
+- salir rapido si el match es debil o ambiguo
 
-```text
-broccoli, plums, sweet potatoes
-```
-
-y la evidencia grounding dice:
-
-- broccoli -> vegetable
-- plums -> fruit
-- sweet potatoes -> vegetable
-
-la salida es:
+Ejemplo de salida correcta:
 
 ```text
-broccoli, sweet potatoes
+broccoli, fresh basil, sweet potatoes
 ```
 
-Si `plums` queda ambiguo o sin evidencia fuerte, la skill no debería responder todavía.
+y no:
 
-Eso además endurece el runtime:
+```text
+Bell pepper, Broccoli, Fresh basil, Sweet potatoes
+```
 
-- una respuesta libre del modelo no alcanza si no existe cierre canónico
-- si existe cierre canónico, la respuesta final debe coincidir con `canonical_answer`
+porque `bell pepper` queda excluido como fruta botanica.
 
-## Ejemplo detallado: `temporal_ordered_list` + adapters
+### Observabilidad botanica
 
-La idea de esta skill es separar:
+Cuando la skill falla, deja breadcrumbs en `decision_trace`, por ejemplo:
 
-- la lógica del problema
-- de la lógica del sitio
+- `skill:botanical_gaia:profile_match`
+- `skill:botanical_gaia:items_extracted=4`
+- `skill:botanical_gaia:unresolved=sweet potatoes`
+- `skill:botanical_gaia:aborted_partial_resolution`
 
-La skill general sabe resolver:
+Cuando cierra, deja:
 
-- "quién está antes"
-- "quién está después"
-- "qué vecino tiene este sujeto"
+- `skill_trace=["botanical_gaia"]`
+- `reducer_used="botanical_classification"`
 
-si ya hay evidencia temporal grounding.
+## Caso detallado: `temporal_ordered_list`
 
-Los adapters se ocupan de conseguir esa evidencia cuando la web no es uniforme.
+Esta skill separa dos problemas:
 
-### Caso Fighters
+- resolver la logica de "antes / despues / vecino"
+- conseguir evidencia temporal confiable
 
-`FightersAdapter` encapsula todo lo que sería feo dejar en el core:
+La skill general trabaja sobre evidencia ya grounding.
+Los adapters se encargan de sitios donde la estructura no es uniforme.
 
-- `npb.jp`
-- `fighters.co.jp`
-- URLs tipo `/team/player/detail/{year}_{id}.html`
-- heurísticas de predicción de IDs
+Por eso un adapter como `FightersAdapter` puede contener reglas especificas de una fuente sin contaminar el runtime general.
 
-Eso permite que el core siga siendo general aunque exista un adapter hackeado para un benchmark.
+## Donde mirar cuando algo falla
 
-## Qué queda en core y qué no
+Si una respuesta salio mal, el orden de inspeccion util suele ser:
 
-### Sí debería vivir en core
+1. `question_profile`
+   - la pregunta fue perfilada correctamente
+2. `tool_trace`
+   - el agente uso las tools adecuadas
+3. `ranked_candidates`
+   - los candidatos utiles subieron y el ruido bajo
+4. `decision_trace`
+   - hubo abortos, retries o breadcrumbs de skill
+5. `evidence_used`
+   - la respuesta final se apoyo en evidencia real
+6. `reducer_used` y `skill_trace`
+   - hubo cierre canonico real o solo salvage
 
-- recoveries reutilizables
-- validación de grounding
-- reducers
-- ranking general
-- tool policy general
+Preguntas concretas que sirven:
 
-### No debería vivir en core
+- el problema fue de deteccion del profile
+- de seleccion de fuentes
+- de fetch
+- de normalizacion de evidencia
+- de reducer
+- de policy
+- o de finalizacion
 
-- patrones de URL de un club específico
-- heurísticas de un benchmark concreto
-- wording ultra acoplado a una sola familia de prompts
+## Terminos clave
 
-## Términos clave
-
-### Hook
-
-Función que se llama en momentos importantes del flujo, por ejemplo antes y después de cada tool.
-
-### DTO
-
-Objeto simple que transporta datos.
-
-En este repo:
-
-- `QuestionProfile`
-- `SourceCandidate`
-- `EvidenceRecord`
-
-### Grounding
-
-Significa que una respuesta está apoyada en evidencia real ya recolectada, no en memoria o intuición del modelo.
-
-### Reducer
-
-Función determinística que toma evidencia estructurada y deriva una respuesta sin llamar al modelo.
-
-### Skill
-
-Capacidad general orientada a un tipo de tarea.
-
-Ejemplo:
-
-- `temporal_ordered_list`
-
-### Adapter
-
-Integración específica con una fuente o ecosistema.
-
-Ejemplo:
-
-- `FightersAdapter`
-
-### Core recovery
-
-Recuperación reusable del agente general, no acoplada a una sola fuente rara.
-
-### Fingerprint de búsqueda
-
-Representación estructurada de una búsqueda para detectar duplicados reales sin bloquear refinamientos válidos.
-
-### Candidate ranking
-
-Proceso de puntuar URLs candidatas según:
-
-- dominio esperado
-- fecha
-- autor
-- hints del tipo de tarea
-- penalizaciones por ruido o fuentes débiles
-
-## Glosario
-
-| Término | Significado en este repo |
+| Termino | Significado en este repo |
 | --- | --- |
-| `adapter` | Lógica específica de fuente o ecosistema |
-| `award number` | Número de subvención o beca |
-| `backoff` | Reintentos con espera creciente |
-| `bucket` | Grupo de candidatos según calidad y estado de lectura |
-| `candidate` | URL que podría contener la respuesta |
-| `core recovery` | Recuperación reusable del agente general |
-| `DTO` | Objeto simple de datos |
-| `evidence` | Texto, tabla o dato obtenido de una fuente real |
-| `fallback` | Término histórico de etapas anteriores; ya no describe la arquitectura vigente |
-| `fingerprint` | Firma estructurada de búsqueda |
-| `grounded` | Apoyado en evidencia real |
-| `guardrail` | Restricción que evita acciones malas o inútiles |
-| `profile` | Clasificación estructurada de una pregunta |
-| `prompt reducer` | Camino rápido para resolver desde el prompt sin tools |
-| `reducer` | Extractor determinístico de respuesta |
-| `registry` | Lista de componentes del mismo tipo que se recorre dinámicamente |
-| `skill` | Capacidad general orientada a una familia de tareas |
-| `StateGraph` | Grafo de LangGraph con nodos y aristas condicionales |
-| `tool trace` | Registro legible de tools ejecutadas |
-| `workflow` | Secuencia de pasos que sigue el agente |
+| `QuestionProfile` | Clasificacion estructurada de la pregunta |
+| `SourceCandidate` | URL candidata con score y razones |
+| `EvidenceRecord` | Evidencia normalizada desde una tool |
+| `grounding` | Respuesta apoyada en evidencia real ya recolectada |
+| `reducer` | Funcion determinista que reduce evidencia a una respuesta |
+| `skill` | Capacidad orientada a una familia de tareas |
+| `adapter` | Integracion especifica por fuente o ecosistema |
+| `core recovery` | Estrategia reusable para recuperar respuesta |
+| `tool_trace` | Registro legible de tools ejecutadas |
+| `decision_trace` | Breadcrumbs del runtime |
+| `canonical answer` | Respuesta producida por la via determinista compartida |
+| `search fingerprint` | Firma estructurada para dedupe de busquedas |
 
-## Idea reutilizable
+## Idea reusable
 
-Aunque este repo está hecho para GAIA, la plantilla conceptual sirve para otros agentes:
+Aunque este repo esta orientado a GAIA, la plantilla de arquitectura es general:
 
-- `prepare_context` para clasificar y enriquecer el prompt
-- `agent` para planear
-- `tools` para ejecutar con guardrails
-- `source_pipeline` para perfilar preguntas y rankear fuentes
-- `reducers` para extraer respuestas determinísticas
-- `core recoveries` para rescates reutilizables
-- `skills` para capacidades generales
-- `adapters` para encapsular hacks inevitables de fuente
-- `finalize` para arbitrar la respuesta final
+- perfilar primero
+- usar tools con policy
+- normalizar evidencia
+- intentar cierre determinista temprano
+- dejar al modelo como planificador y ensamblador, no como unica fuente de verdad
 
-Esa es la parte realmente reusable de esta arquitectura.
+Esa es la parte mas reusable del proyecto.

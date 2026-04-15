@@ -187,7 +187,13 @@ def build_profile_guidance_block(*, question: str, profile: QuestionProfile) -> 
             "Search snippets alone are not sufficient. Ground classifications in fetched page text before finalizing."
         )
         hints.append(
-            "Use web_search to find relevant sources, then fetch_url or find_text_in_url to verify ambiguous items before assembling the final list."
+            "For clean produce names, try search_wikipedia and fetch_wikipedia_page first."
+        )
+        hints.append(
+            "If the Wikipedia title match looks weak or ambiguous, switch quickly to broad web botanical search instead of looping on Wikipedia."
+        )
+        hints.append(
+            "Use broad web search only after that quick Wikipedia attempt, then fetch_url or find_text_in_url to verify ambiguous items before assembling the final list."
         )
     if profile.name == "text_span_lookup":
         hints.append(

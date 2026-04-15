@@ -62,6 +62,11 @@ CANDIDATE_SCORES = {
     "stats_page_penalty": -42,
     "current_roster_penalty": -52,
     "off_scope_roster_penalty": -60,
+    # botanical classification
+    "botanical_source_hint": 26,
+    "botanical_page_match": 24,
+    "botanical_classifier_hint": 12,
+    "botanical_offtopic_vertical_penalty": -90,
 }
 
 
@@ -238,6 +243,8 @@ def _apply_profile_specific_rules(
         score, reasons = _score_text_span(score, reasons, context=context)
     if context.profile.name == "entity_role_chain":
         score, reasons = _score_entity_role_chain(score, reasons, context=context)
+    if _is_botanical_profile(context.profile):
+        score, reasons = _score_botanical_classification(score, reasons, context=context)
     if context.profile.name in {"table_lookup", "temporal_ordered_list", "wikipedia_lookup"}:
         if any(token in context.candidate.title.lower() for token in ("roster", "statistics", "olympics")):
             score += _sc("tableish_title")
@@ -370,6 +377,40 @@ def _score_metric_row(
     return score, reasons
 
 
+def _score_botanical_classification(
+    score: int,
+    reasons: list[str],
+    *,
+    context: CandidateScoringContext,
+) -> tuple[int, list[str]]:
+    lowered = context.haystack.lower()
+    if _is_botanical_source(context):
+        score += _sc("botanical_source_hint")
+        reasons.append("botanical_source_hint")
+    if _candidate_matches_any_botanical_prompt_item(context):
+        score += _sc("botanical_page_match")
+        reasons.append("botanical_page_match")
+    if any(
+        phrase in lowered
+        for phrase in (
+            "botanical",
+            "fruit or vegetable",
+            "vegetable or fruit",
+            "is a fruit",
+            "is a vegetable",
+            "classified as a fruit",
+            "classified as a vegetable",
+            "botany",
+        )
+    ):
+        score += _sc("botanical_classifier_hint")
+        reasons.append("botanical_classifier_hint")
+    if _is_botanical_offtopic_vertical(context):
+        score += _sc("botanical_offtopic_vertical_penalty")
+        reasons.append("botanical_offtopic_vertical_penalty")
+    return score, reasons
+
+
 def _score_roster_neighbor(
     score: int,
     reasons: list[str],
@@ -457,6 +498,85 @@ def _is_low_signal_domain(domain: str) -> bool:
             "tiktok.com",
         )
     )
+
+
+def _is_botanical_profile(profile: QuestionProfile) -> bool:
+    labels = profile.classification_labels or {}
+    return (
+        profile.name == "list_item_classification"
+        and labels.get("include") == "vegetable"
+        and labels.get("exclude") == "fruit"
+    )
+
+
+def _is_botanical_source(context: CandidateScoringContext) -> bool:
+    lowered = context.haystack.lower()
+    if context.domain.endswith("wikipedia.org"):
+        return True
+    if context.domain.endswith(".edu") or context.domain.endswith(".gov"):
+        return any(
+            token in lowered
+            for token in (
+                "agriculture",
+                "agricultural",
+                "horticulture",
+                "botanical",
+                "botany",
+                "extension",
+                "food",
+                "environment",
+            )
+        )
+    return False
+
+
+def _candidate_matches_any_botanical_prompt_item(context: CandidateScoringContext) -> bool:
+    lowered = context.haystack.lower()
+    for item in context.profile.prompt_items or ():
+        token_groups = _botanical_item_token_groups(item)
+        if token_groups and all(
+            any(variant in lowered for variant in variants)
+            for variants in token_groups
+        ):
+            return True
+    return False
+
+
+def _is_botanical_offtopic_vertical(context: CandidateScoringContext) -> bool:
+    lowered = f"{context.domain}\n{context.haystack}".lower()
+    return any(
+        fragment in lowered
+        for fragment in (
+            "amazon.com",
+            "paypal.com",
+            "play.google.com",
+            "apps.apple.com",
+            "imdb.com",
+            "ranker.com",
+            "mobile01.com",
+            "tmz.com",
+            "people.com",
+            "eonline.com",
+            "usmagazine.com",
+        )
+    )
+
+
+def _botanical_item_token_groups(item: str) -> list[set[str]]:
+    ignored = {"fresh", "whole", "raw", "ripe", "dried"}
+    groups: list[set[str]] = []
+    for token in re.findall(r"[a-z0-9]+", item.lower()):
+        if token in ignored:
+            continue
+        variants = {token}
+        if token.endswith("ies") and len(token) > 4:
+            variants.add(token[:-3] + "y")
+        if token.endswith("oes") and len(token) > 4:
+            variants.add(token[:-2])
+        if token.endswith("s") and len(token) > 4:
+            variants.add(token[:-1])
+        groups.append(variants)
+    return groups
 
 
 def _has_strong_relevance_signal(context: CandidateScoringContext) -> bool:

@@ -44,6 +44,9 @@ _STRONG_CANDIDATE_REASONS = {
     "roster_page_hint",
     "dated_roster_hint",
     "official_yearbook_hint",
+    "botanical_source_hint",
+    "botanical_page_match",
+    "botanical_classifier_hint",
 }
 
 
@@ -230,6 +233,8 @@ def is_low_quality_ranked_candidate(candidate: SourceCandidate) -> bool:
         return True
     strong_signal = candidate_has_strong_signal(candidate)
     reasons = set(candidate.reasons)
+    if "botanical_offtopic_vertical_penalty" in reasons and not strong_signal:
+        return True
     if "commercial_noise_penalty" in reasons and not strong_signal:
         return True
     if (
