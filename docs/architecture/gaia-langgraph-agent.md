@@ -246,7 +246,7 @@ Campos importantes:
 - `iterations`, `max_iterations`: control de loops
 - `tool_trace`: registro legible de tools ejecutadas
 - `decision_trace`: decisiones tomadas por el sistema
-- `skill_trace`: skills o adapters usados
+- `skill_trace`: skills o adapters usados con éxito
 - `question_profile`: perfil estructurado
 - `ranked_candidates`: URLs ordenadas por confianza
 - `search_history_fingerprints`: historial de búsquedas con fingerprint estructurado
@@ -260,6 +260,12 @@ Esto convierte al estado en tres cosas a la vez:
 - memoria de calidad
 - memoria de auditoría
 
+En particular:
+
+- `decision_trace` puede guardar breadcrumbs de intentos fallidos o abortados
+- `skill_trace` queda reservado para resoluciones exitosas
+- en botánica, los abortos dejan marcas `skill:botanical_gaia:*` en `decision_trace`
+
 ## Ciclo completo de una pregunta
 
 1. `cli.py` obtiene la `Question`
@@ -269,24 +275,30 @@ Esto convierte al estado en tres cosas a la vez:
 5. `prepare_context` construye el prompt real
 6. `agent` decide si responde o llama tools
 7. `tools` ejecuta herramientas bajo `ToolPolicyEngine`
-8. si aparece una respuesta estructurada válida, puede cortarse antes
-9. si el modelo responde con un no-answer, entra `retry_invalid_answer`
-10. `finalize` arbitra la respuesta final
+8. `resolve_after_tools` intenta cerrar por la vía canónica
+9. si no alcanzó, el flujo vuelve al `agent`
+10. si el modelo responde con un no-answer, entra `retry_invalid_answer`
+11. `finalize` arbitra la respuesta final
 
 ## Cómo decide `finalize`
 
 El orden actual es importante:
 
 1. `preferred structured answer`
-2. `core recovery from evidence`
-3. `skill execution`
-4. `adapter-assisted recovery`
-5. reglas finales específicas
-6. salvage LLM desde evidencia grounding
-7. verificación final
-8. error final
+2. `run_resolution_pipeline()` cuando ya hay tool outputs/evidencia o se agotó el presupuesto
+3. reglas finales específicas
+4. salvage LLM desde evidencia grounding
+5. verificación final
+6. error final
 
-La idea es que lo benchmark-specific actúe tarde, no temprano.
+`run_resolution_pipeline()` es el entrypoint canónico para:
+
+1. structured answers disponibles
+2. core recoveries
+3. skills
+4. adapters aplicables
+
+La idea es resolver temprano cuando la evidencia ya está, pero dejar una barrera final para no aceptar respuestas libres del modelo en tareas sensibles.
 
 ## Cómo funciona `tool_policy`
 
@@ -338,15 +350,17 @@ La skill botánica ya no responde con una lista parcial "más o menos aceptable"
 Hace esto:
 
 1. extrae ítems del prompt
-2. crea un estado por ítem:
-   - `include`
-   - `exclude`
-   - `unknown`
-   - `discarded`
+2. construye un estado canónico compartido con:
+   - `included_items`
+   - `excluded_items`
+   - `unresolved_items`
+   - `canonical_answer`
+   - `is_closed`
 3. intenta clasificar primero desde evidencia ya recolectada
-4. solo busca para los ítems `unknown`
+4. solo busca para los ítems `unresolved`
 5. finaliza únicamente si todos los ítems relevantes están resueltos
 6. arma la respuesta final en orden alfabético
+7. si no cierra, deja trazas como `skill:botanical_gaia:profile_match`, `items_extracted=...`, `unresolved=...` y `aborted_partial_resolution`
 
 ### Ejemplo
 
@@ -369,6 +383,11 @@ broccoli, sweet potatoes
 ```
 
 Si `plums` queda ambiguo o sin evidencia fuerte, la skill no debería responder todavía.
+
+Eso además endurece el runtime:
+
+- una respuesta libre del modelo no alcanza si no existe cierre canónico
+- si existe cierre canónico, la respuesta final debe coincidir con `canonical_answer`
 
 ## Ejemplo detallado: `temporal_ordered_list` + adapters
 

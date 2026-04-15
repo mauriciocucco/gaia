@@ -56,9 +56,14 @@ class BotanicalGaiaSkill:
                 "tool_trace": context.tool_trace,
             }
 
-        has_existing_leads = bool(state.get("messages")) or bool(state.get("ranked_candidates"))
+        existing_records = _botanical_existing_records(state)
+        has_existing_leads = (
+            any(isinstance(message, ToolMessage) for message in state.get("messages", []))
+            or bool(state.get("ranked_candidates"))
+            or bool(existing_records)
+        )
         if not has_existing_leads and len(items) > 8:
-            resolution = build_botanical_canonical_state(items, _botanical_existing_records(state))
+            resolution = build_botanical_canonical_state(items, existing_records)
             if resolution.unresolved_items:
                 unresolved = "|".join(resolution.unresolved_items)
                 context.decision_trace.append(f"skill:botanical_gaia:unresolved={unresolved}")
@@ -68,7 +73,7 @@ class BotanicalGaiaSkill:
                 "tool_trace": context.tool_trace,
             }
 
-        all_records = _botanical_existing_records(state)
+        all_records = existing_records
         resolution = build_botanical_canonical_state(items, all_records)
         for item in resolution.unresolved_items:
             item_budget = RecoveryAttemptBudget(remaining_searches=2, remaining_fetches=2)

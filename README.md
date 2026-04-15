@@ -105,6 +105,7 @@ bash scripts/package_clean.sh
 - `prepare_context`
 - `agent`
 - `tools`
+- `resolve_after_tools`
 - `retry_invalid_answer`
 - `finalize`
 
@@ -132,19 +133,28 @@ Una regla práctica:
 - si algo sabe de un sitio o un patrón de URLs concreto, es `adapter`
 - si algo es recuperación reusable del core, es `core recovery`
 
-### 3. Finalización
+### 3. Resolución y Finalización
 
-El `finalizer` sigue este orden:
+Después de `tools`, el workflow pasa por `resolve_after_tools`.
+
+Ese nodo ejecuta `run_resolution_pipeline()` en este orden:
+
+1. respuesta estructurada disponible
+2. core recoveries
+3. skills
+4. adapters aplicables
+
+Si esa vía canónica cierra, el flujo finaliza ahí mismo. Si no, vuelve al `agent`.
+
+El `finalizer` conserva una segunda barrera:
 
 1. respuesta estructurada preferida
-2. core recovery desde evidencia
-3. skill general
-4. adapter-assisted recovery
-5. reglas finales específicas
-6. salvage LLM desde evidencia grounding
-7. verificación final
+2. `run_resolution_pipeline()` cuando ya hay evidencia/tool outputs o se agotó el presupuesto
+3. reglas finales específicas
+4. salvage LLM desde evidencia grounding
+5. verificación final
 
-Eso evita que una lógica benchmark-specific tome el control demasiado pronto.
+Eso permite resolver temprano cuando ya hay evidencia suficiente y evita que respuestas libres del modelo se cuelen al final en tareas sensibles.
 
 ### 4. Política de búsqueda
 
@@ -181,6 +191,7 @@ src/hf_gaia_agent/
 │       ├── text_span.py
 │       └── utils.py
 ├── cli.py
+├── botanical_classification.py # Estado canónico y scoring botánico compartido
 ├── evidence_solver.py       # Orquesta reducers determinísticos
 ├── graph/                   # Workflow LangGraph y políticas del agente
 │   ├── workflow.py
@@ -206,6 +217,7 @@ src/hf_gaia_agent/
 │       ├── competition_gaia.py
 │       └── role_chain_gaia.py
 ├── source_pipeline/         # Perfilado de preguntas y ranking de fuentes
+│   ├── _prompt_items.py     # Extracción compartida de listas autocontenidas
 └── tools/                   # Tools del agente
 ```
 
@@ -224,10 +236,11 @@ Please alphabetize the vegetables...
 Flujo:
 
 1. `source_pipeline` clasifica la pregunta como `list_item_classification`
-2. `botanical_gaia` extrae los ítems del prompt
-3. cada ítem queda en estado `include | exclude | unknown | discarded`
-4. si un ítem sigue `unknown`, busca evidencia
-5. solo responde cuando todos los ítems relevantes están resueltos
+2. `_prompt_items` extrae los ítems del prompt, incluso en variantes cortas autocontenidas
+3. `botanical_classification` arma un estado canónico con ítems `include | exclude | unresolved`
+4. `botanical_gaia` solo busca para los ítems `unresolved`
+5. el sistema solo acepta la respuesta si el cierre canónico quedó completo y coincide con la salida final
+6. si la skill aborta, deja breadcrumbs `skill:botanical_gaia:*` en `decision_trace`
 
 ### Temporal ordered list
 
@@ -240,9 +253,10 @@ Who are the pitchers with the number before and after Taisho Tamai's number as o
 Flujo:
 
 1. `source_pipeline` clasifica la pregunta como `temporal_ordered_list`
-2. el skill intenta resolver con evidencia temporal ya grounding
-3. si no alcanza, los adapters aportan evidencia adicional
-4. el reducer `roster_neighbor` arma la respuesta final
+2. `resolve_after_tools` intenta cerrar por la vía canónica antes de devolverle otro turno al modelo
+3. el skill intenta resolver con evidencia temporal ya grounding
+4. si no alcanza, los adapters aportan evidencia adicional dentro del mismo pipeline de resolución
+5. el reducer `roster_neighbor` arma la respuesta final
 
 ## Notas técnicas
 

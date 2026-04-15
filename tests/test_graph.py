@@ -1872,6 +1872,58 @@ def test_graph_botanical_failure_records_decision_trace_for_unresolved_items(
     )
 
 
+def test_graph_botanical_skill_skips_large_list_without_real_leads() -> None:
+    services = _workflow_services()
+    state = {
+        "question": (
+            "milk, eggs, flour, whole bean coffee, Oreos, sweet potatoes, fresh basil, plums, "
+            "green beans, rice, corn, bell pepper, broccoli, celery, zucchini, lettuce\n\n"
+            "Please alphabetize the vegetables and place each item in a comma separated list."
+        ),
+        "messages": [
+            SystemMessage(content="system"),
+            HumanMessage(content="question"),
+            AIMessage(content="[ANSWER]broccoli, celery, lettuce, sweet potatoes[/ANSWER]"),
+        ],
+        "ranked_candidates": [],
+        "decision_trace": [],
+        "tool_trace": [],
+        "question_profile": {
+            "name": "list_item_classification",
+            "profile_family": "list_item_classification",
+            "prompt_items": (
+                "milk",
+                "eggs",
+                "flour",
+                "whole bean coffee",
+                "Oreos",
+                "sweet potatoes",
+                "fresh basil",
+                "plums",
+                "green beans",
+                "rice",
+                "corn",
+                "bell pepper",
+                "broccoli",
+                "celery",
+                "zucchini",
+                "lettuce",
+            ),
+            "classification_labels": {"include": "vegetable", "exclude": "fruit"},
+        },
+    }
+
+    result = services.run_skill("botanical_gaia", state)
+
+    assert result is not None
+    assert result.get("final_answer") is None
+    assert result.get("tool_trace") == []
+    assert any(
+        entry == "skill:botanical_gaia:aborted_partial_resolution"
+        for entry in result["decision_trace"]
+    )
+
+
 def test_graph_marks_audio_access_meta_answer_invalid() -> None:
     class FakeModelWithMissingAudioMeta:
         def bind_tools(self, _tools):
