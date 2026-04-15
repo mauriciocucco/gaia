@@ -82,7 +82,7 @@ def test_profile_question_prefers_wikipedia_tools_for_botanical_classification()
     )
 
     assert profile.name == "list_item_classification"
-    assert profile.expected_domains == ("wikipedia.org",)
+    assert profile.expected_domains == ("wikipedia.org", ".edu", ".gov")
     assert profile.preferred_tools[:2] == ("search_wikipedia", "fetch_wikipedia_page")
 
 
@@ -217,6 +217,31 @@ def test_score_candidates_does_not_treat_irrelevant_edu_as_automatically_good_fo
 
     assert scored[0].url == "https://en.wikipedia.org/wiki/Sweet_potato"
     assert "botanical_source_hint" not in scored[1].reasons
+
+
+def test_score_candidates_allows_strong_botanical_edu_to_beat_weaker_wikipedia_match() -> None:
+    question = (
+        "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Sweet potato crop guide\n"
+        "URL: https://extension.example.edu/sweet-potato\n"
+        "Snippet: Sweet potato is an edible root vegetable used in horticulture and agriculture.\n\n"
+        "2. Potato - Wikipedia\n"
+        "URL: https://en.wikipedia.org/wiki/Potato\n"
+        "Snippet: Potato is a starchy tuber.\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://extension.example.edu/sweet-potato"
+    assert "expected_domain" in scored[0].reasons
+    assert "botanical_source_hint" in scored[0].reasons
+    assert "botanical_page_match" in scored[0].reasons
+    assert "expected_domain" in scored[1].reasons
 
 
 def test_score_candidates_prefers_linked_primary_source_for_article_to_paper() -> None:

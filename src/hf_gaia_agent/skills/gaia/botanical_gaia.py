@@ -204,7 +204,11 @@ def _botanical_existing_records(state) -> list[EvidenceRecord]:
         if not isinstance(message, ToolMessage):
             continue
         tool_name = (getattr(message, "name", "") or "").strip()
-        if tool_name not in {"fetch_url", "find_text_in_url"}:
+        if tool_name not in {
+            "fetch_url",
+            "find_text_in_url",
+            "fetch_wikipedia_page",
+        }:
             continue
         for record in evidence_records_from_tool_output(tool_name, str(message.content or "")):
             if record.source_url and record.source_url in seen_urls:

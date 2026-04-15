@@ -21,6 +21,7 @@ from hf_gaia_agent.graph.evidence_support import (
 from hf_gaia_agent.graph.services import GraphWorkflowServices
 from hf_gaia_agent.hooks import BaseAgentHook
 from hf_gaia_agent.skills import build_skills
+from hf_gaia_agent.skills.gaia.botanical_gaia import BotanicalGaiaSkill
 from hf_gaia_agent.skills.gaia.role_chain_gaia import RoleChainGaiaSkill
 
 
@@ -1466,6 +1467,55 @@ def test_graph_botanical_recovery_prefers_wikipedia_first_for_clean_item(monkeyp
         "search_wikipedia:sweet potatoes",
         "fetch_wikipedia_page:Sweet potato",
     ]
+
+
+def test_botanical_skill_reuses_existing_fetch_wikipedia_page_records_without_refetch() -> None:
+    @tool
+    def search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Existing Wikipedia evidence should prevent a new Wikipedia search."""
+        raise AssertionError(f"Unexpected Wikipedia search for query={query!r}, max_results={max_results!r}")
+
+    @tool
+    def fetch_wikipedia_page(title: str) -> str:
+        """Existing Wikipedia evidence should prevent a second Wikipedia fetch."""
+        raise AssertionError(f"Unexpected Wikipedia fetch for title={title!r}")
+
+    skill = BotanicalGaiaSkill(
+        {
+            "search_wikipedia": search_wikipedia,
+            "fetch_wikipedia_page": fetch_wikipedia_page,
+        }
+    )
+    state = {
+        "question": (
+            "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+            "to categorizing things. Here's the list I have so far:\n\n"
+            "sweet potatoes\n\n"
+            "Please alphabetize the vegetables and place each item in a comma separated list."
+        ),
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: Sweet potato\n"
+                    "URL: https://en.wikipedia.org/wiki/Sweet_potato\n\n"
+                    "Sweet potato is an edible root vegetable."
+                ),
+                tool_call_id="call-1",
+                name="fetch_wikipedia_page",
+            )
+        ],
+        "tool_trace": [],
+        "decision_trace": [],
+        "ranked_candidates": [],
+    }
+
+    result = skill.run(state)
+
+    assert result is not None
+    assert result["final_answer"] == "sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+    assert result["skill_used"] == "botanical_gaia"
+    assert "skill:botanical_gaia:resolved" in result["decision_trace"]
 
 
 def test_graph_botanical_recovery_recovers_prompt_item_omitted_by_model(monkeypatch) -> None:

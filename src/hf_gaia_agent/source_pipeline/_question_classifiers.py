@@ -259,7 +259,9 @@ QUESTION_CLASSIFIERS: tuple[QuestionClassifier, ...] = (
             name="list_item_classification",
             profile_family="list_item_classification",
             target_urls=_generic_urls,
-            expected_domains_resolver=_fixed_domains(("wikipedia.org",)),
+            expected_domains_resolver=_fixed_domains(
+                ("wikipedia.org", ".edu", ".gov")
+            ),
             preferred_tools=(
                 "search_wikipedia",
                 "fetch_wikipedia_page",
