@@ -95,6 +95,14 @@ class GraphWorkflowServices:
         if not structured_answer:
             return None
         profile = question_profile_from_state(state)
+        labels = profile.classification_labels or {}
+        if (
+            profile.name == "list_item_classification"
+            and labels.get("include") == "vegetable"
+            and labels.get("exclude") == "fruit"
+            and reducer_used != "botanical_classification"
+        ):
+            return None
         if preferred_only and not should_prefer_structured_answer(
             profile=profile,
             reducer_used=reducer_used,
@@ -192,13 +200,22 @@ class GraphWorkflowServices:
 
     def run_skills(self, state: AgentState) -> dict[str, Any] | None:
         profile = question_profile_from_state(state)
+        current_state = state
+        trace_updates: dict[str, Any] | None = None
         for skill in self._skills:
             if not skill.applies(state, profile):
                 continue
-            result = skill.run(state)
-            if result:
+            result = skill.run(current_state)
+            if not result:
+                continue
+            if result.get("final_answer") is not None:
                 return result
-        return None
+            current_state = self._state_with_trace_updates(current_state, result)
+            trace_updates = {
+                "decision_trace": list(current_state.get("decision_trace") or []),
+                "tool_trace": list(current_state.get("tool_trace") or []),
+            }
+        return trace_updates
 
     def run_skill(self, skill_name: str, state: AgentState) -> dict[str, Any] | None:
         profile = question_profile_from_state(state)
@@ -236,7 +253,28 @@ class GraphWorkflowServices:
         return None
 
     def run_resolution_pipeline(self, state: AgentState) -> dict[str, Any] | None:
-        return self.run_core_recoveries(state) or self.run_skills(state)
+        structured_result = self.structured_answer_result(state)
+        if structured_result:
+            return structured_result
+
+        current_state = state
+        for resolver in (
+            self.run_core_recoveries,
+            self.run_skills,
+            self._run_applicable_adapters,
+        ):
+            result = resolver(current_state)
+            if not result:
+                continue
+            if result.get("final_answer") is not None:
+                return result
+            current_state = self._state_with_trace_updates(current_state, result)
+        if current_state is state:
+            return None
+        return {
+            "decision_trace": list(current_state.get("decision_trace") or []),
+            "tool_trace": list(current_state.get("tool_trace") or []),
+        }
 
     def run_targeted_resolution(
         self, resolution_name: str, state: AgentState
@@ -254,6 +292,41 @@ class GraphWorkflowServices:
             if recovery.name != resolution_name or not recovery.applies(state, profile):
                 continue
             return recovery.run(state)
+        return None
+
+    @staticmethod
+    def _state_with_trace_updates(
+        state: AgentState, updates: dict[str, Any]
+    ) -> AgentState:
+        merged = dict(state)
+        for key in ("decision_trace", "tool_trace"):
+            if key in updates:
+                merged[key] = list(updates.get(key) or [])
+        return merged  # type: ignore[return-value]
+
+    def _run_applicable_adapters(self, state: AgentState) -> dict[str, Any] | None:
+        profile = question_profile_from_state(state)
+        ranked_candidates = ranked_candidates_from_state(state)
+        for adapter in self._source_adapters:
+            if not adapter.applies(profile, ranked_candidates):
+                continue
+            records = adapter.fetch_grounded_records(state)
+            if not records:
+                continue
+            answer, reducer = solve_answer_from_evidence_records(state["question"], records)
+            if not answer:
+                continue
+            return {
+                "final_answer": answer,
+                "error": None,
+                "reducer_used": reducer,
+                "skill_used": adapter.skill_name,
+                "skill_trace": [adapter.skill_name, adapter.name],
+                "evidence_used": serialize_evidence(records[-6:]),
+                "recovery_reason": None,
+                "tool_trace": list(getattr(adapter, "last_tool_trace", []) or []),
+                "decision_trace": list(getattr(adapter, "last_decision_trace", []) or []),
+            }
         return None
 
     def ranked_candidates_from_state(self, state: AgentState) -> list[SourceCandidate]:

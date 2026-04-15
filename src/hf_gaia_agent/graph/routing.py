@@ -7,6 +7,7 @@ import unicodedata
 from typing import Any
 
 from ..source_pipeline import QuestionProfile, profile_question
+from ..source_pipeline._prompt_items import extract_prompt_list_items
 from ..source_pipeline._utils import (
     extract_urls,
     is_metric_row_lookup_question,
@@ -297,25 +298,6 @@ def _parse_markdown_operation_table(question: str) -> dict[tuple[str, str], str]
         for column_label, value in zip(column_labels, cells[1:], strict=False):
             table[(row_label, column_label)] = value
     return table
-
-
-def extract_prompt_list_items(question: str) -> list[str]:
-    patterns = (
-        r"here's the list i have so far:\s*(?P<body>.+?)(?:\n\s*\n|$)",
-        r"comma separated list[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
-        r"list of items[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, question, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            continue
-        body = re.sub(r"\s+", " ", match.group("body")).strip()
-        items = [item.strip(" .") for item in body.split(",") if item.strip()]
-        if items:
-            return items
-    return []
-
-
 def normalize_botanical_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value)
     normalized = normalized.encode("ascii", "ignore").decode("ascii")

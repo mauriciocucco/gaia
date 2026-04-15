@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ._prompt_items import extract_prompt_list_items
+
 
 def is_article_to_paper_question(lowered_question: str) -> bool:
     article_cues = ("article", "news story", "write-up")
@@ -59,12 +61,16 @@ def is_botanical_classification_question(lowered_question: str) -> bool:
     if "vegetable" not in lowered_question and "fruit" not in lowered_question:
         return False
     botanical_cues = ("professor of botany", "botanical", "botany", "stickler")
-    listing_cues = (
+    action_cues = (
         "here's the list i have so far",
         "comma separated list",
         "fruits and vegetables",
         "vegetables from this list",
         "which of these are vegetables",
+        "alphabetize the vegetables",
+        "just the vegetables",
+        "from my list",
+        "from this list",
     )
     classification_cues = (
         "classify",
@@ -73,9 +79,12 @@ def is_botanical_classification_question(lowered_question: str) -> bool:
         "which are",
         "which of these",
     )
-    return any(cue in lowered_question for cue in listing_cues) and (
-        any(cue in lowered_question for cue in botanical_cues)
-        or any(cue in lowered_question for cue in classification_cues)
+    has_action_signal = any(cue in lowered_question for cue in action_cues)
+    has_botanical_signal = any(cue in lowered_question for cue in botanical_cues)
+    has_classification_signal = any(cue in lowered_question for cue in classification_cues)
+    has_prompt_list = bool(extract_prompt_list_items(lowered_question))
+    return has_action_signal and (
+        has_botanical_signal or has_prompt_list or has_classification_signal
     )
 
 

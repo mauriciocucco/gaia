@@ -1311,7 +1311,7 @@ def test_graph_retries_botanical_classification_until_it_has_grounding(monkeypat
             "Title: Botanical food classification\n"
             "URL: https://example.com/botany\n\n"
             "Fresh basil, broccoli, celery, lettuce, and sweet potatoes are vegetables in the botanical sense. "
-            "Bell peppers, corn, green beans, peanuts, plums, and zucchini are botanical fruits."
+            "Acorns, bell peppers, corn, green beans, peanuts, plums, and zucchini are botanical fruits."
         )
 
     monkeypatch.setattr(graph_module, "build_tools", lambda: [fetch_url])
@@ -1650,6 +1650,68 @@ def test_graph_botanical_recovery_recognizes_explicit_vegetable_title_metadata(
     assert result["reducer_used"] == "botanical_classification"
 
 
+def test_graph_resolve_after_tools_finalizes_botanical_answer_without_second_model_turn(
+    monkeypatch,
+) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Keep the botanical skill fully wired even if the model fetches directly."""
+        del query, max_results
+        return ""
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return grounded botanical classification text."""
+        assert url == "https://example.com/botany"
+        return (
+            "Title: Botanical food classification\n"
+            "URL: https://example.com/botany\n\n"
+            "Fresh basil, broccoli, celery, lettuce, and sweet potatoes are vegetables in the botanical sense. "
+            "Bell peppers, corn, green beans, plums, and zucchini are botanical fruits."
+        )
+
+    class _SingleToolCallModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def bind_tools(self, _tools):
+            return self
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("Model should not get a second turn after canonical post-tools resolution.")
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "id": "call-botany-fetch-once",
+                        "name": "fetch_url",
+                        "args": {"url": "https://example.com/botany"},
+                    }
+                ],
+            )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    model = _SingleToolCallModel()
+    agent = GaiaGraphAgent(model=model, max_iterations=3)
+    result = agent.solve(
+        Question(
+            task_id="botany-post-tools-resolution",
+            question=(
+                "fresh basil, broccoli, bell pepper, sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert model.calls == 1
+    assert result["submitted_answer"] == "broccoli, fresh basil, sweet potatoes"
+    assert result["reducer_used"] == "botanical_classification"
+
+
 def test_graph_botanical_recovery_ignores_ambiguous_culinary_zucchini_page(monkeypatch) -> None:
     @tool
     def web_search(query: str, max_results: int = 5) -> str:
@@ -1738,6 +1800,76 @@ def test_graph_rejects_ungrounded_botanical_classification_when_retry_budget_is_
     assert result["submitted_answer"] == ""
     assert result["error"] == "Botanical classification answer lacked grounded evidence."
     assert result["recovery_reason"] == "botanical_classification_evidence_missing"
+
+
+def test_graph_botanical_failure_records_decision_trace_for_unresolved_items(
+    monkeypatch,
+) -> None:
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return one source candidate per botanical query."""
+        assert max_results == 5
+        url_map = {
+            "fresh basil botanical fruit or vegetable": "https://example.com/basil-ambiguous",
+            "fresh basil botany fruit vegetable": "https://example.com/basil-ambiguous",
+            "broccoli botanical fruit or vegetable": "https://example.com/broccoli",
+            "broccoli botany fruit vegetable": "https://example.com/broccoli",
+            "sweet potatoes botanical fruit or vegetable": "https://example.com/sweet-potato",
+            "sweet potatoes botany fruit vegetable": "https://example.com/sweet-potato",
+        }
+        url = url_map.get(query, "https://example.com/unknown")
+        return f"1. Source\nURL: {url}\nSnippet: botanical classification for {query}"
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return fetched botanical classification text."""
+        payloads = {
+            "https://example.com/basil-ambiguous": (
+                "Title: Basil\nURL: https://example.com/basil-ambiguous\n\n"
+                "Basil is a fragrant herb often used in sauces."
+            ),
+            "https://example.com/broccoli": (
+                "Title: Broccoli\nURL: https://example.com/broccoli\n\n"
+                "Broccoli is eaten for its flowering head and stalk."
+            ),
+            "https://example.com/sweet-potato": (
+                "Title: Sweet potato\nURL: https://example.com/sweet-potato\n\n"
+                "Sweet potato is an edible root vegetable."
+            ),
+        }
+        return payloads.get(
+            url,
+            f"Title: Unknown\nURL: {url}\n\nThis page does not contain a relevant botanical classification.",
+        )
+
+    monkeypatch.setattr(graph_module, "build_tools", lambda: [web_search, fetch_url])
+
+    agent = GaiaGraphAgent(
+        model=FakeModelSingleAnswer("[ANSWER]Broccoli, Sweet potatoes[/ANSWER]"),
+        max_iterations=1,
+    )
+    result = agent.solve(
+        Question(
+            task_id="botany-trace-unresolved",
+            question=(
+                "fresh basil, broccoli, sweet potatoes\n\n"
+                "Please alphabetize the vegetables and place each item in a comma separated list."
+            ),
+            file_name=None,
+        )
+    )
+
+    assert result["submitted_answer"] == ""
+    assert any(entry == "skill:botanical_gaia:profile_match" for entry in result["decision_trace"])
+    assert any(entry == "skill:botanical_gaia:items_extracted=3" for entry in result["decision_trace"])
+    assert any(
+        entry == "skill:botanical_gaia:unresolved=fresh basil"
+        for entry in result["decision_trace"]
+    )
+    assert any(
+        entry == "skill:botanical_gaia:aborted_partial_resolution"
+        for entry in result["decision_trace"]
+    )
 
 
 def test_graph_marks_audio_access_meta_answer_invalid() -> None:

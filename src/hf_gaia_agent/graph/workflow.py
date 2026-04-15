@@ -257,6 +257,7 @@ class GaiaGraphAgent:
         workflow.add_node("prepare_context", _prepare_context)
         workflow.add_node("agent", self._agent_node)
         workflow.add_node("tools", self._tools_node)
+        workflow.add_node("resolve_after_tools", self._resolve_after_tools_node)
         workflow.add_node("retry_invalid_answer", self._retry_invalid_answer_node)
         workflow.add_node("finalize", self._finalize_node)
 
@@ -271,8 +272,9 @@ class GaiaGraphAgent:
                 "finalize": "finalize",
             },
         )
+        workflow.add_edge("tools", "resolve_after_tools")
         workflow.add_conditional_edges(
-            "tools",
+            "resolve_after_tools",
             self._route_after_tools,
             {"agent": "agent", "finalize": "finalize"},
         )
@@ -335,6 +337,9 @@ class GaiaGraphAgent:
     def _finalize_node(self, state: AgentState) -> dict[str, Any]:
         return self._finalizer.finalize(state)
 
+    def _resolve_after_tools_node(self, state: AgentState) -> dict[str, Any]:
+        return self._services.run_resolution_pipeline(state) or {}
+
     @staticmethod
     def _route_after_agent(state: AgentState) -> str:
         last_message = state["messages"][-1]
@@ -357,11 +362,7 @@ class GaiaGraphAgent:
         return "finalize"
 
     def _route_after_tools(self, state: AgentState) -> str:
-        return (
-            "finalize"
-            if self._services.structured_answer_result(state) is not None
-            else "agent"
-        )
+        return "finalize" if state.get("final_answer") is not None else "agent"
 
     @staticmethod
     def _messages_for_model(messages: list[Any]) -> list[Any]:

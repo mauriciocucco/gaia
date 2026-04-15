@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from ..normalize import normalize_submitted_answer
+from ..source_pipeline import serialize_evidence
 from .answer_policy import is_invalid_final_response
 from .contracts import FinalizationRule, FinalizationServices
 from .evidence_support import (
+    botanical_canonical_state_from_state,
     requires_botanical_classification_retry,
     requires_temporal_roster_retry,
 )
@@ -31,6 +33,15 @@ class BotanicalClassificationFinalizationRule:
         recovery_reason: str | None,
     ) -> dict[str, Any] | None:
         del answer_text
+        botanical_state = botanical_canonical_state_from_state(state)
+        if botanical_state and botanical_state.is_closed:
+            return {
+                "final_answer": botanical_state.canonical_answer,
+                "error": None,
+                "reducer_used": "botanical_classification",
+                "evidence_used": serialize_evidence(botanical_state.used_records),
+                "recovery_reason": None,
+            }
         derived_answer = services.tool_derived_answer(state["messages"], state["question"])
         if derived_answer and not requires_botanical_classification_retry(state, derived_answer):
             return {

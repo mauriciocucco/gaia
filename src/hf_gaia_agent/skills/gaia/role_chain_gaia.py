@@ -101,7 +101,7 @@ class RoleChainGaiaSkill:
                 prefer_expected_domains=True,
             )
         if not likely_urls:
-            return None
+            return _trace_only(context)
 
         attempted_records: list[EvidenceRecord] = []
         for candidate_url in fetch_candidate_urls(
@@ -122,7 +122,7 @@ class RoleChainGaiaSkill:
             attempted_records.extend(evidence_records_from_tool_output("fetch_url", fetched))
 
         if not attempted_records:
-            return None
+            return _trace_only(context)
 
         evidence_text = _format_grounded_evidence_for_llm(attempted_records[-6:])[-12000:]
         response = self._answer_model.invoke(
@@ -147,17 +147,17 @@ class RoleChainGaiaSkill:
         )
         content = str(getattr(response, "content", "") or "").strip()
         if content == "[INSUFFICIENT]":
-            return None
+            return _trace_only(context)
         candidate = normalize_submitted_answer(content)
         if not candidate or is_invalid_final_response(candidate):
-            return None
+            return _trace_only(context)
 
         evidence_haystack = normalize_submitted_answer(evidence_text).lower()
         candidate_tokens = [
             token for token in re.findall(r"[a-z0-9]+", candidate.lower()) if len(token) >= 3
         ]
         if candidate_tokens and not all(token in evidence_haystack for token in candidate_tokens):
-            return None
+            return _trace_only(context)
 
         return with_recovery_traces(
             {
@@ -191,3 +191,10 @@ def _format_grounded_evidence_for_llm(records: list[EvidenceRecord]) -> str:
             source_bits.append(f"Title: {record.title_or_caption}")
         blocks.append(f"{' | '.join(source_bits)}\n{record.content}")
     return "\n\n".join(blocks)
+
+
+def _trace_only(context) -> dict[str, list[str]]:
+    return {
+        "tool_trace": list(context.tool_trace),
+        "decision_trace": list(context.decision_trace),
+    }

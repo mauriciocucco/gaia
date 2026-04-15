@@ -40,6 +40,41 @@ def test_profile_question_extracts_month_year_expected_date() -> None:
     assert profile.expected_date == "as of July 2023"
 
 
+def test_profile_question_classifies_short_botanical_list_variant() -> None:
+    profile = profile_question(
+        "broccoli, bell pepper, sweet potatoes, fresh basil\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+
+    assert profile.name == "list_item_classification"
+    assert profile.prompt_items == (
+        "broccoli",
+        "bell pepper",
+        "sweet potatoes",
+        "fresh basil",
+    )
+    assert profile.classification_labels == {"include": "vegetable", "exclude": "fruit"}
+
+
+def test_profile_question_uses_fallback_prompt_item_extraction_for_unlabeled_list() -> None:
+    profile = profile_question(
+        "milk, eggs, flour, sweet potatoes, fresh basil, plums, green beans, rice, corn, bell pepper, broccoli\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+
+    assert profile.name == "list_item_classification"
+    assert profile.prompt_items[:4] == ("milk", "eggs", "flour", "sweet potatoes")
+    assert "broccoli" in profile.prompt_items
+
+
+def test_profile_question_does_not_false_positive_generic_vegetable_request() -> None:
+    profile = profile_question(
+        "Please explain whether vegetables are healthier than fruit for endurance athletes."
+    )
+
+    assert profile.name != "list_item_classification"
+
+
 def test_profile_question_prioritizes_attachment_required_before_specialized_families() -> None:
     profile = profile_question(
         "What is the surname of the equine veterinarian mentioned in the attached chapter notes?",

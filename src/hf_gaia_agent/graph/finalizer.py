@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.messages import ToolMessage
+
 from ..normalize import normalize_submitted_answer
 from ..source_pipeline import serialize_evidence
 from .answer_policy import (
@@ -13,7 +15,6 @@ from .answer_policy import (
     looks_like_placeholder_answer,
 )
 from .contracts import FinalizationServices
-from .routing import question_profile_from_state
 from .state import AgentState
 
 
@@ -25,13 +26,13 @@ class WorkflowFinalizer:
 
     def finalize(self, state: AgentState) -> dict[str, Any]:
         if state.get("final_answer"):
-            return {
+            return self._with_state_metadata(state, {
                 "final_answer": state.get("final_answer"),
                 "error": state.get("error"),
                 "reducer_used": state.get("reducer_used"),
                 "evidence_used": state.get("evidence_used", []),
                 "recovery_reason": state.get("recovery_reason"),
-            }
+            })
 
         last_ai = self._services.last_ai_message(state["messages"])
         raw_answer = last_ai.content if last_ai else ""
@@ -51,44 +52,47 @@ class WorkflowFinalizer:
                 state["question"],
             )
             if derived_answer:
-                return {
+                return self._with_state_metadata(state, {
                     "final_answer": derived_answer,
                     "error": None,
                     "recovery_reason": None,
-                }
-            return {
+                })
+            return self._with_state_metadata(state, {
                 "final_answer": "",
                 "error": error or "Required attachment was not available locally.",
                 "recovery_reason": recovery_reason or "attachment_missing",
-            }
+            })
 
         preferred_structured_result = self._services.structured_answer_result(
             state,
             preferred_only=True,
         )
         if preferred_structured_result:
-            return preferred_structured_result
+            return self._with_state_metadata(state, preferred_structured_result)
 
-        run_core_recoveries = getattr(self._services, "run_core_recoveries", None)
-        core_recovery = run_core_recoveries(state) if callable(run_core_recoveries) else None
-        if core_recovery:
-            return core_recovery
-
-        run_skills = getattr(self._services, "run_skills", None)
-        skill_result = run_skills(state) if callable(run_skills) else None
-        if skill_result:
-            return skill_result
-
-        profile = question_profile_from_state(state)
-        if profile.name == "temporal_ordered_list":
-            run_adapters = getattr(self._services, "run_adapters", None)
-            adapter_result = (
-                run_adapters("temporal_ordered_list", state)
-                if callable(run_adapters)
-                else None
+        run_resolution_pipeline = getattr(self._services, "run_resolution_pipeline", None)
+        has_resolution_inputs = self._has_resolution_inputs(state)
+        resolution_result = (
+            run_resolution_pipeline(state)
+            if callable(run_resolution_pipeline)
+            and (
+                has_resolution_inputs
+                or state.get("iterations", 0) >= state.get("max_iterations", 0)
             )
-            if adapter_result:
-                return adapter_result
+            else None
+        )
+        if resolution_result and resolution_result.get("final_answer") is not None:
+            return self._with_state_metadata(state, resolution_result)
+        if resolution_result:
+            if has_resolution_inputs:
+                state = {**state, **resolution_result}
+            else:
+                state = {
+                    **state,
+                    "decision_trace": list(
+                        resolution_result.get("decision_trace") or state.get("decision_trace") or []
+                    ),
+                }
 
         for rule in self._services.finalization_rules:
             if not rule.applies(state, final_answer):
@@ -101,7 +105,7 @@ class WorkflowFinalizer:
                 recovery_reason=recovery_reason,
             )
             if result:
-                return result
+                return self._with_state_metadata(state, result)
 
         if (
             is_invalid_final_response(final_answer)
@@ -114,7 +118,7 @@ class WorkflowFinalizer:
         ):
             recovered = self._recover_from_evidence(state)
             if recovered:
-                return recovered
+                return self._with_state_metadata(state, recovered)
             final_answer = ""
             error = error or "Model produced an invalid non-answer."
             recovery_reason = recovery_reason or "invalid_model_non_answer"
@@ -122,17 +126,17 @@ class WorkflowFinalizer:
         if not final_answer:
             recovered = self._recover_from_evidence(state)
             if recovered:
-                return recovered
+                return self._with_state_metadata(state, recovered)
             error = error or "Model did not produce a final answer."
             recovery_reason = recovery_reason or "missing_final_answer"
 
-        return {
+        return self._with_state_metadata(state, {
             "final_answer": final_answer,
             "error": error,
             "reducer_used": reducer_used,
             "evidence_used": evidence_used,
             "recovery_reason": recovery_reason,
-        }
+        })
 
     def _recover_from_evidence(self, state: AgentState) -> dict[str, Any] | None:
         derived_answer = self._services.tool_derived_answer(
@@ -172,3 +176,19 @@ class WorkflowFinalizer:
                 "recovery_reason": None,
             }
         return None
+
+    @staticmethod
+    def _with_state_metadata(state: AgentState, payload: dict[str, Any]) -> dict[str, Any]:
+        result = dict(payload)
+        result.setdefault("tool_trace", list(state.get("tool_trace") or []))
+        result.setdefault("decision_trace", list(state.get("decision_trace") or []))
+        result.setdefault("skill_trace", list(state.get("skill_trace") or []))
+        return result
+
+    @staticmethod
+    def _has_resolution_inputs(state: AgentState) -> bool:
+        if state.get("structured_tool_outputs"):
+            return True
+        if state.get("tool_trace"):
+            return True
+        return any(isinstance(message, ToolMessage) for message in state.get("messages", []))

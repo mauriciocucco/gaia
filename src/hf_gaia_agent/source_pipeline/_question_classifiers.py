@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import re
 
 from ._models import QuestionProfile
+from ._prompt_items import extract_prompt_list_items
 from ._question_detectors import (
     is_article_to_paper_question,
     is_botanical_classification_question,
@@ -90,20 +91,7 @@ def _generic_urls(context: QuestionClassificationContext) -> tuple[str, ...]:
 
 
 def _prompt_items(context: QuestionClassificationContext) -> tuple[str, ...]:
-    patterns = (
-        r"here's the list i have so far:\s*(?P<body>.+?)(?:\n\s*\n|$)",
-        r"comma separated list[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
-        r"list of items[:\s]+(?P<body>.+?)(?:\n\s*\n|$)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, context.question, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            continue
-        body = re.sub(r"\s+", " ", match.group("body")).strip()
-        items = [item.strip(" .") for item in body.split(",") if item.strip()]
-        if items:
-            return tuple(items)
-    return ()
+    return tuple(extract_prompt_list_items(context.question))
 
 
 def _youtube_urls(context: QuestionClassificationContext) -> tuple[str, ...]:

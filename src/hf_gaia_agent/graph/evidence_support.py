@@ -7,6 +7,7 @@ from typing import Any, Iterable
 
 from langchain_core.messages import AIMessage, ToolMessage
 
+from ..botanical_classification import BotanicalCanonicalState, build_botanical_canonical_state
 from ..evidence_solver import (
     ToolEvidence,
     solve_answer_from_evidence_records,
@@ -24,7 +25,7 @@ from .answer_policy import (
     is_invalid_tool_output,
 )
 from .prompts import FALLBACK_ANSWER_TOOL_NAMES, PREFERRED_STRUCTURED_REDUCERS
-from .routing import question_profile_from_state
+from .routing import extract_prompt_list_items, question_profile_from_state
 from .state import AgentState
 
 
@@ -325,22 +326,39 @@ def requires_botanical_classification_retry(state: AgentState, answer_text: str)
     candidate = normalize_submitted_answer(answer_text)
     if not candidate or is_invalid_final_response(candidate):
         return False
-    profile = question_profile_from_state(state)
-    if profile.name != "list_item_classification":
+    botanical_state = botanical_canonical_state_from_state(state)
+    if botanical_state is None:
         return False
-    if not any(
-        record.kind in {"text", "table", "transcript"}
-        for record in collect_evidence_records_from_state(state)
-    ):
+    if not botanical_state.is_closed:
         return True
-    prompt_items = list(profile.prompt_items or ())
-    if not prompt_items:
-        return False
-    normalized_answer = normalize_submitted_answer(answer_text).lower()
-    mentioned_items = sum(
-        1 for item in prompt_items if normalize_submitted_answer(item).lower() in normalized_answer
+    return botanical_state.canonical_answer != candidate
+
+
+def is_botanical_classification_profile(state: AgentState) -> bool:
+    profile = question_profile_from_state(state)
+    labels = profile.classification_labels or {}
+    return (
+        profile.name == "list_item_classification"
+        and labels.get("include") == "vegetable"
+        and labels.get("exclude") == "fruit"
     )
-    return mentioned_items == 0
+
+
+def botanical_canonical_state_from_state(
+    state: AgentState,
+) -> BotanicalCanonicalState | None:
+    if not is_botanical_classification_profile(state):
+        return None
+    profile = question_profile_from_state(state)
+    items = list(profile.prompt_items or extract_prompt_list_items(state["question"]))
+    if not items:
+        return None
+    grounded_records = [
+        record
+        for record in collect_evidence_records_from_state(state)
+        if record.kind in {"text", "table", "transcript"}
+    ]
+    return build_botanical_canonical_state(items, grounded_records)
 
 
 def top_grounded_evidence_records(
