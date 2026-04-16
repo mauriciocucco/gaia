@@ -51,3 +51,6 @@ class AgentState(MessagesState):
     search_history_fingerprints: list[str]
     structured_tool_outputs: list[dict[str, Any]]
     skill_trace: list[str]
+    botanical_partial_records: list[dict[str, Any]]
+    botanical_item_status: dict[str, dict[str, Any]]
+    botanical_search_history: list[str]

@@ -295,6 +295,24 @@ def is_obviously_bad_candidate_url(url: str) -> bool:
     return any(fragment in lowered for fragment in bad_fragments)
 
 
+def is_botanical_recipe_noise_url(url: str) -> bool:
+    lowered = unquote(url).lower()
+    recipe_fragments = (
+        "chefkoch.",
+        "allrecipes.",
+        "foodnetwork.",
+        "/rezepte",
+        "/recipes",
+        "/recipe/",
+        "/cooking",
+        "recipe",
+        "rezepte",
+        "auflauf",
+        "nudeln",
+    )
+    return any(fragment in lowered for fragment in recipe_fragments)
+
+
 def preferred_ranked_fetch_candidate(
     *,
     requested_url: str,

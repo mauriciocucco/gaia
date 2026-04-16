@@ -27,3 +27,94 @@ def test_classify_botanical_item_uses_adjacent_context_for_sweet_potato_root_sen
     )
 
     assert outcome == "include"
+
+
+def test_zucchini_pepo_excludes_from_vegetables() -> None:
+    record = EvidenceRecord(
+        kind="text",
+        source_url="https://en.wikipedia.org/wiki/Cucurbita_pepo",
+        source_type="page_text",
+        adapter_name="wikipedia.org",
+        content=(
+            "Title: Cucurbita pepo\n"
+            "URL: https://en.wikipedia.org/wiki/Cucurbita_pepo\n\n"
+            "Cucurbita pepo is a cultivated plant. Zucchini is a pepo, a botanical fruit "
+            "developed from the flower ovary and containing seeds."
+        ),
+        title_or_caption="Cucurbita pepo",
+        confidence=0.9,
+        extraction_method="fetch_wikipedia_page",
+        derived_from=("fetch_wikipedia_page",),
+    )
+
+    outcome, _supporting = classify_botanical_item_from_records("zucchini", [record])
+
+    assert outcome == "exclude"
+
+
+def test_bell_pepper_capsicum_fruit_signal_excludes() -> None:
+    record = EvidenceRecord(
+        kind="text",
+        source_url="https://en.wikipedia.org/wiki/Capsicum_annuum",
+        source_type="page_text",
+        adapter_name="wikipedia.org",
+        content=(
+            "Title: Capsicum annuum\n"
+            "URL: https://en.wikipedia.org/wiki/Capsicum_annuum\n\n"
+            "The bell pepper is the fruit of the plant Capsicum annuum. "
+            "It is a botanical fruit because it develops from the ovary and contains seeds."
+        ),
+        title_or_caption="Capsicum annuum",
+        confidence=0.9,
+        extraction_method="fetch_wikipedia_page",
+        derived_from=("fetch_wikipedia_page",),
+    )
+
+    outcome, _supporting = classify_botanical_item_from_records("bell pepper", [record])
+
+    assert outcome == "exclude"
+
+
+def test_peanut_legume_pod_signal_excludes() -> None:
+    record = EvidenceRecord(
+        kind="text",
+        source_url="https://en.wikipedia.org/wiki/Peanut",
+        source_type="page_text",
+        adapter_name="wikipedia.org",
+        content=(
+            "Title: Peanut\n"
+            "URL: https://en.wikipedia.org/wiki/Peanut\n\n"
+            "Peanut is the common name for Arachis hypogaea. The peanut fruit is a legume pod "
+            "that contains seeds."
+        ),
+        title_or_caption="Peanut",
+        confidence=0.9,
+        extraction_method="fetch_wikipedia_page",
+        derived_from=("fetch_wikipedia_page",),
+    )
+
+    outcome, _supporting = classify_botanical_item_from_records("peanuts", [record])
+
+    assert outcome == "exclude"
+
+
+def test_scientific_alias_page_can_support_common_name_item() -> None:
+    record = EvidenceRecord(
+        kind="text",
+        source_url="https://en.wikipedia.org/wiki/Arachis_hypogaea",
+        source_type="page_text",
+        adapter_name="wikipedia.org",
+        content=(
+            "Title: Arachis hypogaea\n"
+            "URL: https://en.wikipedia.org/wiki/Arachis_hypogaea\n\n"
+            "Arachis hypogaea produces a legume pod with edible seeds."
+        ),
+        title_or_caption="Arachis hypogaea",
+        confidence=0.9,
+        extraction_method="fetch_wikipedia_page",
+        derived_from=("fetch_wikipedia_page",),
+    )
+
+    outcome, _supporting = classify_botanical_item_from_records("peanuts", [record])
+
+    assert outcome == "exclude"

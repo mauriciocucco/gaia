@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import re
 from typing import Sequence
 
+from ..botanical_aliases import botanical_aliases_for_item, botanical_token_groups
 from ._models import QuestionProfile, SourceCandidate
 from ._utils import is_metric_row_lookup_question, query_tokens, registered_host
 
@@ -66,6 +67,8 @@ CANDIDATE_SCORES = {
     "botanical_source_hint": 26,
     "botanical_page_match": 24,
     "botanical_classifier_hint": 12,
+    "botanical_scientific_alias_hint": 20,
+    "botanical_recipe_noise_penalty": -110,
     "botanical_offtopic_vertical_penalty": -90,
 }
 
@@ -405,6 +408,12 @@ def _score_botanical_classification(
     ):
         score += _sc("botanical_classifier_hint")
         reasons.append("botanical_classifier_hint")
+    if _candidate_matches_botanical_alias(context):
+        score += _sc("botanical_scientific_alias_hint")
+        reasons.append("botanical_scientific_alias_hint")
+    if _is_botanical_recipe_noise(context):
+        score += _sc("botanical_recipe_noise_penalty")
+        reasons.append("botanical_recipe_noise_penalty")
     if _is_botanical_offtopic_vertical(context):
         score += _sc("botanical_offtopic_vertical_penalty")
         reasons.append("botanical_offtopic_vertical_penalty")
@@ -540,6 +549,39 @@ def _candidate_matches_any_botanical_prompt_item(context: CandidateScoringContex
         ):
             return True
     return False
+
+
+def _candidate_matches_botanical_alias(context: CandidateScoringContext) -> bool:
+    lowered = context.haystack.lower()
+    for item in context.profile.prompt_items or ():
+        for alias in botanical_aliases_for_item(item):
+            token_groups = botanical_token_groups(alias)
+            if token_groups and all(
+                any(variant in lowered for variant in variants)
+                for variants in token_groups
+            ):
+                return True
+    return False
+
+
+def _is_botanical_recipe_noise(context: CandidateScoringContext) -> bool:
+    lowered = context.haystack.lower()
+    return any(
+        fragment in lowered
+        for fragment in (
+            "chefkoch",
+            "allrecipes",
+            "foodnetwork",
+            "recipe",
+            "recipes",
+            "rezepte",
+            "cooking",
+            "pie",
+            "salad",
+            "auflauf",
+            "nudeln",
+        )
+    )
 
 
 def _is_botanical_offtopic_vertical(context: CandidateScoringContext) -> bool:

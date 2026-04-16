@@ -23,6 +23,7 @@ from hf_gaia_agent.hooks import BaseAgentHook
 from hf_gaia_agent.skills import build_skills
 from hf_gaia_agent.skills.gaia.botanical_gaia import BotanicalGaiaSkill
 from hf_gaia_agent.skills.gaia.role_chain_gaia import RoleChainGaiaSkill
+from hf_gaia_agent.source_pipeline import EvidenceRecord, serialize_evidence
 
 
 def _tools_by_name() -> dict[str, object]:
@@ -1516,6 +1517,547 @@ def test_botanical_skill_reuses_existing_fetch_wikipedia_page_records_without_re
     assert result["reducer_used"] == "botanical_classification"
     assert result["skill_used"] == "botanical_gaia"
     assert "skill:botanical_gaia:resolved" in result["decision_trace"]
+
+
+def test_botanical_partial_state_is_persisted_across_abort() -> None:
+    @tool
+    def search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Return weak or ambiguous Wikipedia matches for zucchini only."""
+        assert max_results == 5
+        if query == "zucchini":
+            return (
+                "1. Zucchini\n"
+                "URL: https://en.wikipedia.org/wiki/Zucchini\n"
+                "Snippet: Zucchini is used in savory dishes.\n"
+            )
+        return ""
+
+    @tool
+    def fetch_wikipedia_page(title: str) -> str:
+        """Return ambiguous zucchini text that should not close classification."""
+        assert title == "Zucchini"
+        return (
+            "Title: Zucchini\n"
+            "URL: https://en.wikipedia.org/wiki/Zucchini\n\n"
+            "Zucchini is popular in home cooking and often discussed as a fruit or vegetable."
+        )
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return recipe noise for zucchini broad-web fallback."""
+        assert max_results == 5
+        if query.startswith("zucchini botanical"):
+            return (
+                "1. Zucchini recipes\n"
+                "URL: https://www.chefkoch.de/rs/s0/zucchini/Rezepte.html\n"
+                "Snippet: Zucchini Rezepte.\n"
+            )
+        return ""
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Recipe URLs should be filtered before fetch."""
+        raise AssertionError(f"Recipe noise should be filtered before fetch: {url!r}")
+
+    skill = BotanicalGaiaSkill(
+        {
+            "search_wikipedia": search_wikipedia,
+            "fetch_wikipedia_page": fetch_wikipedia_page,
+            "web_search": web_search,
+            "fetch_url": fetch_url,
+        }
+    )
+    state = {
+        "question": "broccoli, sweet potatoes, zucchini\n\nPlease alphabetize the vegetables and place each item in a comma separated list.",
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: Broccoli\n"
+                    "URL: https://example.com/broccoli\n\n"
+                    "Broccoli is eaten for its flowering head and stalk."
+                ),
+                tool_call_id="call-1",
+                name="fetch_url",
+            ),
+            ToolMessage(
+                content=(
+                    "Title: Sweet potato\n"
+                    "URL: https://example.com/sweet-potato\n\n"
+                    "Sweet potato is an edible root vegetable."
+                ),
+                tool_call_id="call-2",
+                name="fetch_url",
+            ),
+        ],
+        "tool_trace": [],
+        "decision_trace": [],
+        "ranked_candidates": [],
+        "botanical_partial_records": [],
+        "botanical_item_status": {},
+        "botanical_search_history": [],
+    }
+
+    result = skill.run(state)
+
+    assert result is not None
+    assert result.get("final_answer") is None
+    assert result["botanical_partial_records"]
+    assert "zucchini" in result["botanical_item_status"]
+    assert result["botanical_item_status"]["zucchini"]["resolved"] is False
+    assert any(
+        stage.startswith("wiki_exact") or stage.startswith("wiki_alias")
+        for stage in result["botanical_item_status"]["zucchini"]["attempted_stages"]
+    )
+    assert result["botanical_search_history"]
+
+
+def test_botanical_skill_does_not_research_already_resolved_items() -> None:
+    search_queries: list[str] = []
+
+    @tool
+    def search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Only unresolved bell pepper should be researched in this test."""
+        assert max_results == 5
+        search_queries.append(query)
+        assert query in {"bell pepper", "capsicum annuum", "capsicum"}
+        if query == "bell pepper":
+            return (
+                "1. Bell pepper\n"
+                "URL: https://en.wikipedia.org/wiki/Bell_pepper\n"
+                "Snippet: Bell pepper is the fruit of plants in the species Capsicum annuum.\n"
+            )
+        return ""
+
+    @tool
+    def fetch_wikipedia_page(title: str) -> str:
+        """Return a decisive bell pepper exclusion page."""
+        assert title == "Bell pepper"
+        return (
+            "Title: Bell pepper\n"
+            "URL: https://en.wikipedia.org/wiki/Bell_pepper\n\n"
+            "Bell pepper is the fruit of the plant Capsicum annuum and contains seeds."
+        )
+
+    skill = BotanicalGaiaSkill(
+        {
+            "search_wikipedia": search_wikipedia,
+            "fetch_wikipedia_page": fetch_wikipedia_page,
+        }
+    )
+    sweet_potato_record = EvidenceRecord(
+        kind="text",
+        source_url="https://en.wikipedia.org/wiki/Sweet_potato",
+        source_type="page_text",
+        adapter_name="wikipedia.org",
+        content=(
+            "Title: Sweet potato\n"
+            "URL: https://en.wikipedia.org/wiki/Sweet_potato\n\n"
+            "Sweet potato is an edible root vegetable."
+        ),
+        title_or_caption="Sweet potato",
+        confidence=0.9,
+        extraction_method="fetch_wikipedia_page",
+        derived_from=("fetch_wikipedia_page",),
+    )
+    state = {
+        "question": "sweet potatoes, bell pepper\n\nPlease alphabetize the vegetables and place each item in a comma separated list.",
+        "messages": [],
+        "tool_trace": [],
+        "decision_trace": [],
+        "ranked_candidates": [],
+        "question_profile": {
+            "name": "list_item_classification",
+            "profile_family": "list_item_classification",
+            "prompt_items": ("sweet potatoes", "bell pepper"),
+            "classification_labels": {"include": "vegetable", "exclude": "fruit"},
+        },
+        "botanical_partial_records": serialize_evidence([sweet_potato_record]),
+        "botanical_item_status": {
+            "sweet potatoes": {
+                "resolved": True,
+                "outcome": "include",
+                "attempted_stages": [],
+                "last_reason": None,
+            }
+        },
+        "botanical_search_history": [],
+    }
+
+    result = skill.run(state)
+
+    assert result is not None
+    assert result["final_answer"] == "sweet potatoes"
+    assert all("sweet potatoes" not in query for query in search_queries)
+
+
+def test_botanical_second_pass_prefers_alias_wikipedia_before_broad_web() -> None:
+    tool_calls: list[str] = []
+
+    @tool
+    def search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Resolve only through alias Wikipedia after the exact query misses."""
+        tool_calls.append(f"search_wikipedia:{query}")
+        assert max_results == 5
+        if query == "bell pepper":
+            return ""
+        if query == "capsicum annuum":
+            return (
+                "1. Capsicum annuum\n"
+                "URL: https://en.wikipedia.org/wiki/Capsicum_annuum\n"
+                "Snippet: Bell pepper is the fruit of plants in the species Capsicum annuum.\n"
+            )
+        return ""
+
+    @tool
+    def fetch_wikipedia_page(title: str) -> str:
+        """Return a decisive scientific-alias Wikipedia page."""
+        tool_calls.append(f"fetch_wikipedia_page:{title}")
+        assert title == "Capsicum annuum"
+        return (
+            "Title: Capsicum annuum\n"
+            "URL: https://en.wikipedia.org/wiki/Capsicum_annuum\n\n"
+            "Bell pepper is the fruit of the plant Capsicum annuum."
+        )
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Broad web must not run in this alias-Wikipedia happy path."""
+        raise AssertionError(f"Broad web should not run after alias Wikipedia match: {query!r}, {max_results!r}")
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Broad-web fetch must not run in this alias-Wikipedia happy path."""
+        raise AssertionError(f"Broad-web fetch should not run after alias Wikipedia match: {url!r}")
+
+    skill = BotanicalGaiaSkill(
+        {
+            "search_wikipedia": search_wikipedia,
+            "fetch_wikipedia_page": fetch_wikipedia_page,
+            "web_search": web_search,
+            "fetch_url": fetch_url,
+        }
+    )
+    state = {
+        "question": "bell pepper\n\nPlease alphabetize the vegetables and place each item in a comma separated list.",
+        "messages": [],
+        "tool_trace": [],
+        "decision_trace": [],
+        "ranked_candidates": [],
+        "question_profile": {
+            "name": "list_item_classification",
+            "profile_family": "list_item_classification",
+            "prompt_items": ("bell pepper",),
+            "classification_labels": {"include": "vegetable", "exclude": "fruit"},
+        },
+        "botanical_partial_records": [],
+        "botanical_item_status": {},
+        "botanical_search_history": [],
+    }
+
+    result = skill.run(state)
+
+    assert result is not None
+    assert result["reducer_used"] == "botanical_classification"
+    assert tool_calls == [
+        "search_wikipedia:bell pepper",
+        "search_wikipedia:capsicum annuum",
+        "fetch_wikipedia_page:Capsicum annuum",
+    ]
+
+
+def test_botanical_q9_integration_persists_progress_and_closes_from_alias_records() -> None:
+    tool_calls: list[str] = []
+
+    @tool
+    def search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Return weak exact-page leads for the three unresolved Q9 items."""
+        tool_calls.append(f"search_wikipedia:{query}")
+        assert max_results == 5
+        pages = {
+            "bell pepper": (
+                "1. Bell pepper\n"
+                "URL: https://en.wikipedia.org/wiki/Bell_pepper\n"
+                "Snippet: Bell pepper is used in cuisine.\n"
+            ),
+            "peanuts": (
+                "1. Peanuts\n"
+                "URL: https://en.wikipedia.org/wiki/Peanuts\n"
+                "Snippet: Peanuts are a food product.\n"
+            ),
+            "zucchini": (
+                "1. Zucchini\n"
+                "URL: https://en.wikipedia.org/wiki/Zucchini\n"
+                "Snippet: Zucchini is often cooked.\n"
+            ),
+        }
+        return pages.get(query, "")
+
+    @tool
+    def fetch_wikipedia_page(title: str) -> str:
+        """Return ambiguous common-name Wikipedia pages that should stay unresolved."""
+        tool_calls.append(f"fetch_wikipedia_page:{title}")
+        payloads = {
+            "Bell pepper": (
+                "Title: Bell pepper\n"
+                "URL: https://en.wikipedia.org/wiki/Bell_pepper\n\n"
+                "Bell pepper is a popular ingredient in many dishes."
+            ),
+            "Peanuts": (
+                "Title: Peanuts\n"
+                "URL: https://en.wikipedia.org/wiki/Peanuts\n\n"
+                "Peanuts are commonly roasted and eaten as snacks."
+            ),
+            "Zucchini": (
+                "Title: Zucchini\n"
+                "URL: https://en.wikipedia.org/wiki/Zucchini\n\n"
+                "Zucchini is discussed in cooking and home gardens."
+            ),
+        }
+        return payloads[title]
+
+    @tool
+    def web_search(query: str, max_results: int = 5) -> str:
+        """Return weak broad-web results plus recipe noise for zucchini."""
+        tool_calls.append(f"web_search:{query}")
+        assert max_results == 5
+        if query.startswith("zucchini botanical"):
+            return (
+                "1. Zucchini recipes\n"
+                "URL: https://www.chefkoch.de/rs/s0/zucchini/Rezepte.html\n"
+                "Snippet: Zucchini Rezepte.\n"
+            )
+        return (
+            "1. Unknown\n"
+            "URL: https://example.com/unknown\n"
+            "Snippet: Weak botanical discussion.\n"
+        )
+
+    @tool
+    def fetch_url(url: str) -> str:
+        """Return non-decisive broad-web content when fetches happen."""
+        tool_calls.append(f"fetch_url:{url}")
+        assert "chefkoch" not in url
+        return (
+            f"Title: Unknown\nURL: {url}\n\n"
+            "This page does not contain a decisive botanical classification."
+        )
+
+    first_skill = BotanicalGaiaSkill(
+        {
+            "search_wikipedia": search_wikipedia,
+            "fetch_wikipedia_page": fetch_wikipedia_page,
+            "web_search": web_search,
+            "fetch_url": fetch_url,
+        }
+    )
+    resolved_records = [
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/broccoli",
+            source_type="page_text",
+            adapter_name="example.com",
+            content="Title: Broccoli\nURL: https://example.com/broccoli\n\nBroccoli is eaten for its flowering head and stalk.",
+            title_or_caption="Broccoli",
+            confidence=0.9,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        ),
+            EvidenceRecord(
+                kind="text",
+                source_url="https://example.com/celery",
+                source_type="page_text",
+                adapter_name="example.com",
+                content=(
+                    "Title: Celery\nURL: https://example.com/celery\n\n"
+                    "Celery is a vegetable grown for its edible stems and edible stalks."
+                ),
+                title_or_caption="Celery",
+                confidence=0.9,
+                extraction_method="fetch_url",
+                derived_from=("fetch_url",),
+            ),
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/basil",
+            source_type="page_text",
+            adapter_name="example.com",
+            content="Title: Basil\nURL: https://example.com/basil\n\nBasil is a culinary herb whose edible leaves are used fresh.",
+            title_or_caption="Basil",
+            confidence=0.9,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        ),
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/lettuce",
+            source_type="page_text",
+            adapter_name="example.com",
+            content="Title: Lettuce\nURL: https://example.com/lettuce\n\nLettuce is grown for its edible leaves.",
+            title_or_caption="Lettuce",
+            confidence=0.9,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        ),
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/sweet-potato",
+            source_type="page_text",
+            adapter_name="example.com",
+            content="Title: Sweet potato\nURL: https://example.com/sweet-potato\n\nSweet potato is an edible root vegetable.",
+            title_or_caption="Sweet potato",
+            confidence=0.9,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        ),
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/acorn",
+            source_type="page_text",
+            adapter_name="example.com",
+            content="Title: Acorn\nURL: https://example.com/acorn\n\nAcorn is a botanical fruit with a seed.",
+            title_or_caption="Acorn",
+            confidence=0.9,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        ),
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/corn",
+            source_type="page_text",
+            adapter_name="example.com",
+            content="Title: Corn\nURL: https://example.com/corn\n\nCorn kernels are grains and botanical fruits.",
+            title_or_caption="Corn",
+            confidence=0.9,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        ),
+        EvidenceRecord(
+            kind="text",
+            source_url="https://example.com/green-bean",
+            source_type="page_text",
+            adapter_name="example.com",
+            content="Title: Green bean\nURL: https://example.com/green-bean\n\nGreen bean pods contain seeds and are botanical fruits.",
+            title_or_caption="Green bean",
+            confidence=0.9,
+            extraction_method="fetch_url",
+            derived_from=("fetch_url",),
+        ),
+            EvidenceRecord(
+                kind="text",
+                source_url="https://example.com/plum",
+                source_type="page_text",
+                adapter_name="example.com",
+                content=(
+                    "Title: Plum\nURL: https://example.com/plum\n\n"
+                    "Plum is a botanical fruit and a drupe."
+                ),
+                title_or_caption="Plum",
+                confidence=0.9,
+                extraction_method="fetch_url",
+                derived_from=("fetch_url",),
+            ),
+    ]
+    first_state = {
+        "question": (
+            "I'm making a grocery list for my mom, but she's a professor of botany and she's a real stickler when it comes "
+            "to categorizing things. I need to add different foods to different categories on the grocery list, but if I make a mistake, "
+            "she won't buy anything inserted in the wrong category. Here's the list I have so far:\n\n"
+            "milk, eggs, flour, whole bean coffee, Oreos, sweet potatoes, fresh basil, plums, green beans, rice, corn, bell pepper, "
+            "whole allspice, acorns, broccoli, celery, zucchini, lettuce, peanuts\n\n"
+            "I need to make headings for the fruits and vegetables. Could you please create a list of just the vegetables from my list? "
+            "But remember that my mom is a real stickler, so make sure that no botanical fruits end up on the vegetable list. "
+            "Please alphabetize the list of vegetables, and place each item in a comma separated list."
+        ),
+        "messages": [],
+        "tool_trace": [],
+        "decision_trace": [],
+        "ranked_candidates": [],
+        "botanical_partial_records": serialize_evidence(resolved_records),
+        "botanical_item_status": {},
+        "botanical_search_history": [],
+    }
+
+    first_result = first_skill.run(first_state)
+
+    assert first_result is not None
+    assert first_result.get("final_answer") is None
+    assert any("chefkoch" not in entry for entry in first_result["tool_trace"])
+    assert first_result["botanical_item_status"]["bell pepper"]["resolved"] is False
+    assert first_result["botanical_item_status"]["peanuts"]["resolved"] is False
+    assert first_result["botanical_item_status"]["zucchini"]["resolved"] is False
+    assert not any("chefkoch" in entry for entry in first_result["tool_trace"] if entry.startswith("fetch_url("))
+
+    @tool
+    def blocked_search_wikipedia(query: str, max_results: int = 5) -> str:
+        """Second pass should not need any new search."""
+        raise AssertionError(
+            f"Unexpected search on second pass: query={query!r}, max_results={max_results!r}"
+        )
+
+    @tool
+    def blocked_fetch_wikipedia_page(title: str) -> str:
+        """Second pass should not need any new Wikipedia fetch."""
+        raise AssertionError(f"Unexpected wiki fetch on second pass: title={title!r}")
+
+    @tool
+    def blocked_web_search(query: str, max_results: int = 5) -> str:
+        """Second pass should not need any new broad-web search."""
+        raise AssertionError(
+            f"Unexpected broad web on second pass: query={query!r}, max_results={max_results!r}"
+        )
+
+    @tool
+    def blocked_fetch_url(url: str) -> str:
+        """Second pass should not need any new fetch."""
+        raise AssertionError(f"Unexpected fetch on second pass: url={url!r}")
+
+    second_skill = BotanicalGaiaSkill(
+        {
+            "search_wikipedia": blocked_search_wikipedia,
+            "fetch_wikipedia_page": blocked_fetch_wikipedia_page,
+            "web_search": blocked_web_search,
+            "fetch_url": blocked_fetch_url,
+        }
+    )
+    second_state = {
+        **first_state,
+        **first_result,
+        "messages": [
+            ToolMessage(
+                content=(
+                    "Title: Capsicum annuum\n"
+                    "URL: https://en.wikipedia.org/wiki/Capsicum_annuum\n\n"
+                    "Bell pepper is the fruit of the plant Capsicum annuum."
+                ),
+                tool_call_id="alias-1",
+                name="fetch_wikipedia_page",
+            ),
+            ToolMessage(
+                content=(
+                    "Title: Arachis hypogaea\n"
+                    "URL: https://en.wikipedia.org/wiki/Arachis_hypogaea\n\n"
+                    "Arachis hypogaea produces a legume pod that contains seeds."
+                ),
+                tool_call_id="alias-2",
+                name="fetch_wikipedia_page",
+            ),
+            ToolMessage(
+                content=(
+                    "Title: Cucurbita pepo\n"
+                    "URL: https://en.wikipedia.org/wiki/Cucurbita_pepo\n\n"
+                    "Zucchini is a pepo, a botanical fruit."
+                ),
+                tool_call_id="alias-3",
+                name="fetch_wikipedia_page",
+            ),
+        ],
+    }
+
+    second_result = second_skill.run(second_state)
+
+    assert second_result is not None
+    assert second_result["final_answer"] == "broccoli, celery, fresh basil, lettuce, sweet potatoes"
+    assert len(second_result["tool_trace"]) == len(first_result["tool_trace"])
 
 
 def test_graph_botanical_recovery_recovers_prompt_item_omitted_by_model(monkeypatch) -> None:

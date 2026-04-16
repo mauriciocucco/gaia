@@ -244,6 +244,51 @@ def test_score_candidates_allows_strong_botanical_edu_to_beat_weaker_wikipedia_m
     assert "expected_domain" in scored[1].reasons
 
 
+def test_botanical_recipe_urls_are_deprioritized_for_zucchini() -> None:
+    question = (
+        "broccoli, sweet potatoes, zucchini\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Zucchini recipes\n"
+        "URL: https://www.chefkoch.de/rs/s0/zucchini/Rezepte.html\n"
+        "Snippet: Zucchini Rezepte und cooking ideas.\n\n"
+        "2. Sweet potato - Wikipedia\n"
+        "URL: https://en.wikipedia.org/wiki/Sweet_potato\n"
+        "Snippet: Sweet potato is an edible root vegetable.\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://en.wikipedia.org/wiki/Sweet_potato"
+    assert "botanical_recipe_noise_penalty" in scored[1].reasons
+
+
+def test_scientific_alias_candidates_rank_above_recipe_noise() -> None:
+    question = (
+        "broccoli, sweet potatoes, zucchini\n\n"
+        "Please alphabetize the vegetables and place each item in a comma separated list."
+    )
+    profile = profile_question(question)
+    raw = (
+        "1. Cucurbita pepo\n"
+        "URL: https://en.wikipedia.org/wiki/Cucurbita_pepo\n"
+        "Snippet: Cucurbita pepo includes zucchini, a pepo fruit.\n\n"
+        "2. Zucchini recipes\n"
+        "URL: https://www.chefkoch.de/rs/s0/zucchini+auflauf/Rezepte.html\n"
+        "Snippet: Zucchini auflauf Rezepte and cooking ideas.\n"
+    )
+
+    candidates = parse_result_blocks(raw, origin_tool="web_search")
+    scored = score_candidates(candidates, question=question, profile=profile)
+
+    assert scored[0].url == "https://en.wikipedia.org/wiki/Cucurbita_pepo"
+    assert "botanical_scientific_alias_hint" in scored[0].reasons
+    assert "botanical_recipe_noise_penalty" in scored[1].reasons
+
+
 def test_score_candidates_prefers_linked_primary_source_for_article_to_paper() -> None:
     question = (
         "On June 6, 2023, an article by Carolyn Collins Petersen was published in Universe Today. "

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
+from .botanical_aliases import botanical_aliases_for_item, botanical_token_groups
 from .graph.routing import normalize_botanical_text
 from .source_pipeline import EvidenceRecord
 
@@ -51,25 +52,18 @@ def is_botanical_prompt_candidate(item: str) -> bool:
 
 
 def botanical_item_token_groups(item: str) -> list[set[str]]:
-    ignored = {"fresh", "whole", "raw", "ripe", "dried"}
-    groups: list[set[str]] = []
-    for token in normalize_botanical_text(item).split():
-        if token in ignored:
-            continue
-        variants = {token}
-        if token.endswith("ies") and len(token) > 4:
-            variants.add(token[:-3] + "y")
-        if token.endswith("oes") and len(token) > 4:
-            variants.add(token[:-2])
-        if token.endswith("s") and len(token) > 4:
-            variants.add(token[:-1])
-        groups.append(variants)
-    return groups
+    return botanical_token_groups(normalize_botanical_text(item))
+
+
+def botanical_alias_token_groups(item: str) -> list[list[set[str]]]:
+    return [botanical_token_groups(alias) for alias in botanical_aliases_for_item(item)]
 
 
 def botanical_relevant_text(item: str, text: str) -> str:
-    token_groups = botanical_item_token_groups(item)
-    if not token_groups:
+    common_groups = botanical_item_token_groups(item)
+    alias_groups = botanical_alias_token_groups(item)
+    all_group_sets = [groups for groups in [common_groups, *alias_groups] if groups]
+    if not all_group_sets:
         return ""
     segments = [
         segment.strip()
@@ -79,7 +73,7 @@ def botanical_relevant_text(item: str, text: str) -> str:
     direct_match_indices: list[int] = []
     for index, segment in enumerate(segments):
         normalized_segment = normalize_botanical_text(segment)
-        if all(any(variant in normalized_segment for variant in variants) for variants in token_groups):
+        if _segment_matches_any_token_groups(normalized_segment, all_group_sets):
             direct_match_indices.append(index)
     relevant_segments: list[str] = []
     if direct_match_indices:
@@ -87,7 +81,16 @@ def botanical_relevant_text(item: str, text: str) -> str:
         for index in direct_match_indices:
             selected_indices.append(index)
             for neighbor in (index - 1, index + 1):
-                if 0 <= neighbor < len(segments) and _is_botanical_adjacent_context(segments[neighbor]):
+                if (
+                    0 <= neighbor < len(segments)
+                    and (
+                        _is_botanical_adjacent_context(segments[neighbor])
+                        or _segment_matches_any_token_groups(
+                            normalize_botanical_text(segments[neighbor]),
+                            all_group_sets,
+                        )
+                    )
+                ):
                     selected_indices.append(neighbor)
         seen_indices: set[int] = set()
         for index in selected_indices:
@@ -98,9 +101,25 @@ def botanical_relevant_text(item: str, text: str) -> str:
     if relevant_segments:
         return " ".join(relevant_segments)
     normalized = normalize_botanical_text(text)
-    if all(any(variant in normalized for variant in variants) for variants in token_groups):
+    if any(
+        all(any(variant in normalized for variant in variants) for variants in token_groups)
+        for token_groups in all_group_sets
+    ):
         return text
     return ""
+
+
+def _segment_matches_any_token_groups(
+    normalized_segment: str,
+    all_group_sets: list[list[set[str]]],
+) -> bool:
+    return any(
+        all(
+            any(variant in normalized_segment for variant in variants)
+            for variants in token_groups
+        )
+        for token_groups in all_group_sets
+    )
 
 
 def _is_botanical_adjacent_context(segment: str) -> bool:
@@ -131,6 +150,8 @@ def _is_botanical_adjacent_context(segment: str) -> bool:
             "herb",
         )
     )
+
+
 
 
 def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
@@ -180,9 +201,13 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         "fruit rather than a vegetable",
         "not a vegetable but a fruit",
         "the fruit of",
+        "fruit of the plant",
         "seed bearing structure",
+        "seed bearing",
+        "seed-bearing",
         "grain rather than a vegetable",
         "not a vegetable",
+        "seed pod",
     )
     vegetable_phrases = (
         "botanical vegetable",
@@ -256,6 +281,17 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
             vegetable_score += 2
         if "fruit" in normalized_title:
             fruit_score += 2
+    normalized_item = normalize_botanical_text(item)
+    if "zucchini" in normalized_item and "pepo" in normalized:
+        fruit_score += 4
+    if "bell pepper" in normalized_item and "fruit" in normalized and (
+        "capsicum" in normalized or "pepper" in normalized
+    ):
+        fruit_score += 3
+    if "peanut" in normalized_item and any(
+        cue in normalized for cue in ("legume", "pod", "seed", "arachis")
+    ):
+        fruit_score += 4
     return fruit_score, vegetable_score
 
 

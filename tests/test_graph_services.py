@@ -7,6 +7,7 @@ from hf_gaia_agent.graph.contracts import ToolInvocationResult
 from hf_gaia_agent.graph.finalizer import WorkflowFinalizer
 from hf_gaia_agent.graph.finalization_rules import TemporalRosterFinalizationRule
 from hf_gaia_agent.graph.nudges import build_search_nudge, build_stuck_search_nudge
+from hf_gaia_agent.graph.services import GraphWorkflowServices
 from hf_gaia_agent.graph.tool_policy import ToolPolicyEngine
 from hf_gaia_agent.source_pipeline import (
     SourceCandidate,
@@ -424,3 +425,45 @@ def test_evidence_records_accept_structured_table_payloads() -> None:
     assert len(records) == 1
     assert records[0].source_url == "https://example.com/roster"
     assert records[0].title_or_caption == "Pitchers"
+
+
+def test_resolution_pipeline_merges_ranked_candidates_and_botanical_partial_state() -> None:
+    state = {
+        "decision_trace": ["skill:botanical_gaia:profile_match"],
+        "tool_trace": ["search_wikipedia({'query': 'zucchini'})"],
+        "ranked_candidates": [],
+        "search_history_fingerprints": [],
+        "botanical_partial_records": [],
+        "botanical_item_status": {},
+        "botanical_search_history": [],
+    }
+
+    merged = GraphWorkflowServices._state_with_trace_updates(  # type: ignore[attr-defined]
+        state,
+        {
+            "decision_trace": ["updated-decision"],
+            "tool_trace": ["updated-tool"],
+            "ranked_candidates": [{"url": "https://example.com/candidate"}],
+            "search_history_fingerprints": ["classification:zucchini"],
+            "botanical_partial_records": [{"source_url": "https://example.com/zucchini"}],
+            "botanical_item_status": {
+                "zucchini": {
+                    "resolved": False,
+                    "outcome": None,
+                    "attempted_stages": ["wiki_exact_search"],
+                    "last_reason": "still_unresolved",
+                }
+            },
+            "botanical_search_history": ["zucchini|wiki_exact_search|zucchini"],
+        },
+    )
+
+    assert merged["decision_trace"] == ["updated-decision"]
+    assert merged["tool_trace"] == ["updated-tool"]
+    assert merged["ranked_candidates"] == [{"url": "https://example.com/candidate"}]
+    assert merged["search_history_fingerprints"] == ["classification:zucchini"]
+    assert merged["botanical_partial_records"] == [{"source_url": "https://example.com/zucchini"}]
+    assert merged["botanical_item_status"]["zucchini"]["attempted_stages"] == [
+        "wiki_exact_search"
+    ]
+    assert merged["botanical_search_history"] == ["zucchini|wiki_exact_search|zucchini"]

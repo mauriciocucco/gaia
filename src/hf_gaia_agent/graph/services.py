@@ -214,6 +214,19 @@ class GraphWorkflowServices:
             trace_updates = {
                 "decision_trace": list(current_state.get("decision_trace") or []),
                 "tool_trace": list(current_state.get("tool_trace") or []),
+                "ranked_candidates": list(current_state.get("ranked_candidates") or []),
+                "search_history_fingerprints": list(
+                    current_state.get("search_history_fingerprints") or []
+                ),
+                "botanical_partial_records": list(
+                    current_state.get("botanical_partial_records") or []
+                ),
+                "botanical_item_status": dict(
+                    current_state.get("botanical_item_status") or {}
+                ),
+                "botanical_search_history": list(
+                    current_state.get("botanical_search_history") or []
+                ),
             }
         return trace_updates
 
@@ -274,6 +287,17 @@ class GraphWorkflowServices:
         return {
             "decision_trace": list(current_state.get("decision_trace") or []),
             "tool_trace": list(current_state.get("tool_trace") or []),
+            "ranked_candidates": list(current_state.get("ranked_candidates") or []),
+            "search_history_fingerprints": list(
+                current_state.get("search_history_fingerprints") or []
+            ),
+            "botanical_partial_records": list(
+                current_state.get("botanical_partial_records") or []
+            ),
+            "botanical_item_status": dict(current_state.get("botanical_item_status") or {}),
+            "botanical_search_history": list(
+                current_state.get("botanical_search_history") or []
+            ),
         }
 
     def run_targeted_resolution(
@@ -299,9 +323,21 @@ class GraphWorkflowServices:
         state: AgentState, updates: dict[str, Any]
     ) -> AgentState:
         merged = dict(state)
-        for key in ("decision_trace", "tool_trace"):
+        for key in (
+            "decision_trace",
+            "tool_trace",
+            "ranked_candidates",
+            "search_history_fingerprints",
+            "botanical_partial_records",
+            "botanical_item_status",
+            "botanical_search_history",
+        ):
             if key in updates:
-                merged[key] = list(updates.get(key) or [])
+                raw_value = updates.get(key)
+                if key == "botanical_item_status":
+                    merged[key] = dict(raw_value or {})
+                else:
+                    merged[key] = list(raw_value or [])
         return merged  # type: ignore[return-value]
 
     def _run_applicable_adapters(self, state: AgentState) -> dict[str, Any] | None:
