@@ -102,6 +102,7 @@ QuestionProfile(
     profile_family="list_item_classification",
     prompt_items=("broccoli", "bell pepper", "sweet potatoes", "fresh basil"),
     classification_labels={"include": "vegetable", "exclude": "fruit"},
+    expected_domains=("wikipedia.org", ".edu", ".gov"),
     preferred_tools=(
         "search_wikipedia",
         "fetch_wikipedia_page",
@@ -131,6 +132,9 @@ Campos importantes:
 - `question_profile`: version serializada del `QuestionProfile`
 - `ranked_candidates`: URLs puntuadas
 - `search_history_fingerprints`: fingerprints para dedupe de busquedas
+- `botanical_partial_records`: evidencia botanica serializada para reuso entre abortos
+- `botanical_item_status`: estado por item (`resolved`, `outcome`, `attempted_stages`, `last_reason`)
+- `botanical_search_history`: historial cronologico de intentos botanicos
 - `structured_tool_outputs`: payloads estructurados de tools
 - `tool_trace`: log legible de llamadas a tools
 - `decision_trace`: breadcrumbs del runtime
@@ -341,11 +345,23 @@ El flujo interno es:
    - `unresolved_items`
    - `canonical_answer`
    - `is_closed`
-3. intenta clasificar desde evidencia ya presente
-4. para cada item sin resolver, prueba primero una via corta de Wikipedia
-5. si Wikipedia no cierra rapido, cae a broad web botanico
-6. vuelve a construir el estado canonico
-7. solo finaliza si `is_closed == True`
+3. intenta clasificar desde evidencia ya presente, incluyendo records previos de:
+   - `fetch_url`
+   - `find_text_in_url`
+   - `fetch_wikipedia_page`
+   - `botanical_partial_records`
+4. sincroniza estado incremental por item en `botanical_item_status`
+5. para cada item sin resolver, prueba primero una via corta de Wikipedia
+6. si el item sigue abierto, hace una segunda pasada por alias cientificos o cercanos
+7. solo despues cae a broad web botanico
+8. persiste progreso parcial si aborta:
+   - `ranked_candidates`
+   - `search_history_fingerprints`
+   - `botanical_partial_records`
+   - `botanical_item_status`
+   - `botanical_search_history`
+9. vuelve a construir el estado canonico
+10. solo finaliza si `is_closed == True`
 
 La estrategia Wikipedia-first actual es:
 
@@ -353,6 +369,13 @@ La estrategia Wikipedia-first actual es:
 - elegir el mejor titulo, no cualquier match superficial
 - hacer a lo sumo un `fetch_wikipedia_page`
 - salir rapido si el match es debil o ambiguo
+
+Pero el ranking botanico ya no esta sesgado solo a Wikipedia:
+
+- `expected_domains` acepta `wikipedia.org`, `.edu` y `.gov`
+- `preferred_tools` sigue dejando a Wikipedia como atajo operativo
+- alias como `capsicum annuum`, `cucurbita pepo` y `arachis hypogaea` compiten alto
+- URLs de recetas o cocina se penalizan fuerte en modo botanico
 
 Ejemplo de salida correcta:
 
@@ -381,6 +404,35 @@ Cuando cierra, deja:
 
 - `skill_trace=["botanical_gaia"]`
 - `reducer_used="botanical_classification"`
+
+Tambien deja progreso reutilizable en el estado cuando no puede cerrar en la primera vuelta:
+
+- `botanical_partial_records`
+- `botanical_item_status`
+- `botanical_search_history`
+
+Eso evita rehacer la lista completa y permite seguir solo con los items no resueltos.
+
+## `botanical_classification.py`
+
+El clasificador botanico no depende solo de frases literales del tipo "is a fruit".
+
+Hoy tambien da peso fuerte a cues de estructura botanica, por ejemplo:
+
+- `root vegetable`, `leaf vegetable`, `edible stem`
+- `botanical fruit`, `fruit of the plant`, `seed-bearing`
+- `legume`, `pod`, `seed pod`, `edible seeds`, `geocarpy`, `pepo`
+
+Hay bonos contextuales para cuellos de botella observados en GAIA:
+
+- `zucchini` + `pepo`
+- `bell pepper` + `fruit` junto con `capsicum` o `pepper`
+- `peanuts` + `legume/seed/pod/arachis`
+
+La extraccion de texto relevante tambien tiene un guardrail:
+
+- ya no toma el texto completo de una pagina solo porque los tokens del item aparecen dispersos
+- ese fallback solo se habilita si `Title` o `URL` corresponde al item o a un alias botanico
 
 ## Caso detallado: `temporal_ordered_list`
 
