@@ -101,7 +101,7 @@ def botanical_relevant_text(item: str, text: str) -> str:
     if relevant_segments:
         return " ".join(relevant_segments)
     normalized = normalize_botanical_text(text)
-    if any(
+    if _record_metadata_matches_any_token_groups(text, all_group_sets) and any(
         all(any(variant in normalized for variant in variants) for variants in token_groups)
         for token_groups in all_group_sets
     ):
@@ -119,6 +119,27 @@ def _segment_matches_any_token_groups(
             for variants in token_groups
         )
         for token_groups in all_group_sets
+    )
+
+
+def _record_metadata_matches_any_token_groups(
+    text: str,
+    all_group_sets: list[list[set[str]]],
+) -> bool:
+    metadata_haystacks: list[str] = []
+    title_match = re.search(r"(?im)^title:\s*(?P<title>.+)$", text)
+    if title_match:
+        metadata_haystacks.append(title_match.group("title").strip())
+    url_match = re.search(r"(?im)^(?:url|url source):\s*(?P<url>\S+)\s*$", text)
+    if url_match:
+        metadata_haystacks.append(url_match.group("url").strip())
+    return any(
+        _segment_matches_any_token_groups(
+            normalize_botanical_text(metadata_value),
+            all_group_sets,
+        )
+        for metadata_value in metadata_haystacks
+        if metadata_value.strip()
     )
 
 
@@ -169,7 +190,7 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         )
     ):
         return None
-    if re.search(r"made from[\w\s,-]{0,60}\b(?:milled|grinding|ground|powder)\b", normalized):
+    if _is_processed_food_only_match(item=item, normalized_text=normalized):
         return None
     fruit_score = 0
     vegetable_score = 0
@@ -230,6 +251,17 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         "edible root",
         "flower buds",
     )
+    botanical_seed_structure_phrases = (
+        "edible seeds",
+        "contained in underground pods",
+        "fruit develops underground",
+        "fruits develop underground",
+        "develop underground",
+        "grain legume",
+        "legume crop",
+        "geocarpy",
+        "technically called legumes",
+    )
     fruit_cues = (
         "fruit",
         "berry",
@@ -266,6 +298,7 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
     )
     fruit_score += sum(3 for phrase in fruit_phrases if phrase in normalized)
     vegetable_score += sum(3 for phrase in vegetable_phrases if phrase in normalized)
+    fruit_score += sum(2 for phrase in botanical_seed_structure_phrases if phrase in normalized)
     fruit_score += sum(1 for cue in fruit_cues if cue in normalized)
     vegetable_score += sum(1 for cue in vegetable_cues if cue in normalized)
     if any(phrase in normalized for phrase in explicit_fruit_over_vegetable):
@@ -292,7 +325,54 @@ def botanical_scores_from_text(item: str, text: str) -> tuple[int, int] | None:
         cue in normalized for cue in ("legume", "pod", "seed", "arachis")
     ):
         fruit_score += 4
+    if "peanut" in normalized_item:
+        peanut_seed_structure_matches = sum(
+            cue in normalized
+            for cue in (
+                "legume crop",
+                "edible seeds",
+                "underground pods",
+                "grain legume",
+                "geocarpy",
+                "technically called legumes",
+                "arachis",
+            )
+        )
+        if peanut_seed_structure_matches >= 2:
+            fruit_score += 5
     return fruit_score, vegetable_score
+
+
+def _is_processed_food_only_match(*, item: str, normalized_text: str) -> bool:
+    if not re.search(
+        r"made from[\w\s,-]{0,60}\b(?:milled|grinding|ground|powder)\b",
+        normalized_text,
+    ):
+        return False
+    strong_botanical_cues = (
+        "botanical fruit",
+        "fruit of the plant",
+        "seed bearing",
+        "seed-bearing",
+        "seed pod",
+        "legume crop",
+        "edible seeds",
+        "contained in underground pods",
+        "develop underground",
+        "fruits develop underground",
+        "fruit develops underground",
+        "grain legume",
+        "geocarpy",
+        "technically called legumes",
+    )
+    if any(cue in normalized_text for cue in strong_botanical_cues):
+        return False
+    normalized_item = normalize_botanical_text(item)
+    if "peanut" in normalized_item and any(
+        cue in normalized_text for cue in ("legume", "pod", "seed", "arachis")
+    ):
+        return False
+    return True
 
 
 def botanical_is_vegetable(fruit_total: int, vegetable_total: int) -> bool:
